@@ -3,10 +3,12 @@ import { provideZonelessChangeDetection } from '@angular/core';
 import { HttpErrorResponse, provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { provideRouter } from '@angular/router';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { TimeoutError } from 'rxjs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { McpOverview, McpProfile, McpProfileInput, McpPublishedTool, McpToolInput } from '../../../../core/models/mcp.model';
-import { McpSectionStore } from './mcp.store';
+import { mcpError } from '../../../../core/services/mcp-api.service';
+import { McpSectionStore, SETTINGS_CHANGE_TIMEOUT_MS } from './mcp.store';
 
 const OVERVIEW: McpOverview = {
   path: '/mcp',
@@ -95,6 +97,7 @@ describe('Settings → AI / MCP — the store', () => {
   // Every request a case causes is one it has accounted for — and a case that has not fails
   // alone: the test bed is taken down here whatever the answer, so the next one starts clean.
   afterEach(() => {
+    vi.useRealTimers();
     try {
       http.verify();
     } finally {
@@ -170,6 +173,36 @@ describe('Settings → AI / MCP — the store', () => {
     await next;
   });
 
+  it('gives up on a switch the server never answers, reads the section again, and lets the next one go', async () => {
+    vi.useFakeTimers();
+    const hung = store.setDetector('email', false);
+    // Watched from the start: the change is refused long before the case looks at it.
+    const given = expect(hung).rejects.toBeInstanceOf(TimeoutError);
+    const next = store.setDetector('iban', true);
+    await vi.advanceTimersByTimeAsync(0);
+    const put1 = http.expectOne({ method: 'PUT', url: '/api/mcp/settings' });
+    expect(put1.request.body).toEqual({ detectors: ['cardNumber'] });
+
+    // No answer: the switch behind it waits — up to the limit, and no longer.
+    await vi.advanceTimersByTimeAsync(SETTINGS_CHANGE_TIMEOUT_MS - 1);
+    expect(http.match({ method: 'PUT', url: '/api/mcp/settings' })).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(put1.cancelled).toBe(true);
+    // Given up on is not refused: the server may have made the change. The section is read
+    // again, and what the server has — the email detector off — is what the next change starts from.
+    http.expectOne('/api/mcp').flush({ ...OVERVIEW, detectors: OVERVIEW.detectors.map(d => ({ ...d, on: d.id === 'cardNumber' })) });
+    await given;
+    expect(mcpError(await hung.catch((e: unknown) => e), 'The detector could not be switched.').error)
+      .toBe('The server did not answer in time.');
+
+    await vi.advanceTimersByTimeAsync(0);
+    const put2 = http.expectOne({ method: 'PUT', url: '/api/mcp/settings' });
+    expect(put2.request.body).toEqual({ detectors: ['cardNumber', 'iban'] });
+    put2.flush({ ...OVERVIEW, detectors: OVERVIEW.detectors.map(d => ({ ...d, on: d.id !== 'email' })) });
+    await next;
+    expect(store.overview()?.detectors.filter(d => d.on).map(d => d.id)).toEqual(['cardNumber', 'iban']);
+  });
+
   // ── A key is shown once ─────────────────────────────────────────────────────
 
   it('answers a new profile with its key before the lists are read again, and whatever becomes of that read', async () => {
@@ -210,9 +243,13 @@ describe('Settings → AI / MCP — the store', () => {
 
   it('a saved profile is in both lists from its answer, and stays saved when the read after it fails', async () => {
     const saved: McpProfile = { ...P1, name: 'Payments developers', publishedTools: [] };
-    const saving = store.updateProfile('p1', { ...PROFILE_INPUT, name: 'Payments developers', publishedTools: [] });
-    http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' }).flush(saved);
-    await saving;
+    // A change names the fields it changes; the server keeps the rest.
+    const saving = store.updateProfile('p1', { name: 'Payments developers', publishedTools: [] });
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    expect(put.request.body).toEqual({ name: 'Payments developers', publishedTools: [] });
+    put.flush(saved);
+    // Answered with the profile as the server kept it.
+    expect(await saving).toEqual(saved);
 
     expect(store.profiles()).toEqual([saved]);
     // The other end of the grant: the tool no longer names the profile.

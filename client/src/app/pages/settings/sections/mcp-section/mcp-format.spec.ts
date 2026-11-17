@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
+import { parseExactJson } from '../../../../shared/utils/exact-json';
 import {
   KEY_VARIABLE, asCount, cellText, clientSnippets, fmtCount, fmtWindow, hasToken, hiddenSpan, isCount, lastCall, maskedLines,
-  maskedSentence, parseWindow, placeholderNames, placeholderSegments, prettyJson, signatureOf, statusTone, tokenSegments,
+  maskedSentence, parseWindow, placeholderNames, placeholderSegments, prettyJson, sameWindow, signatureOf, statusTone,
+  tokenSegments,
 } from './mcp-format';
 
 describe('AI / MCP — numbers and windows', () => {
@@ -58,6 +60,18 @@ describe('AI / MCP — numbers and windows', () => {
     expect(parseWindow('1h 1h')).toBeNull();
     expect(parseWindow('1h 30')).toBeNull();
     expect(parseWindow('1h, 30m')).toBeNull();
+  });
+
+  it('takes two spellings of one window for the same window', () => {
+    // A form filled with "24 h" and holding "24h" has nothing unsaved.
+    expect(sameWindow('24 h', '24h')).toBe(true);
+    expect(sameWindow('90 min', '1h30m')).toBe(true);
+    expect(sameWindow('1 d', '24 hours')).toBe(true);
+    expect(sameWindow('24 h', '25 h')).toBe(false);
+    // What is no window is the same only as the same text.
+    expect(sameWindow('soon', 'soon')).toBe(true);
+    expect(sameWindow('soon', 'later')).toBe(false);
+    expect(sameWindow('48', '48 min')).toBe(false);
   });
 
   it('refuses a bare number rather than guess its unit', () => {
@@ -124,6 +138,12 @@ describe('AI / MCP — tools', () => {
     expect(prettyJson('{"cut off…')).toBe('{"cut off…');
     expect(prettyJson(null)).toBe('');
   });
+
+  it('shows a 64-bit argument with the digits it was sent with', () => {
+    // The filter under the arguments says …993: the arguments must not say …992.
+    expect(prettyJson('{"orderId":9007199254740993,"ids":[18446744073709551615,-9223372036854775808],"limit":5}')).toBe(
+      '{\n  "orderId": 9007199254740993,\n  "ids": [\n    18446744073709551615,\n    -9223372036854775808\n  ],\n  "limit": 5\n}');
+  });
 });
 
 describe('AI / MCP — tokens and placeholders', () => {
@@ -178,24 +198,30 @@ describe('AI / MCP — a stored value next to what an answer carries', () => {
     expect(cellText({ Iin: '900101300126', Tier: 'gold' })).toBe('{"Iin":"900101300126","Tier":"gold"}');
   });
 
-  it('takes the cell\'s own spelling for a number JSON.parse could not hold', () => {
-    // A 64-bit id as the server writes it, and as the browser has it after JSON.parse.
+  it('keeps the digits of a 64-bit number, hidden or not', () => {
+    // A 64-bit id as the server writes it, read as the preview reads the stored event.
     const exact = '9007199254740993';
-    const stored: unknown = JSON.parse(exact);
-    expect(String(stored)).toBe('9007199254740992');
-    // The cell is the same number: nothing was hidden, and the cell has the digits right.
+    const stored = parseExactJson(exact);
+    // The cell is the same number: nothing was hidden.
     expect(cellText(stored, exact)).toBe(exact);
     expect(hiddenSpan(cellText(stored, exact), exact)).toBeNull();
-    // The same inside an object.
-    const order: unknown = JSON.parse(`{"Id":${exact},"Tier":"gold"}`);
-    expect(cellText(order, `{"Id":${exact},"Tier":"gold"}`)).toBe(`{"Id":${exact},"Tier":"gold"}`);
+    // Hidden, it is shown as stored — not as the double nearest to it.
+    expect(cellText(stored, 'h:91c0e2aa5d17')).toBe(exact);
+    // The same inside an object, whichever way the server spaced or escaped its cell.
+    const order = parseExactJson(`{"Id":${exact},"Tier":"gold"}`);
+    expect(cellText(order, `{ "Id": ${exact}, "Tier": "\\u0067old" }`)).toBe(`{ "Id": ${exact}, "Tier": "\\u0067old" }`);
+    expect(cellText(order, '{"Id":"h:91c0e2aa5d17","Tier":"gold"}')).toBe(`{"Id":${exact},"Tier":"gold"}`);
+    // Another number of the same double is another number.
+    expect(cellText(stored, '9007199254740992')).toBe(exact);
+  });
 
+  it('marks what differs from the cell, whatever the cell says', () => {
     // A cell that is not the stored value stays what was hidden: a token, a kept tail, another number.
-    expect(cellText(stored, 'h:91c0e2aa5d17')).toBe('9007199254740992');
     expect(cellText(4111111111111111, '****1111')).toBe('4111111111111111');
     expect(cellText(12500, '12501')).toBe('12500');
     expect(cellText(0, '')).toBe('0');
-    expect(cellText(order, '{"Id":"h:91c0e2aa5d17","Tier":"gold"}')).toBe('{"Id":9007199254740992,"Tier":"gold"}');
+    // The cell's own spelling of the same number is taken.
+    expect(cellText(12500, '12500.0')).toBe('12500.0');
     // A stored string is its own text, whatever the cell says.
     expect(cellText('12500', '12500.0')).toBe('12500');
   });

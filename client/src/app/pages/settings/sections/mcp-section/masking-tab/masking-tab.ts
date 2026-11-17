@@ -1,5 +1,5 @@
 import {
-  ChangeDetectionStrategy, Component, DestroyRef, ElementRef, computed, effect, inject, signal, viewChild,
+  ChangeDetectionStrategy, Component, DestroyRef, ElementRef, computed, effect, inject, signal, untracked, viewChild,
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
@@ -20,11 +20,19 @@ interface RuleDraft {
 
 /** One line of an event in the preview: a name, and its value in runs of plain and hidden text. */
 interface PreviewLine {
+  /** The name as stored — `@mt`, or a property's: the same on both sides, so lines are told apart by it. */
   key: string;
+  /** The name as the side shows it, in runs: on the sent side, the name an answer carries. */
+  name: Segment[];
   parts: Segment[];
+  /** True for a property whose name itself held a value, and leaves as its token. */
+  renamed?: boolean;
   /** True for a property an answer leaves out altogether. */
   removed?: boolean;
 }
+
+/** What a hidden name's mark says, on either side. */
+const RENAMED = 'The name itself holds a value: the AI gets its token in place of it.';
 
 const ACTIONS: readonly { id: McpMaskAction; label: string; tone: string; does: string }[] = [
   { id: 'hash',      label: 'Hash',        tone: 'acc', does: 'Replace the value with its token. The AI can still match and search by it.' },
@@ -56,6 +64,7 @@ export class MaskingTabComponent {
   private readonly api = inject(McpApiService);
 
   readonly actions = ACTIONS;
+  readonly renamedNote = RENAMED;
 
   /** The mode the tab explains and the preview is taken under. */
   readonly mode = signal<McpMaskingMode>('standard');
@@ -130,8 +139,14 @@ export class MaskingTabComponent {
     if (!this.savingRule()) this.draft.set(null);
   }
 
+  /** Changes the dialog's rule; a refusal about a field that now holds another value goes with it. */
   patchDraft(change: Partial<RuleDraft>): void {
     this.draft.update(d => (d ? { ...d, ...change } : d));
+    const about = this.draftErrorField();
+    if (about !== null && about in change) {
+      this.draftError.set(null);
+      this.draftErrorField.set(null);
+    }
   }
 
   addDraftService(): void {
@@ -268,12 +283,37 @@ export class MaskingTabComponent {
       this.backToAskDelete = false;
       button.focus();
     });
+    // A preview taken as a profile is of the profile as it is: its masking can be changed and
+    // saved on the Profiles tab while this one stays mounted. The mode follows it, and the
+    // preview is taken again; a profile that is gone leaves the preview to the mode it had.
+    effect(() => {
+      const id = this.previewProfile();
+      const profile = id ? this.store.profiles().find(p => p.id === id) ?? null : null;
+      untracked(() => {
+        if (!id) return;
+        if (!profile) {
+          this.previewProfile.set('');
+        } else if (profile.maskingMode !== this.mode()) {
+          this.mode.set(profile.maskingMode);
+          this.retakePreview();
+        }
+      });
+    });
     // The panel opens on the most recent event rather than on nothing.
     this.runPreview();
   }
 
   /** The preview's "as" control: a mode, or a profile (whose mode it then is). */
   readonly previewAs = computed(() => this.previewProfile() || 'mode:' + this.mode());
+
+  /**
+   * The filter that picks the event, as typed. A refusal of the filter stays said in the panel
+   * until the next preview, but no longer marks a field that holds another filter by now.
+   */
+  setProbe(text: string): void {
+    this.probe.set(text);
+    if (this.previewErrorField() === 'filter') this.previewErrorField.set(null);
+  }
 
   setMode(mode: McpMaskingMode): void {
     this.mode.set(mode);
@@ -348,42 +388,47 @@ export class MaskingTabComponent {
     const stored = p.stored;
     const sent = p.sent;
     const out: PreviewLine[] = [];
-    const plain = (key: string, text: string | undefined) => {
-      if (text) out.push({ key, parts: [{ text, kind: '' }] });
-    };
-    // A value on both sides: the part that differs is the raw value here and its token there.
-    const pair = (key: string, was: string, now: string) => {
+    const named = (key: string): Segment[] => [{ text: key, kind: '' }];
+    // A text on both sides: the part that differs is the raw text here and its token there.
+    const runs = (was: string, now: string): Segment[] => {
       const span = hiddenSpan(was, now);
-      if (!span) { out.push({ key, parts: [{ text: was, kind: '' }] }); return; }
+      if (!span) return [{ text: was, kind: '' }];
       const middle: Segment = side === 'stored' ? { text: span.stored, kind: 'raw' } : { text: span.sent, kind: 'token' };
       const parts: Segment[] = [{ text: span.head, kind: '' }, middle, { text: span.tail, kind: '' }];
-      out.push({ key, parts: parts.filter(part => part.text.length > 0) });
+      return parts.filter(part => part.text.length > 0);
+    };
+    const plain = (key: string, text: string | undefined) => {
+      if (text) out.push({ key, name: named(key), parts: [{ text, kind: '' }] });
     };
 
     plain('@t', stored['@t']);
     plain('@l', stored['@l'] ?? 'Information');
     plain('@service', stored['@service']);
-    pair('@mt', stored['@mt'] ?? '', sent.template);
+    out.push({ key: '@mt', name: named('@mt'), parts: runs(stored['@mt'] ?? '', sent.template) });
 
     // A value an answer may leave out altogether: marked on the stored side, named as gone on the other.
-    const held = (key: string, was: string, now: string | undefined) => {
-      if (now !== undefined) pair(key, was, now);
-      else if (side === 'stored') out.push({ key, parts: [{ text: was, kind: 'raw' }] });
-      else out.push({ key, parts: [{ text: 'removed', kind: '' }], removed: true });
+    const held = (line: Omit<PreviewLine, 'parts'>, was: string, now: string | undefined) => {
+      if (now !== undefined) out.push({ ...line, parts: runs(was, now) });
+      else if (side === 'stored') out.push({ ...line, parts: [{ text: was, kind: 'raw' }] });
+      else out.push({ ...line, parts: [{ text: 'removed', kind: '' }], removed: true });
     };
 
-    const answered = new Map(sent.properties.map(prop => [prop.name, prop.value]));
+    // Paired by the name a property is stored under. An answer can carry it under another: a
+    // name that is itself a value — an email address as a key — leaves as its token, like any
+    // value would. A server that does not say (`stored` absent) sends every name as stored.
+    const answered = new Map(sent.properties.map(prop => [prop.stored ?? prop.name, prop]));
     for (const [key, value] of Object.entries(stored.props ?? {})) {
-      const now = answered.get(key);
-      // Spelled the cell's way where the cell is this very value (a 64-bit id, say): see cellText.
-      held(key, cellText(value, now), now);
+      const prop = answered.get(key);
+      const renamed = prop !== undefined && prop.name !== key;
+      // Spelled the cell's way where the cell is this very value: see cellText.
+      held({ key, name: renamed ? runs(key, prop.name) : named(key), renamed }, cellText(value, prop?.value), prop?.value);
     }
 
     const x = stored['@x'];
     if (x) {
       plain('@x.type', x.type);
-      if (x.message !== undefined) held('@x.message', x.message, sent.exception?.message);
-      if (x.stack !== undefined) held('@x.stack', x.stack, sent.exception?.stack);
+      if (x.message !== undefined) held({ key: '@x.message', name: named('@x.message') }, x.message, sent.exception?.message);
+      if (x.stack !== undefined) held({ key: '@x.stack', name: named('@x.stack') }, x.stack, sent.exception?.stack);
     }
     return out;
   }

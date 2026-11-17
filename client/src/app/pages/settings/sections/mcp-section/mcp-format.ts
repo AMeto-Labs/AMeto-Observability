@@ -1,4 +1,5 @@
 import { McpInputSchema, McpMaskedBy } from '../../../../core/models/mcp.model';
+import { JsonDigits, parseExactJson, writeExactJson } from '../../../../shared/utils/exact-json';
 
 /**
  * How Settings → AI / MCP writes things down: numbers, windows, times, tokens, placeholders,
@@ -54,6 +55,17 @@ export function parseWindow(text: string): number | null {
     at = part.lastIndex;
   }
   return Number.isFinite(minutes) && minutes >= 1 ? Math.round(minutes) : null;
+}
+
+/**
+ * True when two windows as typed are the same window: `24h` is what `24 h` says, and a form
+ * that holds one where it was filled with the other has nothing unsaved. Text that is no
+ * window is the same only as the same text.
+ */
+export function sameWindow(a: string, b: string): boolean {
+  if (a === b) return true;
+  const minutes = parseWindow(a);
+  return minutes !== null && minutes === parseWindow(b);
 }
 
 /**
@@ -143,10 +155,14 @@ export const REFUSAL_KINDS: Readonly<Record<string, string>> = {
   unavailable: 'the log store',
 };
 
-/** JSON as sent, laid out for reading; text that is not JSON is shown as it is. */
+/**
+ * JSON as sent, laid out for reading; text that is not JSON is shown as it is. A whole number
+ * keeps the digits it was sent with: a 64-bit id read the plain way would be shown as another
+ * number than the one in the filter beside it.
+ */
 export function prettyJson(text: string | null | undefined): string {
   if (!text) return '';
-  try { return JSON.stringify(JSON.parse(text), null, 2); } catch { return text; }
+  try { return writeExactJson(parseExactJson(text), 2); } catch { return text; }
 }
 
 // ── Highlighting ──────────────────────────────────────────────────────────────
@@ -233,24 +249,23 @@ export function placeholderNames(filter: string | null | undefined): string[] {
 /**
  * A stored value as an answer's cell would spell it, so the two can be compared.
  *
- * `sent` is the cell it is compared with. The stored value has been through `JSON.parse`, which
- * keeps some sixteen digits of a number, while the cell is the server's exact text: a 64-bit id
- * comes back as `9007199254740992` beside a cell that says `…993`. Where the cell, read the
- * same way, is the very value held here, nothing was hidden and the cell's spelling is the
- * exact one — so that is the answer.
+ * The stored value is read with its digits kept (see `parseExactJson`): a 64-bit id is the
+ * stored digits here, hidden or not. `sent` is the cell it is compared with; where the cell,
+ * read as the stored value was read, is that very value, nothing was hidden and the cell's
+ * own spelling of it is the answer.
  */
 export function cellText(value: unknown, sent?: string): string {
   if (typeof value === 'string') return value;
   if (value === undefined) return '';
-  return sent !== undefined && readsAs(sent, value) ? sent : JSON.stringify(value);
+  return sent !== undefined && readsAs(sent, value) ? sent : writeExactJson(value);
 }
 
 /** True when a cell's text, read as the stored value was read, is that value. */
 function readsAs(sent: string, stored: unknown): boolean {
   if (typeof stored === 'number') return sent.trim() !== '' && Number(sent) === stored;
-  // A number inside an object or a list loses its digits the same way.
+  if (stored instanceof JsonDigits) return sent.trim() === stored.text;
   if (stored !== null && typeof stored === 'object') {
-    try { return JSON.stringify(JSON.parse(sent)) === JSON.stringify(stored); } catch { return false; }
+    try { return writeExactJson(parseExactJson(sent)) === writeExactJson(stored); } catch { return false; }
   }
   return false;
 }

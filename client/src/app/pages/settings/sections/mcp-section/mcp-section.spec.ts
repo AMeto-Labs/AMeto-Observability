@@ -1,12 +1,13 @@
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 import { provideZonelessChangeDetection } from '@angular/core';
+import { Location, PlatformNavigation } from '@angular/common';
 import { HttpRequest, provideHttpClient } from '@angular/common/http';
 import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';
 import { Router, provideRouter } from '@angular/router';
 import { LUCIDE_ICONS, LucideIconProvider, icons } from 'lucide-angular';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { McpCall, McpOverview, McpPreview, McpProfile, McpPublishedTool, McpRule } from '../../../../core/models/mcp.model';
+import { McpCall, McpOverview, McpPreview, McpProfile, McpPublishedTool, McpRule, McpSummary } from '../../../../core/models/mcp.model';
 import { SettingsDirtyService } from '../../settings-dirty.service';
 import { McpSectionComponent } from './mcp-section';
 
@@ -53,7 +54,7 @@ const REFUNDS: McpPublishedTool = {
   ...TOOLS[0], id: 't2', name: 'refunds', description: 'Refunds of one merchant.', profiles: [],
 };
 
-const SUMMARY = {
+const SUMMARY: McpSummary = {
   hours: 24, partial: false, calls: 1284, profiles: 5, events: 48310, medianEvents: 38, masked: 212406,
   maskedBy: { rules: 199662, strict: 0, detectors: 12744 }, statuses: { OK: 1270, Refused: 7 },
   refusals: { limit: 5, masking: 2 }, rules: { r1: 18204 }, detectors: { email: 1902 },
@@ -106,6 +107,7 @@ interface World {
   overview?: McpOverview;
   profiles?: McpProfile[];
   tools?: McpPublishedTool[];
+  summary?: McpSummary;
 }
 
 /**
@@ -140,6 +142,7 @@ describe('Settings → AI / MCP', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     // Every request a case caused is one it has accounted for: a read nobody expected — the
     // figures again on every filter, a second change behind a first — fails the case. And only
     // that case: the test bed is taken down here whatever the answer, so the next one starts clean.
@@ -171,7 +174,7 @@ describe('Settings → AI / MCP', () => {
     http.expectOne('/api/mcp/rules').flush(RULES);
     http.expectOne('/api/mcp/tools').flush({ builtIn: overview.tools, published: world.tools ?? TOOLS });
     await settle(f);
-    http.expectOne(isSummary).flush(SUMMARY);
+    http.expectOne(isSummary).flush(world.summary ?? SUMMARY);
     http.expectOne(isUsage).flush(USAGE);
     http.expectOne(r => r.url.startsWith('/api/events/services')).flush(['payments-api', 'acquiring-gw']);
     await settle(f);
@@ -259,7 +262,51 @@ describe('Settings → AI / MCP', () => {
     expect(text(f)).toContain('median 38 per call');
     expect(text(f)).toContain('94 % by field rules');
     expect(text(f)).toContain('5 by limits, 2 by masking');
+    // A server that does not count unrecorded refusals: every figure is a count, not a floor.
+    expect(text(f)).not.toContain('≥');
+    expect(all(f, '.m-tile[title]')).toEqual([]);
     expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('counts the refusals past a limit that were not recorded one by one, and says the totals are floors', async () => {
+    const f = TestBed.createComponent(McpSectionComponent);
+    // 60 refusals past a profile's minute are known only by the counts their minute's records carry.
+    await land(f, { summary: { ...SUMMARY, unrecorded: 60, refusals: { limit: 65, masking: 2 } } });
+    const tile = (label: string): HTMLElement => {
+      const found = all(f, '.m-tile').find(t => t.querySelector('.m-hint')?.textContent === label);
+      if (!found) throw new Error(`no tile says "${label}"`);
+      return found;
+    };
+
+    // The record's 1 284 calls and 7 refusals, and the 60 it holds no record of: at least that many.
+    expect(tile('Calls').querySelector('b')?.textContent).toBe('≥ 1 344');
+    expect(tile('Refused').querySelector('b')?.textContent).toBe('≥ 67');
+    expect(tile('Refused').textContent).toContain('≥ 65 by limits, 2 by masking');
+    for (const label of ['Calls', 'Refused']) {
+      expect(tile(label).getAttribute('title')).toBe(
+        'At least: past a profile’s calls-per-minute limit only the 1st, 2nd, 4th, 8th… refusal of a minute is recorded.');
+    }
+    // What the unrecorded refusals have no part in stays a count.
+    expect(tile('Events returned').hasAttribute('title')).toBe(false);
+    expect(tile('Events returned').querySelector('b')?.textContent).toBe('48 310');
+  });
+
+  it('says the totals are floors whenever refusals past a limit were thinned, none unrecorded included', async () => {
+    const f = TestBed.createComponent(McpSectionComponent);
+    // A minute whose last record is its 2nd refusal: nothing is known to be unrecorded, and a
+    // 3rd may have come — which no record holds.
+    await land(f, { summary: { ...SUMMARY, unrecorded: 0, thinned: true, refusals: { limit: 2 } } });
+    const tile = (label: string): HTMLElement => {
+      const found = all(f, '.m-tile').find(t => t.querySelector('.m-hint')?.textContent === label);
+      if (!found) throw new Error(`no tile says "${label}"`);
+      return found;
+    };
+
+    // The separators are no-break spaces, as fmtCount and the sign write them.
+    expect(tile('Calls').querySelector('b')?.textContent).toMatch(/^≥\s1\s284$/u);
+    expect(tile('Refused').querySelector('b')?.textContent).toMatch(/^≥\s7$/u);
+    expect(tile('Refused').textContent).toMatch(/≥\s2 by limits/u);
+    expect(tile('Calls').getAttribute('title')).toContain('At least');
   });
 
   it('says why when the section cannot be read, and reads again when asked', async () => {
@@ -326,6 +373,23 @@ describe('Settings → AI / MCP', () => {
     expect(events.hasAttribute('aria-invalid')).toBe(false);
   });
 
+  it('the widest window stops pointing at the refusal once it is put right', async () => {
+    const f = TestBed.createComponent(McpSectionComponent);
+    await land(f);
+    const window = el<HTMLInputElement>(f, 'input[aria-label="Widest time window"]');
+    type(window, 'a week');
+    await settle(f);
+    button(f, 'Save limits').click();
+    await settle(f);
+    expect(el(f, '#mcp-limits-error').textContent).toContain('Write the widest window with a unit');
+    expect(window.getAttribute('aria-describedby')).toBe('mcp-limits-error');
+
+    type(window, '7d');
+    await settle(f);
+    expect(window.hasAttribute('aria-invalid')).toBe(false);
+    expect(window.hasAttribute('aria-describedby')).toBe(false);
+  });
+
   it('a window that is no whole number of hours is shown as one the form can save', async () => {
     const f = TestBed.createComponent(McpSectionComponent);
     await land(f, { overview: { ...OVERVIEW, limits: { ...OVERVIEW.limits, maxWindowMinutes: 90 } } });
@@ -362,7 +426,7 @@ describe('Settings → AI / MCP', () => {
     expect(dirty.dirtyTabsList()).toEqual([]);
   });
 
-  it('saving a profile sends its settings and its granted tools as one list', async () => {
+  it('saving a profile sends what was changed in its card, the granted tools as one list', async () => {
     const f = await open('profiles');
     type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Payments developers');
     // The published tool's switch: off withdraws it from this profile.
@@ -372,11 +436,7 @@ describe('Settings → AI / MCP', () => {
     button(f, 'Save').click();
     await settle(f);
     const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
-    expect(put.request.body).toEqual({
-      name: 'Payments developers', description: 'Claude Code for the payments developers', toolsMode: 'builtInAndPublished',
-      tools: ['logs_overview', 'logs_search'], services: ['payments-api'], maskingMode: 'standard', freeFilters: true,
-      maxEvents: 200, maxWindowMinutes: 1440, callsPerMinute: 30, publishedTools: [],
-    });
+    expect(put.request.body).toEqual({ name: 'Payments developers', publishedTools: [] });
     const saved = { ...PROFILES[0], name: 'Payments developers', publishedTools: [] };
     put.flush(saved);
     await settle(f);
@@ -389,6 +449,151 @@ describe('Settings → AI / MCP', () => {
     // Profiles and tools name each other, so both are read again after a change to either.
     await lists(f, [saved], [{ ...TOOLS[0], profiles: [] }]);
     expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a card filled before somebody else narrowed the profile cannot widen it again by saving a new name', async () => {
+    const f = await open('profiles');
+    // Meanwhile, elsewhere, the profile was made Strict and given another service. This card has
+    // not heard of it, and still shows Standard and payments-api.
+    type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Payments developers');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    expect(put.request.body).toEqual({ name: 'Payments developers' });
+    const saved: McpProfile = { ...PROFILES[0], name: 'Payments developers', maskingMode: 'strict', services: ['acquiring-gw'] };
+    put.flush(saved);
+    await lists(f, [saved], TOOLS);
+
+    // The card is the profile as the server kept it: the narrowing stands.
+    expect(button(f, 'Strict', 'app-mcp-profiles-tab [aria-label="Masking"]').getAttribute('aria-pressed')).toBe('true');
+    expect(all(f, 'app-mcp-profiles-tab .m-chip.m-cd').map(c => c.textContent?.trim())).toEqual(['acquiring-gw']);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a save answered after the card moved to another profile leaves that card as it is', async () => {
+    const f = await open('profiles', { profiles: [PROFILES[0], SUPPORT] });
+    const name = (): HTMLInputElement => el(f, 'input[placeholder="Payments team"]');
+    const rows = (): HTMLElement[] => all(f, '[role=row].pick');
+    type(name(), 'Payments developers');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+
+    // While the save is on its way the other profile is picked — after the question — and typed into.
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    rows()[1].click();
+    await settle(f);
+    expect(confirm).toHaveBeenCalledTimes(1);
+    type(name(), 'Support desk');
+    await settle(f);
+
+    const saved = { ...PROFILES[0], name: 'Payments developers' };
+    put.flush(saved);
+    await settle(f);
+    // The card is still the one being typed into, with what was typed; the save is in the list.
+    expect(el(f, 'app-mcp-profiles-tab .card .section-title').textContent).toBe('Support');
+    expect(name().value).toBe('Support desk');
+    expect(rows().map(r => r.getAttribute('aria-selected'))).toEqual(['false', 'true']);
+    expect(rows()[0].textContent).toContain('Payments developers');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+    await lists(f, [saved, SUPPORT], TOOLS);
+    expect(name().value).toBe('Support desk');
+  });
+
+  it('a save refused after the card moved on names its profile, and marks nothing on the card that is open', async () => {
+    const f = await open('profiles', { profiles: [PROFILES[0], SUPPORT] });
+    const name = (): HTMLInputElement => el(f, 'input[placeholder="Payments team"]');
+    type(name(), 'Payments developers');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[1].click();
+    await settle(f);
+
+    put.flush({ error: 'A profile is called that already.', field: 'name' }, { status: 400, statusText: 'Bad Request' });
+    await settle(f);
+    expect(el(f, '#mcp-profile-error').textContent).toBe('“Payments team”: A profile is called that already.');
+    expect(name().value).toBe('Support');
+    expect(name().hasAttribute('aria-invalid')).toBe(false);
+    expect(name().hasAttribute('aria-describedby')).toBe(false);
+  });
+
+  it('what is typed while a save is on its way stays unsaved, over the profile as it was saved', async () => {
+    const f = await open('profiles');
+    const name = (): HTMLInputElement => el(f, 'input[placeholder="Payments team"]');
+    const description = (): HTMLInputElement => el(f, 'input[placeholder="Who or what uses this key?"]');
+    type(name(), 'Payments developers');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+
+    // The description is typed while the name is on its way.
+    type(description(), 'Claude Code and Cursor');
+    await settle(f);
+    const saved = { ...PROFILES[0], name: 'Payments developers' };
+    put.flush(saved);
+    await lists(f, [saved], TOOLS);
+
+    expect(name().value).toBe('Payments developers');
+    expect(description().value).toBe('Claude Code and Cursor');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+    // The name is saved; what is left to save is the description alone.
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const again = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    expect(again.request.body).toEqual({ description: 'Claude Code and Cursor' });
+    const described = { ...saved, description: 'Claude Code and Cursor' };
+    again.flush(described);
+    await lists(f, [described], TOOLS);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a window typed another way is not an unsaved change of the card', async () => {
+    const f = await open('profiles');
+    const window = el<HTMLInputElement>(f, 'app-mcp-profiles-tab input[placeholder="24h"]');
+    expect(window.value).toBe('24 h');
+
+    for (const same of ['24h', '1 d', '1440 min']) {
+      type(window, same);
+      await settle(f);
+      expect(dirty.dirtyTabsList()).toEqual([]);
+      expect(button(f, 'Save', 'app-mcp-profiles-tab').disabled).toBe(true);
+    }
+    type(window, '25h');
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+  });
+
+  it('a refusal stops marking a field of the card once the field holds another value', async () => {
+    const f = await open('profiles');
+    const name = (): HTMLInputElement => el(f, 'input[placeholder="Payments team"]');
+    type(name(), 'Support');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' })
+      .flush({ error: 'A profile is called that already.', field: 'name' }, { status: 400, statusText: 'Bad Request' });
+    await settle(f);
+    expect(name().getAttribute('aria-invalid')).toBe('true');
+    expect(name().getAttribute('aria-describedby')).toBe('mcp-profile-error');
+
+    // Another field changed: the refusal is still about the name, and stays.
+    type(el<HTMLInputElement>(f, 'input[placeholder="Who or what uses this key?"]'), 'Cursor');
+    await settle(f);
+    expect(name().getAttribute('aria-invalid')).toBe('true');
+    // The name changed: what was refused is no longer there to point at.
+    type(name(), 'Support desk');
+    await settle(f);
+    expect(name().hasAttribute('aria-invalid')).toBe(false);
+    expect(name().hasAttribute('aria-describedby')).toBe(false);
+    expect(all(f, '#mcp-profile-error')).toEqual([]);
   });
 
   /** Withdraws `payment_declines` from the profile in the tool's own editor, and saves the tool. */
@@ -497,6 +702,31 @@ describe('Settings → AI / MCP', () => {
     await offered(f);
   });
 
+  it('a grant switched on for a tool that is then deleted leaves nothing unsaved in the card', async () => {
+    const f = await open('profiles', { tools: [TOOLS[0], REFUNDS] });
+    el<HTMLButtonElement>(f, 'app-mcp-profiles-tab button.m-sw[aria-label="refunds"]').click();
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    // The tool the switch was for is deleted on the Tools tab.
+    await show(f, 'Tools');
+    await offered(f);
+    el<HTMLButtonElement>(f, 'button[aria-label="Delete refunds"]').click();
+    await settle(f);
+    button(f, 'Delete tool', '.modal').click();
+    await settle(f);
+    http.expectOne({ method: 'DELETE', url: '/api/mcp/tools/t2' }).flush(null, NO_CONTENT);
+    await lists(f, PROFILES, [TOOLS[0]]);
+    await offered(f);
+
+    // A grant of a tool that is no more is no grant — the server would refuse its id — so the
+    // switch is all there was to save, and it is gone with its tool.
+    await show(f, 'Profiles');
+    expect(all(f, 'app-mcp-profiles-tab button.m-sw[aria-label="refunds"]')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+    expect(button(f, 'Save', 'app-mcp-profiles-tab').disabled).toBe(true);
+  });
+
   it('a profile the server will not delete leaves what was typed in its card unsaved', async () => {
     const f = await open('profiles');
     type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Payments developers');
@@ -552,11 +782,15 @@ describe('Settings → AI / MCP', () => {
     button(f, 'Create profile').click();
     await settle(f);
     const post = http.expectOne({ method: 'POST', url: '/api/mcp/profiles' });
-    // No tool was granted in the card, so no grants are sent.
-    expect(post.request.body).not.toHaveProperty('publishedTools');
+    // A new profile is all of it. No tool was granted in the card, so no grants are sent.
+    expect(post.request.body).toEqual({
+      name: 'Support', description: '', toolsMode: 'builtInAndPublished', tools: ['logs_overview', 'logs_search'],
+      services: [], maskingMode: 'standard', freeFilters: true, maxEvents: 200, maxWindowMinutes: 1440, callsPerMinute: 30,
+    });
     post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
     await failLists(f);
 
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Support”');
     expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
     button(f, 'Done', '.modal').click();
     await settle(f);
@@ -565,6 +799,113 @@ describe('Settings → AI / MCP', () => {
     expect(el(f, 'app-mcp-profiles-tab .card .section-title').textContent).toBe('Support');
     expect(all<HTMLButtonElement>(f, 'button').map(b => b.textContent?.trim())).not.toContain('Create profile');
     expect(all(f, '[role=row].pick').map(r => r.classList.contains('sel'))).toEqual([false, true]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a key on its way names its profile when it arrives, whichever card is open by then', async () => {
+    const f = await open('profiles');
+    button(f, 'New profile').click();
+    await settle(f);
+    type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Support');
+    await settle(f);
+    button(f, 'Create profile').click();
+    await settle(f);
+    const post = http.expectOne({ method: 'POST', url: '/api/mcp/profiles' });
+
+    // While the key is on its way the first profile is picked again, after the question.
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    // Nothing is typed into that card — and the page has something to lose all the same.
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    // The key is shown, and says whose it is: the card under it is another profile's, and stays so.
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Support”');
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+    expect(el(f, 'app-mcp-profiles-tab .card .section-title').textContent).toBe('Payments team');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a new profile written while another is being created is not the one created', async () => {
+    const f = await open('profiles');
+    const name = (): HTMLInputElement => el(f, 'input[placeholder="Payments team"]');
+    button(f, 'New profile').click();
+    await settle(f);
+    type(name(), 'Support');
+    await settle(f);
+    button(f, 'Create profile').click();
+    await settle(f);
+    const post = http.expectOne({ method: 'POST', url: '/api/mcp/profiles' });
+
+    // Away to the first profile and back to a blank new one — another card, though it is "new" too.
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    button(f, 'New profile').click();
+    await settle(f);
+    type(name(), 'Operations');
+    await settle(f);
+
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Support”');
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    // The card is still the profile being written, not the one just created under another name.
+    expect(el(f, 'app-mcp-profiles-tab .card .section-title').textContent).toBe('New profile');
+    expect(name().value).toBe('Operations');
+    expect(button(f, 'Create profile').disabled).toBe(false);
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+  });
+
+  it('the rotate and delete questions stay up while their answers are on their way', async () => {
+    const f = await open('profiles', { profiles: [PROFILES[0], SUPPORT] });
+    const closeButtons = (): HTMLElement[] => all(f, '.modal button[title="Close"]');
+
+    button(f, 'Rotate', 'app-mcp-profiles-tab .card').click();
+    await settle(f);
+    // Before it is answered, the question can be put away …
+    expect(closeButtons().length).toBe(1);
+    button(f, 'Rotate key', '.modal').click();
+    await settle(f);
+    const rotate = http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' });
+    // … but not while its answer is on its way: no close button, and a click beside it does nothing.
+    expect(closeButtons()).toEqual([]);
+    el(f, '.modal-backdrop').click();
+    await settle(f);
+    expect(el(f, '.modal__title').textContent).toBe('Rotate the key?');
+    // The old key stops working with this answer, and the new one is not on screen yet.
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+    rotate.flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
+    expect(el(f, '.modal__title').textContent).toBe('Key of “Payments team”');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+
+    button(f, 'Delete profile', 'app-mcp-profiles-tab .card').click();
+    await settle(f);
+    button(f, 'Delete profile', '.modal').click();
+    await settle(f);
+    const remove = http.expectOne({ method: 'DELETE', url: '/api/mcp/profiles/p1' });
+    expect(closeButtons()).toEqual([]);
+    el(f, '.modal-backdrop').click();
+    await settle(f);
+    expect(el(f, '.modal__title').textContent).toBe('Delete the profile?');
+
+    // Deleted: the question goes, and the card moves to the profile that is left.
+    remove.flush(null, NO_CONTENT);
+    await lists(f, [SUPPORT], [{ ...TOOLS[0], profiles: [] }]);
+    expect(all(f, '.modal')).toEqual([]);
+    expect(all(f, '[role=row].pick').map(r => r.querySelector('.m-strong')?.textContent)).toEqual(['Support']);
+    expect(el(f, 'app-mcp-profiles-tab .card .section-title').textContent).toBe('Support');
     expect(dirty.dirtyTabsList()).toEqual([]);
   });
 
@@ -602,8 +943,8 @@ describe('Settings → AI / MCP', () => {
 
   // ── Masking ─────────────────────────────────────────────────────────────────
 
-  /** Opens the Masking tab and answers the preview it opens with. */
-  async function openMasking(preview: McpPreview = PREVIEW): Promise<ComponentFixture<McpSectionComponent>> {
+  /** Opens the Masking tab and answers the preview it opens with: an answer, or the server's own text of one. */
+  async function openMasking(preview: McpPreview | string = PREVIEW): Promise<ComponentFixture<McpSectionComponent>> {
     const f = await open('masking');
     const first = http.expectOne('/api/mcp/preview');
     expect(first.request.body).toEqual({ mode: 'standard' });
@@ -612,13 +953,19 @@ describe('Settings → AI / MCP', () => {
     return f;
   }
 
-  /** The preview's two boxes, each as `key → [text, kind of mark]` runs. */
-  const previewLine = (f: ComponentFixture<unknown>, box: 0 | 1, key: string): HTMLElement => {
+  /** A line of one of the preview's two boxes (0: as stored, 1: as sent), found by the name it shows. */
+  const previewEntry = (f: ComponentFixture<unknown>, box: 0 | 1, key: string): HTMLElement => {
     const line = [...all(f, '.kv')[box].querySelectorAll<HTMLElement>('.kv-line')]
       .find(l => l.querySelector('.kv-key')?.textContent === key);
     if (!line) throw new Error(`the preview has no line ${key}`);
-    return line.querySelector<HTMLElement>('.kv-value')!;
+    return line;
   };
+  /** The value of a line, in runs: `.m-raw` marks what is hidden, `.m-tok` what stands in for it. */
+  const previewLine = (f: ComponentFixture<unknown>, box: 0 | 1, key: string): HTMLElement =>
+    previewEntry(f, box, key).querySelector<HTMLElement>('.kv-value')!;
+  /** The name of a line, marked the same way where the name itself is hidden. */
+  const previewKey = (f: ComponentFixture<unknown>, box: 0 | 1, key: string): HTMLElement =>
+    previewEntry(f, box, key).querySelector<HTMLElement>('.kv-key')!;
 
   it('shows an event as stored and as sent, the hidden part marked on both sides — the stack included', async () => {
     const f = await openMasking();
@@ -634,22 +981,91 @@ describe('Settings → AI / MCP', () => {
     expect(text(f)).toContain('2 values replaced: 1 by field rules, 1 by detectors.');
   });
 
-  it('does not mark a 64-bit number as hidden because the browser cannot hold its digits', async () => {
-    // The stored event went through JSON.parse; the cell of the answer is the server's own text.
+  it('shows a 64-bit number with the digits it is stored with, hidden or not', async () => {
+    // The server's own text: the stored event has the numbers as they are stored, which a
+    // double — what JSON.parse makes of them — cannot hold.
     const exact = '9007199254740993';
-    const f = await openMasking({
-      ...PREVIEW,
-      stored: { ...PREVIEW.stored!, props: { OrderId: JSON.parse(exact), Amount: 12500 } },
-      sent: { ...PREVIEW.sent!, properties: [{ name: 'OrderId', value: exact }, { name: 'Amount', value: 'h:0123456789ab' }] },
-    });
+    const f = await openMasking(
+      '{"found":true,"stored":{"@t":"2026-11-16T09:14:31.0000000+00:00","@mt":"Order {OrderId} paid","@l":"Information",'
+      + `"@service":"payments-api","props":{"OrderId":${exact},"MerchantRef":${exact},"Amount":12500}},`
+      + '"sent":{"template":"Order {OrderId} paid","properties":['
+      + `{"name":"OrderId","value":"${exact}","stored":"OrderId"},`
+      + '{"name":"MerchantRef","value":"h:91c0e2aa5d17","stored":"MerchantRef"},'
+      + '{"name":"Amount","value":"h:0123456789ab","stored":"Amount"}]},'
+      + '"masked":{"total":2,"rules":{"MerchantRef":1,"Amount":1},"strict":{},"detectors":{}}}');
 
+    // Sent as stored: nothing is marked, and both sides have the digits right.
     for (const box of [0, 1] as const) {
       expect(previewLine(f, box, 'OrderId').textContent).toBe(exact);
       expect(previewLine(f, box, 'OrderId').querySelector('.m-raw, .m-tok')).toBeNull();
     }
-    // A number that was hidden is still marked.
+    // Hidden: what is shown as stored is what is stored — not the double nearest to it.
+    expect(previewLine(f, 0, 'MerchantRef').querySelector('.m-raw')?.textContent).toBe(exact);
+    expect(previewLine(f, 1, 'MerchantRef').querySelector('.m-tok')?.textContent).toBe('h:91c0e2aa5d17');
     expect(previewLine(f, 0, 'Amount').querySelector('.m-raw')?.textContent).toBe('12500');
     expect(previewLine(f, 1, 'Amount').querySelector('.m-tok')?.textContent).toBe('h:0123456789ab');
+  });
+
+  it('a property whose name is itself a value is shown sent under its token, not as removed', async () => {
+    const f = await openMasking({
+      ...PREVIEW,
+      stored: { ...PREVIEW.stored!, props: { PaymentId: 'pay_1', 'a.serikov@example.com': 'active', Note: 'internal' } },
+      sent: {
+        ...PREVIEW.sent!,
+        properties: [
+          { name: 'PaymentId', value: 'pay_1', stored: 'PaymentId' },
+          { name: 'h:3aa0715ce9d4', value: 'active', stored: 'a.serikov@example.com' },
+        ],
+      },
+    });
+
+    // As stored: the name is what is hidden, not the value.
+    expect(previewKey(f, 0, 'a.serikov@example.com').querySelector('.m-raw')?.textContent).toBe('a.serikov@example.com');
+    expect(previewLine(f, 0, 'a.serikov@example.com').textContent).toBe('active');
+    expect(previewLine(f, 0, 'a.serikov@example.com').querySelector('.m-raw')).toBeNull();
+    // As sent: under its token, with its value — the AI gets it.
+    expect(previewKey(f, 1, 'h:3aa0715ce9d4').querySelector('.m-tok')?.textContent).toBe('h:3aa0715ce9d4');
+    expect(previewLine(f, 1, 'h:3aa0715ce9d4').textContent).toBe('active');
+    for (const box of [0, 1] as const) {
+      expect(previewKey(f, box, box === 0 ? 'a.serikov@example.com' : 'h:3aa0715ce9d4').getAttribute('title'))
+        .toBe('The name itself holds a value: the AI gets its token in place of it.');
+    }
+    expect(all(f, '.kv')[1].textContent).not.toContain('a.serikov@example.com');
+    // A property the answer leaves out is still said to be removed; one sent as it is, is not marked.
+    expect(previewLine(f, 1, 'Note').textContent).toBe('removed');
+    expect(previewKey(f, 1, 'PaymentId').hasAttribute('title')).toBe(false);
+  });
+
+  it('a preview taken as a profile is taken again when that profile\'s masking is saved on the Profiles tab', async () => {
+    const f = await openMasking();
+    choose(el<HTMLSelectElement>(f, 'select[aria-label="Preview as"]'), 'p1');
+    await settle(f);
+    const asProfile = http.expectOne('/api/mcp/preview');
+    expect(asProfile.request.body).toEqual({ profileId: 'p1' });
+    asProfile.flush(PREVIEW);
+    await settle(f);
+
+    // The profile goes Strict on the Profiles tab; the Masking tab stays mounted meanwhile.
+    await show(f, 'Profiles');
+    button(f, 'Strict', 'app-mcp-profiles-tab [aria-label="Masking"]').click();
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    expect(put.request.body).toEqual({ maskingMode: 'strict' });
+    const strict: McpProfile = { ...PROFILES[0], maskingMode: 'strict' };
+    put.flush(strict);
+    await settle(f);
+    // The preview is of the profile as it is now.
+    const again = http.expectOne('/api/mcp/preview');
+    expect(again.request.body).toEqual({ profileId: 'p1' });
+    again.flush(PREVIEW_STRICT);
+    await lists(f, [strict], TOOLS);
+
+    await show(f, 'Masking');
+    expect(el<HTMLSelectElement>(f, 'select[aria-label="Preview as"]').value).toBe('p1');
+    expect(button(f, 'Strict', '[aria-label="Masking mode"]').getAttribute('aria-pressed')).toBe('true');
+    expect(previewLine(f, 1, 'PaymentId').textContent).toBe('h:0123456789ab');
   });
 
   it('a slow preview does not land on top of a newer one', async () => {
@@ -696,6 +1112,14 @@ describe('Settings → AI / MCP', () => {
     expect(el(f, '#mcp-preview-error').textContent).toContain('Invalid filter');
     expect(probe.getAttribute('aria-invalid')).toBe('true');
     expect(probe.getAttribute('aria-describedby')).toBe('mcp-preview-error');
+
+    // Typed into, the field no longer holds the filter that was refused: the panel still says
+    // why the last preview failed, but the field is not marked for it.
+    type(probe, "@l = 'Error' and @service = 'payments-api' and Amount > 0");
+    await settle(f);
+    expect(probe.hasAttribute('aria-invalid')).toBe(false);
+    expect(probe.hasAttribute('aria-describedby')).toBe(false);
+    expect(el(f, '#mcp-preview-error').textContent).toContain('Invalid filter');
   });
 
   it('every detector\'s switch waits while one is on its way', async () => {
@@ -764,6 +1188,13 @@ describe('Settings → AI / MCP', () => {
     expect(el(f, '#mcp-rule-error').textContent).toBe('Field is required.');
     expect(field.getAttribute('aria-invalid')).toBe('true');
     expect(field.getAttribute('aria-describedby')).toBe('mcp-rule-error');
+
+    // Typed into, the field is no longer what was refused.
+    type(field, 'Customer.Iin');
+    await settle(f);
+    expect(field.hasAttribute('aria-invalid')).toBe(false);
+    expect(field.hasAttribute('aria-describedby')).toBe(false);
+    expect(all(f, '#mcp-rule-error')).toEqual([]);
   });
 
   // ── Tools ───────────────────────────────────────────────────────────────────
@@ -882,6 +1313,48 @@ describe('Settings → AI / MCP', () => {
     expect(text(f)).toContain('Published tools');
   });
 
+  it('"no" to the browser\'s Back steps forward to the editor again, and keeps the entry Back went to', async () => {
+    // The browser's history, as the test bed has it: the Router's Location runs on a fake of the
+    // Navigation API. The section reads where an entry stands from the browser's own
+    // `navigation`, which jsdom has not got — so here that is the fake as well.
+    const fake = TestBed.inject(PlatformNavigation);
+    vi.stubGlobal('navigation', { get currentEntry() { return fake.currentEntry; } });
+    const browser = TestBed.inject(Location);
+    const go = vi.spyOn(browser, 'historyGo');
+    // The Router follows Back and Forward, as it does once the app has started.
+    router.setUpLocationChangeListener();
+    /** The browser's own Back. */
+    const back = async (f: ComponentFixture<unknown>): Promise<void> => {
+      browser.back();
+      for (let turn = 0; turn < 3; turn++) await settle(f);
+    };
+
+    // Two entries: the list of tools — marked, so that it is told from any other entry with the
+    // same address — then the editor of one.
+    await router.navigate([], { queryParams: { mcp: 'tools', entry: 'list' } });
+    const f = await openEditor();
+    const name = (): HTMLInputElement => el(f, 'app-mcp-tool-editor input[placeholder="payment_declines"]');
+    type(name(), 'payment_declines_v2');
+    await settle(f);
+
+    const confirm = vi.fn(() => false);
+    vi.stubGlobal('confirm', confirm);
+    await back(f);
+    // "No": a step forward again, to the editor's own entry — not its address written over the list's.
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(go).toHaveBeenCalledWith(1);
+    expect(router.url).toBe('/?mcp=tools&tool=t1');
+    expect(name().value).toBe('payment_declines_v2');
+
+    // The list's entry is still there: Back reaches it again, and "yes" goes to it.
+    confirm.mockReturnValue(true);
+    await back(f);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(router.url).toBe('/?mcp=tools&entry=list');
+    expect(all(f, 'app-mcp-tool-editor')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
   it('an enum parameter shows its default, chosen from its values — and sends no default it does not show', async () => {
     const f = await openEditor(WITH_DEFAULT);
     const row = (): HTMLElement => all(f, 'app-mcp-tool-editor [role=row].param')[1];
@@ -968,8 +1441,82 @@ describe('Settings → AI / MCP', () => {
     expect(el(f, '#mcp-tool-error').textContent).toContain('is the name of a built-in tool');
     expect(name.getAttribute('aria-invalid')).toBe('true');
     expect(name.getAttribute('aria-describedby')).toBe('mcp-tool-error');
-    // A field the sentence is not about is left alone.
+    // A field the sentence is not about is left alone — and changing it leaves the sentence be.
     expect(el(f, '#mcp-tool-filter').hasAttribute('aria-invalid')).toBe(false);
+    type(el<HTMLTextAreaElement>(f, '#mcp-tool-filter'), 'MerchantId = {merchantId} and @l = \'Error\'');
+    await settle(f);
+    expect(name.getAttribute('aria-invalid')).toBe('true');
+
+    // The name typed again is no longer the name that was refused.
+    type(name, 'payment_declines_v2');
+    await settle(f);
+    expect(name.hasAttribute('aria-invalid')).toBe(false);
+    expect(name.hasAttribute('aria-describedby')).toBe(false);
+    expect(all(f, '#mcp-tool-error')).toEqual([]);
+  });
+
+  it('a window typed another way is not an unsaved change of the tool', async () => {
+    const f = await openEditor();
+    const window = el<HTMLInputElement>(f, 'app-mcp-tool-editor input[placeholder="1h"]');
+    expect(window.value).toBe('1 h');
+    type(window, '60m');
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+    expect(button(f, 'Discard changes', 'app-mcp-tool-editor').disabled).toBe(true);
+    type(window, '2h');
+    await settle(f);
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+  });
+
+  /** A tool with an argument of each type the test run sends differently. */
+  const TYPED: McpPublishedTool = {
+    ...TOOLS[0],
+    parameters: [
+      { name: 'merchantId', type: 'string', required: true, description: '', values: [], default: null },
+      { name: 'orderId', type: 'number', required: false, description: '', values: [], default: null },
+      { name: 'urgent', type: 'boolean', required: false, description: '', values: [], default: null },
+    ],
+    filter: 'MerchantId = {merchantId} and OrderId = {orderId} and Urgent = {urgent}',
+    inputSchema: {
+      properties: { merchantId: {}, orderId: {}, urgent: {}, from: {}, to: {}, cursor: {} }, required: ['merchantId'],
+    },
+  };
+
+  it('runs the tool as a profile would call it, a 64-bit number argument as it was typed — and saves nothing', async () => {
+    const f = await openEditor(TYPED);
+    const argument = <T extends HTMLElement>(name: string): T => {
+      const label = all(f, 'app-mcp-tool-editor .args label').find(l => l.querySelector('.m-lbl')?.textContent?.trim() === name);
+      if (!label) throw new Error(`the test run has no argument ${name}`);
+      return label.querySelector<T>('input, select')!;
+    };
+    type(argument<HTMLInputElement>('merchantId'), 'm-42');
+    type(argument<HTMLInputElement>('orderId'), '9007199254740993');
+    choose(argument<HTMLSelectElement>('urgent'), 'true');
+    type(argument<HTMLInputElement>('from'), '-2h');
+    await settle(f);
+    // Arguments are not the tool: nothing about it is unsaved.
+    expect(dirty.dirtyTabsList()).toEqual([]);
+
+    button(f, 'Run', 'app-mcp-tool-editor').click();
+    await settle(f);
+    const run = http.expectOne({ method: 'POST', url: '/api/mcp/tools/test' });
+    expect(run.request.body).toMatchObject({ id: 't1', profileId: 'p1', tool: { name: 'payment_declines', filter: TYPED.filter } });
+    // The id as typed: as a number it would be 9007199254740992, another order's.
+    expect(run.request.body.arguments).toEqual({ merchantId: 'm-42', orderId: '9007199254740993', urgent: true, from: '-2h' });
+    run.flush({
+      text: 'PaymentId=pay_1 CardNumber=h:91c0e2aa5d17', isError: false, status: 'OK',
+      filter: "MerchantId = 'm-42' and OrderId = 9007199254740993 and Urgent = true",
+      events: 1, masked: 1, maskedBy: { rules: { CardNumber: 1 } }, tokens: 60, elapsedMs: 12,
+      definition: { name: 'payment_declines', description: TYPED.description, inputSchema: TYPED.inputSchema },
+    });
+    await settle(f);
+
+    expect(text(f)).toContain('1 event · 1 value masked · about 60 tokens · 12 ms');
+    const [bound, answer, definition] = all(f, 'app-mcp-tool-editor .m-side pre.m-code');
+    expect(bound.textContent).toBe("MerchantId = 'm-42' and OrderId = 9007199254740993 and Urgent = true");
+    expect(answer.querySelector('.m-tok')?.textContent).toBe('h:91c0e2aa5d17');
+    expect(JSON.parse(definition.textContent ?? '')).toMatchObject({ name: 'payment_declines', inputSchema: { required: ['merchantId'] } });
+    expect(dirty.dirtyTabsList()).toEqual([]);
   });
 
   // ── Activity ────────────────────────────────────────────────────────────────
@@ -1005,31 +1552,82 @@ describe('Settings → AI / MCP', () => {
     // The record holds the filter as the call wrote it — which is all its caption claims for it.
     expect(all(f, 'app-mcp-activity-tab .m-side .m-lbl').map(l => l.textContent))
       .toEqual(['What the AI was told', 'Arguments', 'Filter as written']);
-    expect(text(f)).toContain('Showing 1 of 1 284 calls');
+    // Records, not calls: past a profile's limit one record can stand for many refused calls.
+    expect(text(f)).toContain('Showing 1 of 1 284 records');
+  });
+
+  it('shows a call\'s 64-bit argument with the digits the filter under it has', async () => {
+    const f = await open('activity');
+    http.expectOne(isActivity).flush({
+      more: false,
+      calls: [call('42', 'OK', {
+        tool: 'payment_declines', arguments: '{"merchantId":"m-42","orderId":9007199254740993}',
+        filter: "MerchantId = 'm-42' and OrderId = 9007199254740993",
+      })],
+    });
+    await settle(f);
+
+    const [args, filter] = all(f, 'app-mcp-activity-tab .m-side pre.m-code');
+    expect(args.textContent).toBe('{\n  "merchantId": "m-42",\n  "orderId": 9007199254740993\n}');
+    expect(filter.textContent).toBe("MerchantId = 'm-42' and OrderId = 9007199254740993");
   });
 
   it('says how many refusals a record stands for when a profile ran over its limit', async () => {
     const f = await open('activity');
+    const refused = { refusalKind: 'limit', refusal: 'The profile has made its 30 calls of this minute.' };
     http.expectOne(isActivity).flush({
       more: false,
       calls: [
-        call('44', 'Refused', { refusalKind: 'limit', refusal: 'The profile has made its 30 calls of this minute.', repeats: 8 }),
-        call('43', 'Refused', { refusalKind: 'limit', refusal: 'The profile has made its 30 calls of this minute.', repeats: 1 }),
-        call('42', 'OK', { repeats: 0 }),
+        call('45', 'Refused', { ...refused, repeats: 8 }),
+        call('44', 'Refused', { ...refused, repeats: 1 }),
+        call('43', 'OK', { repeats: 0 }),
+        // What the server sends for a call that was no such refusal.
+        call('42', 'OK', { repeats: null }),
       ],
     });
     await settle(f);
+    const note = (): HTMLElement[] => all(f, 'app-mcp-activity-tab .m-side > section > .m-hint');
 
     const rows = all(f, '[role=row].pick');
     expect(rows[0].textContent).toContain('×8');
-    expect(rows[1].textContent).not.toContain('×');
-    expect(rows[2].textContent).not.toContain('×');
-    expect(text(f)).toContain('Refused 8 times this minute so far — only the 1st, 2nd, 4th, 8th… are recorded.');
+    for (const row of rows.slice(1)) expect(row.textContent).not.toContain('×');
+    expect(note().map(n => n.textContent)).toContain('Refused 8 times this minute so far — only the 1st, 2nd, 4th, 8th… are recorded.');
 
-    // The first refusal of a minute is one refusal: nothing to add.
+    // The first refusal of a minute is one refusal — and the start of the thinning, which is said.
     rows[1].click();
     await settle(f);
+    expect(note().map(n => n.textContent)).toContain('The first call refused this minute — after it, only the 2nd, 4th, 8th… are recorded.');
     expect(text(f)).not.toContain('this minute so far');
+
+    // Any other call has nothing of the kind to say.
+    for (const row of [rows[2], rows[3]]) {
+      row.click();
+      await settle(f);
+      expect(text(f)).not.toContain('this minute');
+    }
+  });
+
+  it('adds the next page of calls under the list', async () => {
+    const f = await open('activity');
+    http.expectOne(isActivity).flush({ more: true, calls: [call('42', 'OK')] });
+    await settle(f);
+    expect(text(f)).toContain('Showing 1 of 1 284 records');
+
+    button(f, 'Load more').click();
+    await settle(f);
+    const more = http.expectOne(isActivity);
+    // After the last call on screen, under the same filters.
+    expect(more.request.params.get('afterTs')).toBe('639000000000000000');
+    expect(more.request.params.get('afterId')).toBe('42');
+    expect(more.request.params.get('count')).toBe('50');
+    more.flush({ more: false, calls: [call('41', 'Trimmed'), call('40', 'OK')] });
+    await settle(f);
+
+    expect(all(f, '[role=row].pick').map(r => r.querySelector('.m-pill')?.textContent)).toEqual(['OK', 'Trimmed', 'OK']);
+    // The picked call stays picked, and there is nothing more to load.
+    expect(all(f, '[role=row].pick').map(r => r.getAttribute('aria-selected'))).toEqual(['true', 'false', 'false']);
+    expect(all(f, 'app-mcp-activity-tab button').map(b => b.textContent?.trim())).not.toContain('Load more');
+    expect(text(f)).toContain('Showing 3 of 1 284 records');
   });
 
   it('a filter that changes abandons the page being loaded under the old one', async () => {

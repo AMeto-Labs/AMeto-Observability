@@ -66,7 +66,7 @@ export interface McpProfile {
   lastCallAt: string | null;
 }
 
-/** What `POST` / `PUT /api/mcp/profiles` take. */
+/** What `POST /api/mcp/profiles` takes. */
 export interface McpProfileInput {
   name: string;
   description: string;
@@ -85,6 +85,12 @@ export interface McpProfileInput {
    */
   publishedTools?: string[];
 }
+
+/**
+ * What `PUT /api/mcp/profiles/{id}` takes: any of the fields above. The server keeps every
+ * field the body leaves out, so a change sends what it changes and nothing else.
+ */
+export type McpProfilePatch = Partial<McpProfileInput>;
 
 export type McpMaskAction = 'hash' | 'remove' | 'keepLast4' | 'keep';
 
@@ -219,11 +225,12 @@ export interface McpCall {
   client: string | null;
   maskedBy: McpMaskedBy | null;
   /**
-   * How many refusals the profile's minute has had so far, this one included. A profile over
-   * its calls-per-minute limit has only its 1st, 2nd, 4th, 8th… refusal of a minute recorded,
-   * and each such record carries the count. Absent or 0 for an ordinary call.
+   * How many refusals past the limit the profile's minute has had so far, this one included. A
+   * profile over its calls-per-minute limit has only its 1st, 2nd, 4th, 8th… such refusal of a
+   * minute recorded, and each of those records carries the count — `1` on the first. Null or
+   * absent for every other call.
    */
-  repeats?: number;
+  repeats?: number | null;
 }
 
 export interface McpActivityPage {
@@ -247,7 +254,21 @@ export interface McpSummary {
   hours: number;
   /** True when the window holds more calls than one summary reads: the figures are of the newest only. */
   partial: boolean;
+  /** The calls of the record. Past a profile's limit not every call is in it: see `unrecorded`. */
   calls: number;
+  /**
+   * At least this many more calls were refused past a profile's calls-per-minute limit without
+   * being recorded one by one: such a refusal is recorded only as the 1st, 2nd, 4th, 8th… of its
+   * minute. `refusals.limit` counts them already; `calls` and `statuses` do not. Absent from an
+   * older server.
+   */
+  unrecorded?: number;
+  /**
+   * True when any refusal past a profile's limit is in the window. The counts it is part of are
+   * then floors even when `unrecorded` is 0: a minute whose last record is its 2nd refusal may
+   * have had a 3rd that no record holds. Absent from an older server.
+   */
+  thinned?: boolean;
   profiles: number;
   events: number;
   /** Of the calls that returned any event; null when none did. */
@@ -280,13 +301,27 @@ export interface McpStoredEvent {
   props?: Record<string, unknown>;
 }
 
-/** `POST /api/mcp/preview`: one event as stored and as an answer would carry it. */
+/**
+ * One property of an event as an answer carries it. `name` is what the AI gets; `stored` is the
+ * name the property is stored under — the same, unless the name itself held a value and was
+ * replaced by its token. Absent from an older server, which sends every name as it is stored.
+ */
+export interface McpSentProperty {
+  name: string;
+  value: string;
+  stored?: string;
+}
+
+/**
+ * `POST /api/mcp/preview`: one event as stored and as an answer would carry it. A whole number
+ * of the stored event past what a double holds is read with its digits kept (`JsonDigits`).
+ */
 export interface McpPreview {
   found: boolean;
   stored?: McpStoredEvent;
   sent?: {
     template: string;
-    properties: { name: string; value: string }[];
+    properties: McpSentProperty[];
     exception?: { type: string; message?: string; stack?: string };
   };
   masked?: {

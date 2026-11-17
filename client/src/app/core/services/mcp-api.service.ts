@@ -1,11 +1,12 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient, HttpErrorResponse, HttpParams } from '@angular/common/http';
-import { Observable } from 'rxjs';
+import { Observable, TimeoutError, map } from 'rxjs';
 import {
   McpActivityPage, McpActivityQuery, McpFieldError, McpLimits, McpOfferedTool, McpOverview, McpPreview,
-  McpProfile, McpProfileInput, McpPublishedTool, McpRule, McpRuleInput, McpSummary, McpToolInput,
+  McpProfile, McpProfileInput, McpProfilePatch, McpPublishedTool, McpRule, McpRuleInput, McpSummary, McpToolInput,
   McpToolList, McpToolTestResult, McpUsage,
 } from '../models/mcp.model';
+import { parseExactJson } from '../../shared/utils/exact-json';
 
 /** What `PUT /api/mcp/settings` takes; a field left out keeps its value. */
 export type McpSettingsPatch = Partial<McpLimits> & {
@@ -52,7 +53,8 @@ export class McpApiService {
     return this.http.post<{ profile: McpProfile; key: string }>('/api/mcp/profiles', input);
   }
 
-  updateProfile(id: string, input: McpProfileInput): Observable<McpProfile> {
+  /** Changes the fields `input` names; the server keeps the others as they are. */
+  updateProfile(id: string, input: McpProfilePatch): Observable<McpProfile> {
     return this.http.put<McpProfile>(`/api/mcp/profiles/${encodeURIComponent(id)}`, input);
   }
 
@@ -87,9 +89,14 @@ export class McpApiService {
     return this.http.delete<void>(`/api/mcp/rules/${encodeURIComponent(id)}`);
   }
 
-  /** The most recent event matching `filter`, as stored and as an answer would carry it. */
+  /**
+   * The most recent event matching `filter`, as stored and as an answer would carry it. Read as
+   * text and parsed here: the stored event is the log's own, and a 64-bit value in it — hidden
+   * from the answer, so shown nowhere else — keeps its digits (see `parseExactJson`).
+   */
   preview(body: { filter?: string; mode?: string; profileId?: string }): Observable<McpPreview> {
-    return this.http.post<McpPreview>('/api/mcp/preview', body);
+    return this.http.post('/api/mcp/preview', body, { responseType: 'text' })
+      .pipe(map(text => parseExactJson(text) as McpPreview));
   }
 
   // ── Tools ───────────────────────────────────────────────────────────────────
@@ -132,15 +139,22 @@ export class McpApiService {
 
 /**
  * The server's own sentence for a refused change, and the field it names: every `400` of this
- * API carries both. Anything else — a dropped connection, a `500` — gets `fallback`.
+ * API carries both. A request that was given up on waiting says so. Anything else — a dropped
+ * connection, a `500` — gets `fallback`.
  */
 export function mcpError(e: unknown, fallback: string): McpFieldError {
   if (e instanceof HttpErrorResponse) {
-    const body = e.error as Partial<McpFieldError> | null;
+    // A request read as text (the preview) has its refusal as text too.
+    const body = (typeof e.error === 'string' ? jsonOrNull(e.error) : e.error) as Partial<McpFieldError> | null;
     if (body && typeof body.error === 'string' && body.error) {
       return { error: body.error, field: typeof body.field === 'string' ? body.field : undefined };
     }
     if (e.status === 403) return { error: 'Only an administrator can change this.' };
   }
+  if (e instanceof TimeoutError) return { error: 'The server did not answer in time.' };
   return { error: fallback };
+}
+
+function jsonOrNull(text: string): unknown {
+  try { return JSON.parse(text); } catch { return null; }
 }

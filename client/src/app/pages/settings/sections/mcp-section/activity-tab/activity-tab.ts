@@ -30,11 +30,18 @@ const PAGE = 50;
 const quote = (value: string): string => `'${value.replace(/\\/g, '\\\\').replace(/'/g, '\\\'')}'`;
 
 /**
- * How many refusals a record stands for, when it stands for more than its own: a profile over
- * its calls-per-minute limit has only its 1st, 2nd, 4th, 8th… refusal of a minute recorded,
- * each with the count so far. 0 for a record that is one call and no more.
+ * Which refusal past the limit of its minute a record is: a profile over its calls-per-minute
+ * limit has only its 1st, 2nd, 4th, 8th… such refusal of a minute recorded, each with the
+ * count so far. 0 for a record of any other call.
  */
-const repeatsOf = (call: McpCall): number => (typeof call.repeats === 'number' && call.repeats > 1 ? call.repeats : 0);
+const repeatsOf = (call: McpCall): number => (typeof call.repeats === 'number' && call.repeats > 0 ? call.repeats : 0);
+
+/** What the detail of a refusal past the limit says about the ones that were not recorded. */
+function repeatsNote(repeats: number): string {
+  if (repeats === 0) return '';
+  if (repeats === 1) return 'The first call refused this minute — after it, only the 2nd, 4th, 8th… are recorded.';
+  return `Refused ${fmtCount(repeats)} times this minute so far — only the 1st, 2nd, 4th, 8th… are recorded.`;
+}
 
 /**
  * Activity: the record of the assistants' calls, newest first, and one call taken apart — who
@@ -99,18 +106,21 @@ export class ActivityTabComponent {
       tokens: answered ? fmtCount(c.tokens) : '—',
       ms: fmtCount(c.elapsedMs),
       tone: statusTone(c.status),
-      /** `16` for a record that stands for sixteen refusals of its minute; empty for a single call. */
-      repeats: repeats ? fmtCount(repeats) : '',
+      /** `16` for a record that stands for sixteen refusals of its minute; empty for one that stands for itself. */
+      repeats: repeats > 1 ? fmtCount(repeats) : '',
     };
   }));
 
-  /** `Showing 14 of 1 284 calls` where the whole is known: the unfiltered last day. */
+  /**
+   * `Showing 14 of 1 284 records` where the whole is known: the unfiltered last day. Records,
+   * not calls: past a profile's limit one record can stand for many refused calls (×N).
+   */
   readonly footer = computed(() => {
     const shown = this.calls().length;
     const summary = this.store.summary();
     const unfiltered = !this.profileId() && !this.tool() && !this.status() && this.hours() === 24;
     const total = unfiltered && summary && !summary.partial && summary.calls >= shown ? ` of ${fmtCount(summary.calls)}` : '';
-    return `Showing ${fmtCount(shown)}${total} ${shown === 1 && !total ? 'call' : 'calls'}`;
+    return `Showing ${fmtCount(shown)}${total} ${shown === 1 && !total ? 'record' : 'records'}`;
   });
 
   // ── The picked call ─────────────────────────────────────────────────────────
@@ -125,13 +135,12 @@ export class ActivityTabComponent {
       : c.status === 'Timed out' ? `Ran out of its time budget after ${fmtCount(c.elapsedMs)} ms; what it had found was returned as a part`
       : c.status === 'Failed' ? 'Failed on the server; the server log has the details'
       : `Refused by ${REFUSAL_KINDS[c.refusalKind ?? ''] ?? 'the server'}`;
-    const repeats = repeatsOf(c);
     return {
       call: c,
       title: `Call ${clockTime(c.at)}`,
       tone: statusTone(c.status),
       result,
-      repeats: repeats ? `Refused ${fmtCount(repeats)} times this minute so far — only the 1st, 2nd, 4th, 8th… are recorded.` : '',
+      repeats: repeatsNote(repeatsOf(c)),
       arguments: prettyJson(c.arguments),
       filter: tokenSegments(c.filter),
       filterHasToken: hasToken(c.filter),

@@ -10,7 +10,7 @@ import {
 } from '../../../../../core/models/mcp.model';
 import { McpSectionStore } from '../mcp.store';
 import {
-  asCount, fmtCount, fmtWindow, isCount, parseWindow, placeholderNames, placeholderSegments, tokenSegments,
+  asCount, fmtCount, fmtWindow, isCount, parseWindow, placeholderNames, placeholderSegments, sameWindow, tokenSegments,
 } from '../mcp-format';
 
 /** A parameter as its row holds it: the allowed values of an enum as one comma-separated text. */
@@ -98,6 +98,16 @@ const toForm = (tool: McpPublishedTool | null): ToolForm => (tool ? {
   profiles: [...tool.profiles],
 } : blank());
 
+/** True when two forms describe the same tool: `1h` typed over `1 h` changes nothing. */
+const sameTool = (a: ToolForm, b: ToolForm): boolean =>
+  sameWindow(a.window, b.window) && JSON.stringify({ ...a, window: '' }) === JSON.stringify({ ...b, window: '' });
+
+/** The field of the form that a refusal's `field` names, by the server's name for it. */
+const FORM_FIELDS: Readonly<Record<string, keyof ToolForm>> = {
+  name: 'name', description: 'description', parameters: 'parameters', filter: 'filter', fields: 'fields',
+  defaultWindowMinutes: 'window', maxEvents: 'maxEvents', order: 'order', profiles: 'profiles',
+};
+
 /**
  * The editor of a published tool: a saved query with parameters, which an assistant calls by
  * name. On the left the definition; on the right a test run that answers exactly as a chosen
@@ -140,11 +150,11 @@ export class ToolEditorComponent {
     source: () => this.toolId(),
     computation: () => toForm(untracked(this.tool)),
   });
-  private readonly baseline = linkedSignal<string, string>({
+  private readonly baseline = linkedSignal<string, ToolForm>({
     source: () => this.toolId(),
-    computation: () => JSON.stringify(toForm(untracked(this.tool))),
+    computation: () => toForm(untracked(this.tool)),
   });
-  readonly dirty = computed(() => JSON.stringify(this.form()) !== this.baseline());
+  readonly dirty = computed(() => !sameTool(this.form(), this.baseline()));
 
   readonly saving = signal(false);
   readonly error = signal<string | null>(null);
@@ -207,8 +217,18 @@ export class ToolEditorComponent {
 
   // ── Editing ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Changes fields of the form. A refusal is about the value it refused: once the field it
+   * names holds another, the save's sentence and the field's mark go. A test run's answer
+   * stays on screen — it is the answer the run got — but no longer points at the field.
+   */
   patch(change: Partial<ToolForm>): void {
     this.form.update(f => ({ ...f, ...change }));
+    const about = this.errorField();
+    const field = about === null ? undefined : FORM_FIELDS[about];
+    if (field === undefined || !(field in change)) return;
+    this.error.set(null);
+    this.errorField.set(null);
   }
 
   /**
@@ -266,7 +286,7 @@ export class ToolEditorComponent {
   }
 
   discard(): void {
-    this.form.set(JSON.parse(this.baseline()) as ToolForm);
+    this.form.set(this.baseline());
     this.error.set(null);
     this.errorField.set(null);
   }
@@ -314,7 +334,7 @@ export class ToolEditorComponent {
       // What the server kept is what is now unsaved-free: trimmed names, clamped numbers.
       const form = toForm(saved);
       this.form.set(form);
-      this.baseline.set(JSON.stringify(form));
+      this.baseline.set(form);
       this.store.setDirty('tool', false);
       this.saved.emit(saved.id);
     } catch (e) {
@@ -404,9 +424,10 @@ export class ToolEditorComponent {
     for (const p of this.testParameters()) {
       const text = (values[p.name] ?? '').trim();
       if (!text) continue;
-      args[p.name] = p.type === 'boolean' ? text === 'true'
-                   : p.type === 'number' && Number.isFinite(Number(text)) ? Number(text)
-                   : text;
+      // A number goes as the text that was typed: the server reads a number argument from a
+      // JSON string as it does from a JSON number, and Number() would turn a 64-bit id into
+      // another id — one the filter then looks for instead.
+      args[p.name] = p.type === 'boolean' ? text === 'true' : text;
     }
     const from = (values['from'] ?? '').trim();
     if (from) args['from'] = from;

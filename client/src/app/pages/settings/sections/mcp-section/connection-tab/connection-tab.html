@@ -69,7 +69,7 @@
     <app-section title="Last 24 hours">
       <div class="tiles">
         @for (t of tiles(); track t.label) {
-          <div class="m-tile">
+          <div class="m-tile" [attr.title]="t.title ?? null">
             <span class="m-hint">{{ t.label }}</span>
             <b>{{ t.value }}</b>
             <span class="m-hint m-el">{{ t.note }}</span>

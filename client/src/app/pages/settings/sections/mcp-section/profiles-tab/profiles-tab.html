@@ -204,11 +204,12 @@
   }
 </div>
 
-<!-- The key, once: after a profile is created or its key rotated. -->
-<app-modal [open]="revealedKey() !== null" title="Profile key" [dismissable]="false">
+<!-- The key, once: after a profile is created or its key rotated. It names its profile: the card
+     under it may be another one's by the time the key arrives. -->
+<app-modal [open]="revealed() !== null" [title]="keyTitle()" [dismissable]="false">
   <div class="m-key-reveal">
     <lucide-icon name="key" [size]="14" />
-    <span class="m-key-text">{{ revealedKey() }}</span>
+    <span class="m-key-text">{{ revealed()?.key }}</span>
     <button type="button" class="btn-icon" title="Copy" (click)="copyKey()">
       <lucide-icon [name]="copied() ? 'check' : 'copy'" [size]="13" />
     </button>
@@ -219,7 +220,9 @@
   </div>
 </app-modal>
 
-<app-modal [open]="confirming() === 'rotate'" title="Rotate the key?" (close)="confirming.set(null)">
+<!-- Neither question can be put away while its answer is on its way: the card under it must
+     still be the profile it is about when that answer arrives. -->
+<app-modal [open]="confirming() === 'rotate'" title="Rotate the key?" [dismissable]="!working()" (close)="confirming.set(null)">
   <span class="m-sub">The current key of “{{ selected()?.name }}” stops working at once. Every client that uses it has to be given the new one.</span>
   <div class="m-actions">
     <button type="button" class="btn" [disabled]="working()" (click)="confirming.set(null)">Cancel</button>
@@ -230,7 +233,7 @@
   </div>
 </app-modal>
 
-<app-modal [open]="confirming() === 'delete'" title="Delete the profile?" (close)="confirming.set(null)">
+<app-modal [open]="confirming() === 'delete'" title="Delete the profile?" [dismissable]="!working()" (close)="confirming.set(null)">
   <span class="m-sub">“{{ selected()?.name }}” and its key are removed, and its access ends at once. The record of its calls stays in the log.</span>
   <div class="m-actions">
     <button type="button" class="btn" [disabled]="working()" (click)="confirming.set(null)">Cancel</button>

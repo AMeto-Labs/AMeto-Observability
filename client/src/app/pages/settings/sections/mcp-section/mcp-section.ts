@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component, computed, effect, inject, signal, untracked } from '@angular/core';
-import { toSignal } from '@angular/core/rxjs-interop';
-import { ActivatedRoute, ParamMap, Router } from '@angular/router';
+import { Location } from '@angular/common';
+import { takeUntilDestroyed, toSignal } from '@angular/core/rxjs-interop';
+import { ActivatedRoute, NavigationStart, ParamMap, Router } from '@angular/router';
 
 import { SettingsDirtyService } from '../../settings-dirty.service';
 import { MCP_TABS, McpSectionStore, McpTabId } from './mcp.store';
@@ -28,6 +29,13 @@ const placeOf = (params: ParamMap): Place => {
 const samePlace = (a: Place, b: Place): boolean => a.tab === b.tab && a.tool === b.tool;
 
 /**
+ * Where the browser's current history entry stands among the others, where the browser says:
+ * the Navigation API's index. Null without that API.
+ */
+const historyIndex = (): number | null =>
+  (globalThis as { navigation?: { currentEntry?: { index: number } | null } }).navigation?.currentEntry?.index ?? null;
+
+/**
  * Settings → AI / MCP: the Model Context Protocol endpoint for AI assistants — where it is and
  * how a client connects, the profiles and their keys, what is hidden from an answer, the tools
  * an assistant is offered, and the record of its calls (docs/MCP.md).
@@ -51,6 +59,7 @@ export class McpSectionComponent {
   readonly store = inject(McpSectionStore);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
+  private readonly location = inject(Location);
   private readonly dirtyService = inject(SettingsDirtyService);
 
   readonly tabs = MCP_TABS;
@@ -68,6 +77,12 @@ export class McpSectionComponent {
    */
   private readonly place = signal<Place>(placeOf(this.route.snapshot.queryParamMap));
 
+  /** The history entry of the place, by its index (see historyIndex); null where that is not known. */
+  private placeEntry = historyIndex();
+
+  /** True while the Router follows the browser's Back or Forward rather than a move of the page's own. */
+  private traversing = false;
+
   readonly activeTab = computed<McpTabId>(() => this.place().tab);
 
   /** The tool open in the editor: its id, `new`, or null while the list is shown. */
@@ -80,6 +95,9 @@ export class McpSectionComponent {
   readonly createRequest = signal(0);
 
   constructor() {
+    this.router.events.pipe(takeUntilDestroyed()).subscribe(e => {
+      if (e instanceof NavigationStart) this.traversing = e.navigationTrigger === 'popstate';
+    });
     effect(() => this.dirtyService.mark('ai-mcp', this.store.anyDirty()));
     effect(() => {
       const requested = this.requested();
@@ -125,19 +143,36 @@ export class McpSectionComponent {
    * Goes where the URL now points. A move made inside the section has asked its question
    * before it touched the URL, and cleared the flag; what arrives here with the flag still up
    * is Back, Forward or an address typed by hand — out of an editor with unsaved input. "No"
-   * keeps the editor and puts its address back in place of the one that was just entered.
+   * keeps the editor, and its address with it (see `stay`).
    */
   private follow(requested: Place): void {
     const here = this.place();
     if (samePlace(requested, here)) return;
     if (here.tool !== null && this.store.dirty().tool) {
       if (!confirm('This tool has unsaved changes. Discard them?')) {
-        this.go({ mcp: here.tab, tool: here.tool }, true);
+        this.stay(here);
         return;
       }
       this.store.setDirty('tool', false);
     }
     this.place.set(requested);
+    this.placeEntry = historyIndex();
+  }
+
+  /**
+   * "No" to leaving the editor: the address goes back to the editor's. After Back or Forward
+   * that is a step back through the history to the editor's own entry, so the entry Back went
+   * to is still there for the next Back. Where the browser does not say where its entries
+   * stand, the editor's address takes the place of the one just entered instead — that entry
+   * is lost, but the address is right.
+   */
+  private stay(here: Place): void {
+    const now = historyIndex();
+    if (this.traversing && this.placeEntry !== null && now !== null && now !== this.placeEntry) {
+      this.location.historyGo(this.placeEntry - now);
+      return;
+    }
+    this.go({ mcp: here.tab, tool: here.tool }, true);
   }
 
   private go(queryParams: Record<string, string | null>, replaceUrl = false): void {

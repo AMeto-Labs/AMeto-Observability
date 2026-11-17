@@ -1,11 +1,12 @@
 import { DestroyRef, computed, inject } from '@angular/core';
 import { patchState, signalStore, withComputed, withMethods, withState } from '@ngrx/signals';
-import { Subscription, catchError, firstValueFrom, forkJoin, of } from 'rxjs';
+import { Subscription, TimeoutError, catchError, firstValueFrom, forkJoin, of, timeout } from 'rxjs';
 
 import { ApiService } from '../../../../core/services/api.service';
 import { McpApiService, McpSettingsPatch, mcpError } from '../../../../core/services/mcp-api.service';
 import {
-  McpOverview, McpProfile, McpProfileInput, McpPublishedTool, McpRule, McpRuleInput, McpSummary, McpToolInput,
+  McpOverview, McpProfile, McpProfileInput, McpProfilePatch, McpPublishedTool, McpRule, McpRuleInput, McpSummary,
+  McpToolInput,
 } from '../../../../core/models/mcp.model';
 
 /** The section's tabs, in the order they are shown. */
@@ -19,8 +20,18 @@ export const MCP_TABS = [
 
 export type McpTabId = (typeof MCP_TABS)[number]['id'];
 
-/** The parts of the section that can hold unsaved input. */
-export type McpDirtyPart = 'limits' | 'profile' | 'tool';
+/**
+ * The parts of the section that hold something a reload would lose: unsaved input, and a
+ * profile's key while it is on its way or on screen — it is shown once, and the key it
+ * replaced has stopped working.
+ */
+export type McpDirtyPart = 'limits' | 'profile' | 'tool' | 'key';
+
+/**
+ * How long a change of the section's settings is waited for. The changes go one at a time, so
+ * one that is never answered would hold every switch behind it for good.
+ */
+export const SETTINGS_CHANGE_TIMEOUT_MS = 30_000;
 
 interface McpSectionState {
   loading: boolean;
@@ -58,7 +69,7 @@ const initialState: McpSectionState = {
   usage: {},
   summary: null,
   services: [],
-  dirty: { limits: false, profile: false, tool: false },
+  dirty: { limits: false, profile: false, tool: false, key: false },
 };
 
 /** The two lists that name each other. */
@@ -174,11 +185,24 @@ export const McpSectionStore = signalStore(
      * worked out when its turn comes: from the state the change before it left, not from the
      * state at the click. Two quick clicks would otherwise send two lists, each of which
      * undoes the other's switch.
+     *
+     * A change that is not answered in time is given up on, so the ones behind it can go. It
+     * may still have been made, though, so the section is read again before the next one is
+     * worked out — from the server's settings, not from the state before the change.
      */
     let settingsChange: Promise<unknown> = Promise.resolve();
     const changeSettings = (patch: () => McpSettingsPatch): Promise<void> => {
       const change = settingsChange.then(async () => {
-        patchState(store, { overview: await firstValueFrom(api.updateSettings(patch())) });
+        try {
+          const overview = await firstValueFrom(api.updateSettings(patch()).pipe(timeout(SETTINGS_CHANGE_TIMEOUT_MS)));
+          patchState(store, { overview });
+        } catch (e) {
+          if (e instanceof TimeoutError) {
+            await firstValueFrom(api.getOverview().pipe(timeout(SETTINGS_CHANGE_TIMEOUT_MS)))
+              .then(overview => patchState(store, { overview }), () => undefined);
+          }
+          throw e;
+        }
       });
       settingsChange = change.catch(() => undefined);
       return change;
@@ -254,10 +278,12 @@ export const McpSectionStore = signalStore(
         return created;
       },
 
-      async updateProfile(id: string, input: McpProfileInput): Promise<void> {
+      /** Changes the fields `input` names, and answers the profile as the server kept it. */
+      async updateProfile(id: string, input: McpProfilePatch): Promise<McpProfile> {
         const saved = await firstValueFrom(api.updateProfile(id, input));
         patchState(store, withProfile(lists(), saved));
         readListsAgain();
+        return saved;
       },
 
       async deleteProfile(id: string): Promise<void> {

@@ -9,7 +9,7 @@ import { McpProfile, McpProfileInput, McpPublishedTool } from '../../../../../co
 import { McpSectionStore } from '../mcp.store';
 import { asCount, dayOf, isCount, lastCall, parseWindow } from '../mcp-format';
 import { focusRow, rowKeyTarget } from '../pick-rows';
-import { ProfileForm, blankForm, rebaseForm, sameForm, sameMembers, toForm } from './profile-form';
+import { ProfileForm, blankForm, changesOf, rebaseForm, sameForm, sameMembers, toForm } from './profile-form';
 
 /** One switch of the card's tool grid. */
 interface ToolSwitch {
@@ -22,10 +22,23 @@ interface ToolSwitch {
   draft: boolean;
 }
 
+/** A key just created or rotated, with the name of the profile it opens. */
+interface RevealedKey {
+  key: string;
+  profile: string;
+}
+
 const NEW = 'new';
 
 /** The id of the card's error line, for the field it is about to point at. */
 const ERROR_ID = 'mcp-profile-error';
+
+/** The field of the card that a refusal's `field` names, by the server's name for it. */
+const FORM_FIELDS: Readonly<Record<string, keyof ProfileForm>> = {
+  name: 'name', description: 'description', toolsMode: 'toolsMode', tools: 'builtIn', publishedTools: 'published',
+  services: 'services', maskingMode: 'maskingMode', freeFilters: 'freeFilters', maxEvents: 'maxEvents',
+  maxWindowMinutes: 'window', callsPerMinute: 'callsPerMinute',
+};
 
 /**
  * Profiles: a key and what that key may do. The list on the left, the card of the picked
@@ -63,8 +76,24 @@ export class ProfilesTabComponent {
   readonly errorField = signal<string | null>(null);
   readonly serviceDraft = signal('');
 
-  /** The key just created or rotated: shown once, until acknowledged. */
-  readonly revealedKey = signal<string | null>(null);
+  /**
+   * Goes up each time the card is filled anew: another profile, a blank one, the same one
+   * again. An answer to a change touches the card only while it is the card the change was
+   * sent from — a new profile's card left and opened again is another card.
+   */
+  private card = 0;
+
+  /**
+   * The key just created or rotated: shown once, until acknowledged. It carries the name of its
+   * profile because the card under it may be another profile's by the time it arrives.
+   */
+  readonly revealed = signal<RevealedKey | null>(null);
+  readonly keyTitle = computed(() => {
+    const r = this.revealed();
+    return r ? `Key of “${r.profile}”` : '';
+  });
+  /** True while a create or a rotate is on its way: its answer is a key that exists nowhere else. */
+  private readonly keyPending = signal(false);
   readonly copied = signal(false);
   readonly confirming = signal<'delete' | 'rotate' | null>(null);
   readonly working = signal(false);
@@ -154,6 +183,9 @@ export class ProfilesTabComponent {
       if (this.createRequest() > 0) untracked(() => this.startNew());
     });
     effect(() => this.store.setDirty('profile', this.dirty()));
+    // A key on its way or on screen is lost to a reload, and the key it replaced is dead
+    // already: leaving the page asks first, as it does for unsaved input.
+    effect(() => this.store.setDirty('key', this.keyPending() || this.revealed() !== null));
   }
 
   private blank(): ProfileForm {
@@ -190,6 +222,7 @@ export class ProfilesTabComponent {
   private open(id: string | null): void {
     const profile = id === null || id === NEW ? null : this.store.profiles().find(p => p.id === id) ?? null;
     const form = this.known(profile ? toForm(profile) : this.blank());
+    this.card++;
     this.selectedId.set(id);
     this.form.set(form);
     this.baseline.set(form);
@@ -228,8 +261,16 @@ export class ProfilesTabComponent {
     else this.open(this.selectedId());
   }
 
+  /**
+   * Changes fields of the card. A refusal is about the value it refused: once the field it
+   * names holds another, the refusal — its sentence and its mark — is about nothing on screen,
+   * and goes. Whether the new value will do is asked again on save.
+   */
   patch(change: Partial<ProfileForm>): void {
     this.form.update(f => ({ ...f, ...change }));
+    const about = this.errorField();
+    const field = about === null ? undefined : FORM_FIELDS[about];
+    if (field !== undefined && field in change) this.fail(null, null);
   }
 
   /** `aria-describedby` of a field: the error line while it is about that field, else nothing. */
@@ -241,7 +282,8 @@ export class ProfilesTabComponent {
     if (t.blocked) return;
     const id = t.key.slice(2);
     const flip = (list: string[]) => (list.includes(id) ? list.filter(x => x !== id) : [...list, id]);
-    this.form.update(f => (t.builtIn ? { ...f, builtIn: flip(f.builtIn) } : { ...f, published: flip(f.published) }));
+    const f = this.form();
+    this.patch(t.builtIn ? { builtIn: flip(f.builtIn) } : { published: flip(f.published) });
   }
 
   addService(): void {
@@ -264,37 +306,66 @@ export class ProfilesTabComponent {
     if (window === null) return this.fail('Write the time window with a unit: 30m, 24h, 7d.', 'maxWindowMinutes');
     if (!isCount(f.callsPerMinute)) return this.fail('Calls per minute is a whole number above zero.', 'callsPerMinute');
 
-    const input: McpProfileInput = {
-      name: f.name.trim(), description: f.description.trim(), toolsMode: f.toolsMode, tools: f.builtIn,
-      services: f.services, maskingMode: f.maskingMode, freeFilters: f.freeFilters,
-      maxEvents: f.maxEvents, maxWindowMinutes: window, callsPerMinute: f.callsPerMinute,
-    };
-    // The grants go along only when they were changed here. Left out, the server keeps them as
-    // they are — so a save that is about the name cannot undo what a tool's editor just did.
-    if (!sameMembers(f.published, this.baseline().published)) input.publishedTools = f.published;
-
-    this.error.set(null);
-    this.errorField.set(null);
+    const id = this.selectedId()!;
+    const card = this.card;
+    const name = f.name.trim();
+    // What a refusal calls the profile when the card has moved on: the name it is listed under.
+    const listed = this.selected()?.name ?? name;
+    this.fail(null, null);
     this.saving.set(true);
     try {
-      if (this.isNew()) {
+      if (id === NEW) {
+        const input: McpProfileInput = {
+          name, description: f.description.trim(), toolsMode: f.toolsMode, tools: f.builtIn,
+          services: f.services, maskingMode: f.maskingMode, freeFilters: f.freeFilters,
+          maxEvents: f.maxEvents, maxWindowMinutes: window, callsPerMinute: f.callsPerMinute,
+        };
+        if (!sameMembers(f.published, this.baseline().published)) input.publishedTools = f.published;
+        this.keyPending.set(true);
         const { profile, key } = await this.store.createProfile(input);
-        this.open(profile.id);
-        this.revealedKey.set(key);
+        // Shown whatever the card holds by now: this answer is the only place the key exists.
+        this.revealed.set({ key, profile: profile.name });
+        this.settle(card, profile, f);
       } else {
-        const id = this.selectedId()!;
-        await this.store.updateProfile(id, input);
-        this.open(id);
+        // What was changed here and nothing else: the server keeps every field the body leaves
+        // out, so a save that is about the name cannot undo what somebody else did meanwhile —
+        // a tool's editor that withdrew a grant, another administrator who narrowed the services.
+        this.settle(card, await this.store.updateProfile(id, changesOf(f, this.baseline(), window)), f);
       }
     } catch (e) {
       const problem = mcpError(e, 'The profile could not be saved.');
-      this.fail(problem.error, problem.field ?? null);
+      this.refused(card, listed, problem.error, problem.field ?? null);
     } finally {
       this.saving.set(false);
+      this.keyPending.set(false);
     }
   }
 
-  private fail(message: string, field: string | null): void {
+  /**
+   * The card after a save sent from `card` was answered with `saved` — when it is still that
+   * card. Filled anew meanwhile, after the question — another profile, or another new one —
+   * it is not touched. Otherwise it becomes the profile as the server kept it, with whatever
+   * was typed while the save was on its way kept on top, unsaved.
+   */
+  private settle(card: number, saved: McpProfile, sent: ProfileForm): void {
+    if (this.card !== card) return;
+    const fresh = this.known(toForm(saved));
+    this.selectedId.set(saved.id);
+    this.baseline.set(fresh);
+    this.form.set(this.known(rebaseForm(this.form(), sent, fresh)));
+  }
+
+  /**
+   * A change sent from `card` that the server refused: said on that card — or, when the card
+   * has been filled anew meanwhile, said there with the profile's name and pointing at no
+   * field of what the card holds now.
+   */
+  private refused(card: number, name: string, message: string, field: string | null): void {
+    if (this.card === card) this.fail(message, field);
+    else this.fail(`“${name}”: ${message}`, null);
+  }
+
+  private fail(message: string | null, field: string | null): void {
     this.error.set(message);
     this.errorField.set(field);
   }
@@ -302,31 +373,35 @@ export class ProfilesTabComponent {
   // ── The key, and deleting ───────────────────────────────────────────────────
 
   async rotate(): Promise<void> {
-    const id = this.selectedId();
-    if (!id || id === NEW) return;
+    const profile = this.selected();
+    if (!profile) return;
+    const card = this.card;
     this.working.set(true);
+    this.keyPending.set(true);
     try {
-      this.revealedKey.set(await this.store.rotateKey(id));
+      this.revealed.set({ key: await this.store.rotateKey(profile.id), profile: profile.name });
       this.confirming.set(null);
     } catch (e) {
-      this.fail(mcpError(e, 'The key could not be rotated.').error, null);
+      this.refused(card, profile.name, mcpError(e, 'The key could not be rotated.').error, null);
       this.confirming.set(null);
     } finally {
       this.working.set(false);
+      this.keyPending.set(false);
     }
   }
 
   async remove(): Promise<void> {
-    const id = this.selectedId();
-    if (!id || id === NEW) return;
+    const profile = this.selected();
+    if (!profile) return;
+    const card = this.card;
     this.working.set(true);
     try {
       // Once the profile is gone from the store the card moves to the first one left, whatever
       // it held. Until then — and when the server refuses — what was typed stays unsaved input.
-      await this.store.deleteProfile(id);
+      await this.store.deleteProfile(profile.id);
       this.confirming.set(null);
     } catch (e) {
-      this.fail(mcpError(e, 'The profile could not be deleted.').error, null);
+      this.refused(card, profile.name, mcpError(e, 'The profile could not be deleted.').error, null);
       this.confirming.set(null);
     } finally {
       this.working.set(false);
@@ -334,7 +409,7 @@ export class ProfilesTabComponent {
   }
 
   async copyKey(): Promise<void> {
-    const key = this.revealedKey();
+    const key = this.revealed()?.key;
     if (!key) return;
     await copyToClipboard(key);
     this.copied.set(true);
@@ -342,7 +417,7 @@ export class ProfilesTabComponent {
   }
 
   acknowledgeKey(): void {
-    this.revealedKey.set(null);
+    this.revealed.set(null);
     this.copied.set(false);
   }
 }

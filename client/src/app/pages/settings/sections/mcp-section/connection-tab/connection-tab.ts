@@ -26,7 +26,19 @@ interface Tile {
   label: string;
   value: string;
   note: string;
+  /** Why the value is a floor rather than a count, where it is one. */
+  title?: string;
 }
+
+/**
+ * What a figure "at least" stands on: past a profile's calls-per-minute limit only the 1st,
+ * 2nd, 4th, 8th… refusal of a minute is recorded, so the calls in between are known only by
+ * the count the next record carries — and those after a minute's last record not at all.
+ */
+const AT_LEAST = 'At least: past a profile’s calls-per-minute limit only the 1st, 2nd, 4th, 8th… refusal of a minute is recorded.';
+
+/** Before a figure that is a floor; with a no-break space, as fmtCount sets its own. */
+const AT_LEAST_SIGN = '≥ ';
 
 const toForm = (limits: McpLimits | undefined): LimitsForm => ({
   responseBudgetTokens: limits?.responseBudgetTokens ?? null,
@@ -98,8 +110,19 @@ export class ConnectionTabComponent {
     if (!s) {
       return ['Calls', 'Events returned', 'Values masked', 'Refused'].map(label => ({ label, value: '—', note: ' ' }));
     }
+    // The record counts the calls it holds. Refusals past a limit that were not recorded one by
+    // one are counted beside it — and make every figure they are part of a floor. So does a
+    // refusal past a limit at all (`thinned`): the last one of its minute may be past the last
+    // record, and then nothing counts it.
+    const unrecorded = s.unrecorded ?? 0;
+    const isFloor = unrecorded > 0 || s.thinned === true;
+    const floor = isFloor ? { title: AT_LEAST } : {};
+    const atLeast = (n: number): string => (isFloor ? AT_LEAST_SIGN : '') + fmtCount(n);
     return [
-      { label: 'Calls', value: fmtCount(s.calls), note: `from ${fmtCount(s.profiles)} ${s.profiles === 1 ? 'profile' : 'profiles'}` },
+      {
+        label: 'Calls', value: atLeast(s.calls + unrecorded), ...floor,
+        note: `from ${fmtCount(s.profiles)} ${s.profiles === 1 ? 'profile' : 'profiles'}`,
+      },
       {
         label: 'Events returned', value: fmtCount(s.events),
         note: s.medianEvents === null ? 'no call returned any' : `median ${fmtCount(s.medianEvents)} per call`,
@@ -108,14 +131,20 @@ export class ConnectionTabComponent {
         label: 'Values masked', value: fmtCount(s.masked),
         note: s.masked === 0 ? 'nothing was hidden' : `${Math.round((s.maskedBy.rules / s.masked) * 100)} % by field rules`,
       },
-      { label: 'Refused', value: fmtCount(s.statuses['Refused'] ?? 0), note: this.refusedNote(s) },
+      {
+        label: 'Refused', value: atLeast((s.statuses['Refused'] ?? 0) + unrecorded), ...floor,
+        note: this.refusedNote(s, isFloor),
+      },
     ];
   });
 
-  private refusedNote(s: McpSummary): string {
+  /** The two kinds of refusal there were most of; `limitFloor` when the count of `limit` is a floor. */
+  private refusedNote(s: McpSummary, limitFloor: boolean): string {
     const kinds = Object.entries(s.refusals).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
     if (kinds.length === 0) return 'none in this window';
-    return kinds.slice(0, 2).map(([kind, n]) => `${fmtCount(n)} ${REFUSED_BY[kind] ?? kind}`).join(', ');
+    return kinds.slice(0, 2)
+      .map(([kind, n]) => `${kind === 'limit' && limitFloor ? AT_LEAST_SIGN : ''}${fmtCount(n)} ${REFUSED_BY[kind] ?? kind}`)
+      .join(', ');
   }
 
   // ── Server limits ───────────────────────────────────────────────────────────
@@ -167,13 +196,14 @@ export class ConnectionTabComponent {
   }
 
   /**
-   * `aria-describedby` of a limit's field: the error line while the field is one it is about —
-   * the window for the sentence about the window, the counts that will not do for the other.
+   * `aria-describedby` of a limit's field: the error line while the field is one it is about,
+   * and only until the field is put right — the window for the sentence about the window, the
+   * counts that will not do for the other.
    */
   describes(field: keyof LimitsForm): string | null {
     const about = this.limitsErrorAbout();
-    const named = about === 'window' ? field === 'window' : about === 'counts' && field !== 'window' && this.invalid()[field];
-    return named ? 'mcp-limits-error' : null;
+    const named = about === 'window' ? field === 'window' : about === 'counts' && field !== 'window';
+    return named && this.invalid()[field] ? 'mcp-limits-error' : null;
   }
 
   private failLimits(message: string | null, about: 'window' | 'counts' | null = null): void {
