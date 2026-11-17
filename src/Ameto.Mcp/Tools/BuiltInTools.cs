@@ -106,7 +106,7 @@ public static class BuiltInTools
 
         Filters use Seq syntax: @l = 'Error', StatusCode >= 500, @service in ['a', 'b'], has(UserId), @mt like '%timeout%', ci_contains(@x.message, 'refused'), Request.Path = '/pay', combined with and / or / not and parentheses. Plain words are looked for in the message template and in the exception, not in property values: to search a property, name it.
 
-        Hidden values: some values are replaced by tokens such as h:91c0e2aa5d17. One value has the same token wherever it is hidden the same way, so tokens can be compared, counted and grouped. To find other events with that value, filter with the token itself: UserId = 'h:91c0e2aa5d17'. A token may only stand as the value in =, != or in, with a property (not a built-in field such as @service); where the value is found it is shown as the token again. A hidden property can only be tested with =, !=, in or has(). Do not try to work out the value behind a token.
+        Hidden values: some values are replaced by tokens such as h:91c0e2aa5d17. One value has the same token wherever it is hidden the same way, so tokens can be compared, counted and grouped. To find other events with that value, filter with the token itself: UserId = 'h:91c0e2aa5d17'. A token may only stand as the value in =, != or in, and only with a property that hides the value wherever it is read: one logs_fields marks "= only", or — for a card number, an IIN or an email address a detector hid — the unmarked property it was found in. With a field that shows its values (a built-in field such as @service, a property kept as stored) it would find the value in the open, and is refused. A hidden property can only be tested with =, !=, in or has(). Do not try to work out the value behind a token.
 
         Answers are cut to a budget. When one ends with 'more', call again with the cursor it gives.
         """;
@@ -124,7 +124,8 @@ public static class BuiltInTools
           built-in     @t  @l  @mt  @service  @tr  @sp  @x.type  @x.message  @x.stack
           functions    has() isDefined() startsWith() contains() endsWith() and their ci_ forms, length(), regexMatch(); no others here
           free text    plain words are looked for in the message template and the exception, not in property values; every word must appear
-          hidden       a property marked "= only" takes =, !=, in and has(); a token (h:…) stands only as the value in =, != or in
+          hidden       a property marked "= only" takes =, !=, in and has(); so does "= only, no token", shown as stored in some services, but not with a token
+          tokens       a token (h:…) stands only as the value in =, != or in: with a property marked "= only", or for a card number, IIN or email the unmarked one it was in
           aggregation  select count(*) where @l = 'Error' group by @service limit 20   (logs_aggregate)
           strings are in single quotes; a quote inside one is doubled: 'can''t'
         """;

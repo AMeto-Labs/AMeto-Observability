@@ -125,7 +125,7 @@ listed among the profile's services.
 | `logs_search` | Events matching a filter, grouped by message template. |
 | `logs_aggregate` | A table: `select count(*) where @l = 'Error' group by @service`. |
 | `logs_context` | One event in full, the events of its service just before and after it, and the events of its trace. |
-| `logs_fields` | The properties found in recent events: how often, which type, sample values, whether hidden. Ends with a filter-syntax reference. |
+| `logs_fields` | The properties found in recent events: how often, which type, sample values, whether hidden — `= only` for a field hidden in every service, `= only, no token` for one that some service shows as stored (see [Tokens](#tokens)). Ends with a filter-syntax reference. |
 
 A built-in tool can be switched off for the whole server (Settings → AI / MCP → Tools, or
 `disabledTools` in `PUT /api/mcp/settings`). It is then offered to no profile, whatever the
@@ -148,8 +148,8 @@ differences. Both are there for the hidden values (see
   of the language (`toJson()`, `elementAt()`, `substring()`, …) are refused by name: several of
   them read a value by a road a field rule does not name.
 
-A filter or a query is at most 4 000 characters, with parentheses nested at most 32 deep, and a
-search takes at most 24 plain words.
+A filter or a query is at most 4 000 characters, with parentheses nested at most 32 deep, and
+holds at most 24 plain words in all, however they are grouped.
 
 ### What an answer looks like
 
@@ -252,7 +252,8 @@ call that would leave a tool with no condition is refused too.
 **The rules for hidden values hold.** A tool's filter is checked like any filter the assistant
 could write — it may not read a hidden field with anything but `=`, `!=`, `in` or `has()`, and a
 definition that does is refused when it is saved. Answers are masked as every answer is, and a
-token is a valid argument: `payments_by_card(card: "h:92f7e6d86459")` finds that card's payments.
+token is a valid argument where the tool compares it with a field a token may meet (see
+[Tokens](#tokens)): `payments_by_card(card: "h:92f7e6d86459")` finds that card's payments.
 
 **When a client sees a new tool.** A client on protocol revision `2026-07-28` is told with every
 list that the list is good for 60 seconds. A client that holds a session is sent
@@ -356,15 +357,35 @@ would order or match a visible value against the hidden one. The filter that run
 from the checked tree and read back before it is run; it is never the caller's text with pieces
 replaced.
 
-**A token finds its value, and the answer does not say what it is.** A token may be compared
-with any property, hidden or not: `Note = 'h:…'` finds the events whose `Note` is that value. In
-such an event the value lies in the open — so wherever an answer would show a value the call
-itself named by a token, in the compared field or in any other, in an event, a group key or an
-aggregate's cell, it shows that token instead. The assistant learns what it asked — that the value
-is there — and not what the value is. (In the record of calls these are counted under
-`detectors.named`.) A token is not compared with a built-in field (`@service = 'h:…'`,
-`@x.type = 'h:…'`): no hidden value is ever kept in one, and every answer shows those fields as
-they are, so the question is refused.
+**A token is compared only where its value is hidden wherever it is read.** A token finds the
+events that hold its value, and every call after it reads those events again. Compared with a
+field that shows its values as stored — `Attempt = 'h:…'` — it would find the value lying in the
+open there, and the next `logs_context`, a `sum` with a `count` beside it, or a run of
+`Attempt > n` would read it. So a token may stand only against:
+
+- a property hidden whole in every service: a `hash` or `remove` rule that holds for every service
+  names it (or a path above it), or the profile is in Strict mode and no rule shows it.
+  `logs_fields` marks such a property `= only`;
+- for a value a detector hides whole wherever an equality can find it — a card number, an IIN,
+  an email address — any property no `keep` or `keepLast4` rule names, in any service: the
+  detector hides it there as well. An equality compares texts without regard to case, and a text
+  that reads as a number with that number in a numeric field; so not an IBAN or a JWT, which the
+  detectors know by the case of their letters, not a phone number (`'+77015550123'` equals
+  `77015550123`, and no detector knows a phone number stored as a number), and not an IIN with a
+  leading zero (it equals an eleven-digit number). Nor a text a detector hides only a part of:
+  under a `hash` rule, `card 4111… failed` found in an open field would be shown with only the
+  number gone.
+
+Anything else is refused with a sentence that says so, before anything is read: a property no rule
+hides, one a rule hides in some services only (`= only, no token` in `logs_fields`), one a `keep`
+or a `keepLast4` shows somewhere — the last four characters are the whole of a short value — and a
+built-in field (`@service = 'h:…'`, `@x.type = 'h:…'`), which no hidden value is kept in and every
+answer shows as it is.
+
+The events a token finds are shown as any answer shows them. An open field that happens to hold
+the same value is shown as stored, not as the token: shown as the token, it would say which open
+value the hidden one is, and the next answer — which shows that field as stored — would say what
+it is.
 
 For this the server remembers, in memory only, the values of the tokens it handed out recently —
 up to 40 000 of them, none longer than 256 characters. A token it no longer remembers (an old one,
@@ -421,10 +442,9 @@ parent — the functions that could (`toJson()`, `elementAt()`, `keys()`, `value
   the cure is to log values as properties. For an exception's text there is none here; a profile
   that must not have this gets free-form filters switched off and published tools instead.
 - **A rule hides a field, not a value.** A value hidden in one field and logged in the open in
-  another is in the open there, to any search that reads that field. (Asked for by its token it
-  is shown as the token — see [Tokens](#tokens) — but nothing stops a search that does not go by
-  the token.) Hide every field the value is logged in: a pattern without a dot covers a name at
-  any depth.
+  another is in the open there, to any search that reads that field. A token is not compared with
+  such a field (see [Tokens](#tokens)), but nothing stops a search that does not go by the token.
+  Hide every field the value is logged in: a pattern without a dot covers a name at any depth.
 - **The shape of a hidden value can be asked about.** `has(Recipients[2])` says whether a hidden
   list has a third element, `has(Limits['a@example.com'])` whether a hidden map has that key, and
   `Customer = Payer` whether two objects are equal, hidden fields and all. Each is one yes or no,
@@ -461,7 +481,7 @@ Every call is written to the log store as an event of the service `ameto-mcp`, w
 | `Tool`, `Profile`, `ProfileId` | |
 | `Status` | `OK`, `Trimmed` (cut to the budget, or a table whose scan stopped early), `Refused`, `Timed out`, `Failed` |
 | `Events`, `Masked`, `Tokens`, `ElapsedMs` | Events returned, values hidden, estimated size, time taken. |
-| `MaskedBy` | Values hidden, by what hid them: `rules` (a field rule) and `strict` (Strict mode) count by field path, `detectors` by detector id — `cardNumber`, `email`, `phone`, `iin`, `secret`, `iban`, plus `unscannable` and `tooDeep` for a text or a value hidden whole because it could not be looked through, and `named` for a value shown as the token the call itself asked about it by. `ruleIds` counts the same values as `rules`, by the id of the rule that decided. |
+| `MaskedBy` | Values hidden, by what hid them: `rules` (a field rule) and `strict` (Strict mode) count by field path, `detectors` by detector id — `cardNumber`, `email`, `phone`, `iin`, `secret`, `iban`, plus `unscannable` and `tooDeep` for a text or a value hidden whole because it could not be looked through. `ruleIds` counts the same values as `rules`, by the id of the rule that decided. |
 | `Arguments` | As the assistant sent them, whole: a token stays a token. |
 | `Filter` | The filter a search asked with. For a published tool, its template with the call's arguments in place — what the arguments alone do not show. As written and whole: a token in it is still a token, and the filter with the value in the token's place is not kept anywhere. Absent when the call had no filter. |
 | `Refusal` | Why a refused call was refused. |

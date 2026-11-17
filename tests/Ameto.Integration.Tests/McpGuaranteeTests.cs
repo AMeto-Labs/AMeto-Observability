@@ -638,17 +638,19 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
 
         // With a token in the first argument and the rest of a filter in the second, this pair
         // used to return every event the profile could see.
-        foreach (var (owner, region) in ((string, string)[])
+        foreach (var (owner, region, refusal) in ((string, string, string?)[])
                  [
-                     ("x' or has(@mt) or C = 'c", "eu"),
-                     ("x'" + token, "or has(@mt) or C = 'c"),
-                     (token, "' or has(@mt) or '"),
-                     ("alice' and Region = 'us", "eu"),
+                     ("x' or has(@mt) or C = 'c", "eu", null),
+                     ("x'" + token, "or has(@mt) or C = 'c", null),
+                     // A token in an argument is a token in the filter, and is judged as one: Owner
+                     // shows its values as stored, so no token is compared with it.
+                     (token, "' or has(@mt) or '", "shows its values as they are stored"),
+                     ("alice' and Region = 'us", "eu", null),
                  ])
         {
             var (text, isError) = await Call(client, name, ("owner", owner), ("region", region));
-            Assert.False(isError, text);
-            Assert.Contains("No events match", text);
+            Assert.Equal(refusal is not null, isError);
+            Assert.Contains(refusal ?? "No events match", text);
             Assert.DoesNotContain("o-bob", text);
             Assert.DoesNotContain("e-carol", text);
         }
@@ -728,42 +730,67 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
         Assert.Contains("hidden field", ranged);
     }
 
+    /// <summary>
+    /// The third review read a hidden value through a token: compared with a field that shows its
+    /// values as stored, the token found the events where the value lay in the open — and the
+    /// next <c>logs_context</c>, a <c>sum</c> with a <c>count</c> beside it, an ordering of the
+    /// same field each read it there. So such a comparison is refused before anything is read.
+    /// A token meets a field hidden in every service, and the events it finds are shown as any
+    /// answer shows them: an open field that holds the same value is not turned into the token,
+    /// which would say which open value the hidden one is, for the next answer to read as stored.
+    /// </summary>
     [Fact]
-    public async Task ATokenComparedWithAFieldInTheOpen_FindsTheValue_AndDoesNotShowIt()
+    public async Task AToken_MeetsOnlyAFieldThatHidesItsValueEverywhere()
     {
         var admin = await host.AdminAsync();
         await Rule(admin, new { field = "PatientAge", action = "hash" });
         string service = McpTesting.NewService();
         await McpTesting.IngestAsync(admin,
-            new(service, "Admitted {Who}") { Properties = { ["Who"] = "patient", ["PatientAge"] = 7391 } },
+            new(service, "Admitted {Who}") { Properties = { ["Who"] = "patient", ["PatientAge"] = 7391, ["Attempt"] = 7391 } },
+            new(service, "Admitted {Who}") { Properties = { ["Who"] = "twin", ["PatientAge"] = 7391 } },
             new(service, "Retried {Who}")  { Properties = { ["Who"] = "worker", ["Attempt"] = 7391, ["StatusCode"] = 200 } },
             new(service, "Retried {Who}")  { Properties = { ["Who"] = "other", ["Attempt"] = 2, ["StatusCode"] = 200 } });
         var (profileId, key) = await McpTesting.CreateProfileAsync(admin, new { name = "token in the open", services = new[] { service } });
         await using var client = await McpTesting.ConnectAsync(host, key);
 
         var (search, _) = await Call(client, "logs_search", ("filter", "has(PatientAge)"));
-        Assert.DoesNotContain("7391", search);
-        string token = McpTesting.Token.Match(search).Value;
+        Assert.Contains("2 events", search);
+        Assert.DoesNotContain("PatientAge = 7391", search);
+        string token = Regex.Match(search, @"PatientAge = (h:[0-9a-f]{12})").Groups[1].Value;
         Assert.NotEmpty(token);
 
-        // The same number lies in the open in another field. The token finds it — that is what
-        // a token is for — and the answer says so without saying what the number is.
-        var (found, foundError) = await Call(client, "logs_search", ("filter", $"Attempt = '{token}' or StatusCode = '{token}'"));
+        // The review's roads, each refused before anything is read: the open field, whose events
+        // the next call would read; a sum with a count beside it; an ordering of the same field.
+        foreach (var (tool, argument, text) in ((string, string, string)[])
+                 [
+                     ("logs_search",    "filter", $"Attempt = '{token}' or StatusCode = '{token}'"),
+                     ("logs_aggregate", "query",  $"select sum(Attempt), count(Attempt) where Attempt = '{token}'"),
+                     ("logs_search",    "filter", $"Attempt = '{token}' and Attempt > 7000"),
+                 ])
+        {
+            var (answer, isError) = await Call(client, tool, (argument, text));
+            Assert.True(isError, answer);
+            Assert.Contains("shows its values as they are stored", answer);
+            Assert.DoesNotContain("7391", answer);
+        }
+        var refused = (await Calls(admin, profileId)).Where(static c => Text(c, "status") == "Refused").ToList();
+        Assert.Equal(3, refused.Count);
+        Assert.All(refused, static c => Assert.Equal("masking", Text(c, "refusalKind")));
+
+        // The hidden field the token came from: answered — and answered exactly as the search
+        // that named no token, but for the line with the window's times. The patient's open
+        // Attempt holds the same number; shown as the token here, it would be read as 7391 there.
+        var (found, foundError) = await Call(client, "logs_search", ("filter", $"PatientAge = '{token}'"));
         Assert.False(foundError, found);
-        Assert.Contains("1 event", found);
-        Assert.Contains("worker", found);
-        Assert.Contains(token, found);
-        Assert.DoesNotContain("7391", found);
+        Assert.Equal(Body(search), Body(found));
 
+        // A table of those events is a table like any other: its numbers are the open field's.
         var (table, tableError) = await Call(client, "logs_aggregate",
-            ("query", $"select count(*), max(Attempt) where Attempt = '{token}' group by Attempt"));
+            ("query", $"select sum(Attempt), count(Attempt), count(*) where PatientAge = '{token}'"));
         Assert.False(tableError, table);
-        Assert.DoesNotContain("7391", table);
-        Assert.Contains(token, table);
+        Assert.Matches(@"(?m)^7391\s+1\s+2\s*$", table);
 
-        // Counted with what the answer hid, under its own name.
-        var call = (await Calls(admin, profileId)).First(c => Text(c, "tool") == "logs_search" && Text(c, "filter")!.StartsWith("Attempt"));
-        Assert.Equal(1, call.GetProperty("maskedBy").GetProperty("detectors").GetProperty("named").GetInt64());
+        static string Body(string answer) => answer[(answer.IndexOf('\n') + 1)..];
     }
 
     [Fact]

@@ -155,9 +155,6 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
 
         /// <summary>The filter before tokens became values and the profile's scope was joined: what the audit keeps.</summary>
         public string?             AsWritten   { get; init; }
-
-        /// <summary>The values the filter named by their tokens: shown as those tokens in the answer.</summary>
-        public NamedValues?        Named       { get; init; }
         public HashSet<LogLevel>?  Levels      { get; init; }
         public HashSet<string>?    Fields      { get; init; }
         public int                 Limit       { get; init; }
@@ -201,7 +198,6 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         {
             Filter      = FilterGuard.Compose(prepared.Node, call.Profile, service),
             AsWritten   = call.Str("filter"),
-            Named       = prepared.Named,
             Levels      = levels,
             Fields      = call.Strings("fields") is { } f ? new HashSet<string>(f, StringComparer.OrdinalIgnoreCase) : null,
             Limit       = Math.Clamp(call.Int("limit") ?? 50, 1, call.MaxEvents),
@@ -246,7 +242,6 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         {
             Filter      = FilterGuard.Compose(prepared.Node, call.Profile),
             AsWritten   = bound,
-            Named       = prepared.Named,
             Fields      = tool.Fields.Count == 0 ? null : new HashSet<string>(tool.Fields, StringComparer.OrdinalIgnoreCase),
             Limit       = Math.Clamp(tool.MaxEvents, 1, call.MaxEvents),
             OldestFirst = tool.OldestFirst,
@@ -291,7 +286,7 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         foreach (var ev in page.Events)
         {
             var own    = new MaskStats();
-            var masked = policy.Mask(ev, own, spec.Fields, spec.Named);
+            var masked = policy.Mask(ev, own, spec.Fields);
             bool known = seen.Contains(masked.Template);
             int cost   = EventTable.CostOf(masked, seen);
             if (shown.Count > 0 && used + cost > call.BudgetChars)
@@ -355,7 +350,6 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         var leftOut  = new MaskStats();
         var prepared = FilterGuard.PrepareAggregation(asWritten, policy, store.Vault, call.Profile, leftOut);
         if (prepared.Query is not { } query) return ToolResult.Refused(prepared.Kind, prepared.Error!, asWritten);
-        var named = prepared.Named;
 
         var result = await RunAggregationAsync(query, from, to, ct);
 
@@ -369,9 +363,9 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         {
             var cells = new string?[header.Count];
             for (int k = 0; k < row.Key.Length; k++)
-                cells[k] = GroupKey(query.Keys[k].Property, row.Key[k], policy, stats, named) is { } key ? EventTable.Cell(key) : null;
+                cells[k] = GroupKey(query.Keys[k].Property, row.Key[k], policy, stats) is { } key ? EventTable.Cell(key) : null;
             for (int v = 0; v < row.Values.Length; v++)
-                cells[row.Key.Length + v] = Cell(query.Aggregates[v], row.Values[v], policy, stats, named);
+                cells[row.Key.Length + v] = Cell(query.Aggregates[v], row.Values[v], policy, stats);
             rows.Add(cells);
         }
 
@@ -409,10 +403,10 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
     /// One number of a table. A count is a count; any other aggregate is made of the values
     /// themselves — a maximum is one of them — so it goes past the detectors like a value does.
     /// </summary>
-    private static string? Cell(AggregateSpec aggregate, double? value, MaskingPolicy policy, MaskStats stats, NamedValues? named) =>
+    private static string? Cell(AggregateSpec aggregate, double? value, MaskingPolicy policy, MaskStats stats) =>
         value is not { } number ? null
         : aggregate.Kind == AggregateKind.Count || aggregate.Property is null ? Number(number)
-        : policy.MaskNumber(FilterGuard.RulePath(aggregate.Property), number, stats, named);
+        : policy.MaskNumber(FilterGuard.RulePath(aggregate.Property), number, stats);
 
     /// <summary>Runs an aggregation whose where-clause already carries the profile's scope (see <see cref="FilterGuard"/>).</summary>
     private async Task<AggregationResult> RunAggregationAsync(
@@ -425,16 +419,11 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
     /// an exception's message, its stack) and go past the detectors as they do in a search.
     /// Everything else is a property, whatever its name begins with, and the rules judge it.
     /// </summary>
-    private static string? GroupKey(string encoded, string? value, MaskingPolicy policy, MaskStats stats, NamedValues? named)
+    private static string? GroupKey(string encoded, string? value, MaskingPolicy policy, MaskStats stats)
     {
         if (value is null) return null;
         if (!BuiltinFields.TryResolve(encoded, out var field))
-            return policy.MaskGroupKey(FilterGuard.RulePath(encoded), value, stats, named);
-        if (named?.TokenOf(value) is { } token)
-        {
-            stats.Add(MaskReason.Detector, MaskStats.Named);
-            return token;
-        }
+            return policy.MaskGroupKey(FilterGuard.RulePath(encoded), value, stats);
         return field is BuiltinField.MessageTemplate or BuiltinField.ExceptionMessage
                      or BuiltinField.ExceptionStack or BuiltinField.InnerExceptionMessage
             ? policy.MaskText(value, stats)
@@ -717,7 +706,11 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
                     name,
                     info.Count.ToString(CultureInfo.InvariantCulture),
                     string.Join('|', info.Types),
-                    policy.HidesField(info.Stored) ? "= only" : "",
+                    // "= only": tested for equality only, and a token may be compared with it. A
+                    // field some service shows as stored is tested the same way, but a token
+                    // compared with it would find its value there in the open.
+                    !policy.HidesField(info.Stored) ? ""
+                        : policy.HidesEverywhere(info.Stored) ? "= only" : "= only, no token",
                     string.Join(", ", info.Examples),
                 ]);
             sb.Append('\n');

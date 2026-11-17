@@ -363,51 +363,84 @@ public sealed class McpFilterGuardTests
         }
     }
 
+    /// <summary>
+    /// A token is a question about where a hidden value is, and the events it finds are read again
+    /// by every call after it. Compared with a field that shows its values as stored, it would
+    /// find the value lying in the open — and a sum with a count beside it, the next logs_context,
+    /// an ordering of the same open field would each read it there (the third review did all
+    /// three). So a token meets only a field hidden whole in every service; or, for a value a
+    /// detector hides by its shape, any field no keep or keepLast4 rule shows.
+    /// </summary>
     [Fact]
-    public void AValueNamedByItsToken_IsShownAsThatToken_WhereverItTurnsUp()
+    public void AToken_IsComparedOnlyWhereItsValueIsHiddenEverywhere()
     {
         var vault  = new TokenVault();
         var policy = Policy(McpMaskingMode.Standard, vault,
-            Rule("PatientAge", MaskAction.Hash), Rule("Buyer", MaskAction.Hash), Rule("Reference", MaskAction.Keep));
-        var hidden = Cells(policy.Mask(Event("x", new() { ["PatientAge"] = 7391, ["Buyer"] = "Ivan Petrov" }), new MaskStats()));
-        string age = hidden["PatientAge"], buyer = hidden["Buyer"];
-
-        // The same two values lying in the open, in fields no rule hides — one of them in a
-        // field a rule KEEPS, which is exactly where a value is shown as it is stored.
-        var open = Event("Attempt {Attempt}", new()
+            Rule("PatientAge", MaskAction.Hash), Rule("Buyer", MaskAction.Hash), Rule("Reference", MaskAction.Keep),
+            Rule("Region", MaskAction.Hash, "payments-api"), Rule("Contact", MaskAction.Keep, "support"), Rule("Customer", MaskAction.Remove),
+            Rule("Masked", MaskAction.KeepLast4), Rule("Account", MaskAction.Hash), Rule("Account", MaskAction.KeepLast4, "support"),
+            Rule("Comment", MaskAction.Hash));
+        var hidden = Cells(policy.Mask(Event("x", new()
         {
-            ["Attempt"] = 7391, ["AttemptText"] = "7391", ["Reference"] = "IVAN PETROV",
-            ["Tags"] = new List<object?> { "vip", "Ivan Petrov" }, ["Other"] = 7392, ["Greeting"] = "Hello, Ivan Petrov",
-        });
+            ["PatientAge"] = 7391, ["Buyer"] = "Ivan Petrov", ["Region"] = "north", ["Note"] = "card 4111111111111111",
+            ["Pan"] = "4111111111111111", ["Comment"] = "card 4111111111111111 failed",
+            ["Iban"] = "GB82WEST12345698765432", ["Mail"] = "Ivan.Petrov@Example.com",
+            ["Phone"] = "+7 701 555 01 23", ["YoungIin"] = "050312501234", ["Iin"] = "900101300126",
+        }), new MaskStats()));
+        string age = hidden["PatientAge"], buyer = hidden["Buyer"], region = hidden["Region"], comment = hidden["Comment"];
+        string card = hidden["Pan"], iban = hidden["Iban"], mail = hidden["Mail"], phone = hidden["Phone"];
+        string youngIin = hidden["YoungIin"], iin = hidden["Iin"];
+        foreach (string token in (string[])[card, iban, mail, phone, youngIin, iin])
+            Assert.Matches("^h:[0-9a-f]{12}$", token);                  // hidden by a detector, in a field no rule names
 
-        // The question is a fair one, and is answered: yes, the value is there.
-        var prepared = FilterGuard.Prepare($"Attempt = '{age}' or Reference = '{buyer}' or Tags = '{buyer}'", policy, vault);
-        Assert.True(Run(prepared).Matches(open));
-        Assert.Equal(2, prepared.Named!.Count);
+        // Fields that show their values as stored somewhere: refused, whatever the operator of equality.
+        foreach (string filter in (string[])
+                 [
+                     $"Attempt = '{age}'", $"Attempt != '{age}'", $"Attempt in ['{age}', 'x']", $"Owner = '{buyer}'",
+                     $"Reference = '{buyer}'",                              // kept by a rule: shown as stored
+                     $"Region = '{region}'",                                // hidden in one service only, open in the others
+                     $"Tags = '{buyer}'", $"Items[0].Name = '{buyer}'",
+                     $"Contact = '{card}'",                                 // a keep for one service lets even a card through there
+                     $"Masked = '{buyer}'", $"Masked = '{card}'",           // the last four characters: the whole of a short value
+                     $"OtherNote = '{comment}'",                            // a detector would hide the card in it, and show "failed"
+                     $"Iban = '{iban}'", $"OtherIban = '{iban}'",           // matched in small letters too, where no detector knows it
+                     // A text that reads as a number equals that number in a numeric field, and
+                     // 77015550123 or 50312501234 is shown there as it is: no detector knows it.
+                     $"Phone = '{phone}'", $"Msisdn = '{phone}'", $"YoungIin = '{youngIin}'", $"ClientNo = '{youngIin}'",
+                 ])
+        {
+            var refused = FilterGuard.Prepare(filter, policy, vault);
+            Assert.Contains("shows its values as they are stored", refused.Error);
+            Assert.Equal(RefusalKind.Masking, refused.Kind);
+            Assert.DoesNotContain("7391", refused.Error);
+        }
 
-        // What it must not be answered with is the value. Before this, the event came back with
-        // Attempt = 7391 beside it: one call, and the token was read.
-        Assert.Equal("7391", Cells(policy.Mask(open, new MaskStats()))["Attempt"]);
-        var stats = new MaskStats();
-        var cells = Cells(policy.Mask(open, stats, onlyFields: null, prepared.Named));
-        Assert.Equal(age, cells["Attempt"]);
-        Assert.Equal(age, cells["AttemptText"]);                    // the number kept as text is the same value
-        Assert.Equal(buyer, cells["Reference"]);                    // kept by a rule, in another case — and not shown
-        Assert.Equal($"[\"vip\",\"{buyer}\"]", cells["Tags"]);      // one element of a list
-        Assert.Equal("7392", cells["Other"]);                       // another value is another value
-        Assert.Equal("Hello, Ivan Petrov", cells["Greeting"]);      // part of a longer text: no equality ever matched it
-        Assert.Equal(4, stats.ByDetector[MaskStats.Named]);
+        // Fields hidden in every event of every service: the question is answered.
+        foreach (string filter in (string[])
+                 [
+                     $"PatientAge = '{age}'", $"Buyer = '{buyer}'", $"Buyer.Name = '{buyer}'",   // under a rule on its parent
+                     $"Customer.Iin != '{age}'",                                                // removed: hidden all the same
+                     $"Pan = '{card}'", $"OtherNote = '{card}'", $"Items[0].Pan in ['{card}']", // a value the detector hides wherever it lies
+                     $"Account = '{buyer}'",                                // hashed in every service: the hash wins over a keepLast4 anywhere
+                     $"Comment = '{comment}'",
+                     $"Mail = '{mail}'", $"ReplyTo = '{mail}'",             // an address is found in any case of its letters
+                     $"Iin = '{iin}'", $"ClientNo = '{iin}'",               // as a number too, it is an IIN by its digits
+                 ])
+            Assert.Null(FilterGuard.Prepare(filter, policy, vault).Error);
 
-        // A table's key and an aggregate's cell are answers too.
-        Assert.Equal(buyer, policy.MaskGroupKey("Reference", "Ivan Petrov", new MaskStats(), prepared.Named));
-        Assert.Equal(age, policy.MaskNumber("Attempt", 7391, new MaskStats(), prepared.Named));
-        Assert.Equal("7392", policy.MaskNumber("Attempt", 7392, new MaskStats(), prepared.Named));
-        var query = FilterGuard.PrepareAggregation($"select max(Attempt) where Attempt = '{age}' group by Reference", policy, vault, Payments);
-        Assert.Null(query.Error);
-        Assert.Equal(1, query.Named!.Count);
+        // What logs_fields says of each: "= only" is where a token may go.
+        Assert.True(policy.HidesEverywhere("PatientAge"));
+        Assert.True(policy.HidesEverywhere("Account"));
+        foreach (string shown in (string[])["Region", "Masked", "Contact", "Reference", "Attempt"])
+            Assert.False(policy.HidesEverywhere(shown), shown);
+        Assert.True(policy.HidesField("Region") && policy.HidesField("Masked"));    // "= only, no token"
 
-        // A filter that named nothing carries nothing.
-        Assert.Null(FilterGuard.Prepare("Attempt = 7391", policy, vault).Named);
+        // Strict: every field no rule shows is hidden everywhere, so a token meets it.
+        var strict = Policy(McpMaskingMode.Strict, vault, Rule("PatientAge", MaskAction.Hash), Rule("Reference", MaskAction.Keep),
+                            Rule("Contact", MaskAction.Keep, "support"), Rule("Masked", MaskAction.KeepLast4));
+        Assert.Null(FilterGuard.Prepare($"Attempt = '{age}'", strict, vault).Error);
+        foreach (string field in (string[])["Reference", "Contact", "Masked"])
+            Assert.Contains("shows its values as they are stored", FilterGuard.Prepare($"{field} = '{age}'", strict, vault).Error);
     }
 
     [Fact]
@@ -599,9 +632,11 @@ public sealed class McpFilterGuardTests
         string either  = string.Join(" or ", Enumerable.Range(0, 300).Select(static i => "A = " + i % 10));
         string nots    = string.Concat(Enumerable.Repeat("not ", FilterGuard.MaxNesting)) + "A = 1";
         string words   = string.Join(' ', Enumerable.Range(0, FilterGuard.MaxWords).Select(static i => "w" + i));
-        // The densest chain 4 000 characters hold: a lone '-' is a word, three characters a
-        // clause, 1 334 clauses — a left-deep tree that deep, walked by recursion at each step.
-        string densest = string.Concat(Enumerable.Repeat("-or", 1_333)) + "-";
+        // The densest chain 4 000 characters hold of what a filter here may be: six characters a
+        // clause, 667 clauses — a left-deep tree that deep, walked by recursion at each step. (The
+        // densest of all, a lone '-' three characters a clause, is plain words, and 1 334 of them
+        // are refused by the count of words — see below.)
+        string densest = string.Concat(Enumerable.Repeat("a=1or ", 666)) + "a=1";
 
         string mixed   = $"({string.Join(" or ", Enumerable.Range(0, 120).Select(static i => "B = " + i))}) and {string.Concat(Enumerable.Repeat("not ", 30))}C = 1 and {words}";
 
@@ -647,6 +682,21 @@ public sealed class McpFilterGuardTests
         var tooMany = FilterGuard.Prepare(words + " onemore", policy, new TokenVault());
         Assert.Contains("plain words", tooMany.Error);
         Assert.Equal(RefusalKind.Input, tooMany.Kind);
+
+        // Counted across the filter, not per run of words: the third review's 450 one-word runs,
+        // and the densest chain of all, are a full scan with 1 350 and 4 002 tests an event.
+        foreach (string spread in (string[])
+                 [
+                     string.Join(" and ", Enumerable.Range(0, 450).Select(static i => "w" + i)),
+                     string.Concat(Enumerable.Repeat("-or", 1_333)) + "-",
+                     string.Join(" or ", Enumerable.Range(0, FilterGuard.MaxWords + 1).Select(static i => "w" + i)),
+                 ])
+        {
+            var refused = FilterGuard.Prepare(spread, policy, new TokenVault());
+            Assert.Contains("plain words", refused.Error);
+            Assert.Equal(RefusalKind.Input, refused.Kind);
+        }
+        Assert.Null(FilterGuard.Prepare(string.Join(" or ", Enumerable.Range(0, FilterGuard.MaxWords).Select(static i => "w" + i)), policy, new TokenVault()).Error);
     }
 
     [Fact]
@@ -800,11 +850,19 @@ public sealed class McpFilterGuardTests
             ["Owner"] = "x'" + numeric, ["Region"] = "or has(@mt) or CardNumber like '4111%' or C = 'c",
         })));
 
-        // A token given whole as an argument is a token: the tool can be asked for "the same owner as before".
-        var byToken = PublishedToolBinder.Bind(OrdersOf, Json($$"""{"owner":"{{numeric}}","region":"eu"}"""));
-        var same    = FilterGuard.Prepare(byToken.Filter, policy, vault);
+        // A token given whole as an argument is a token, held to the same rule as in a filter: the
+        // tool can be asked for "the same merchant as before" where the merchant is a hidden field…
+        var byMerchant = OrdersOf with { Filter = "MerchantId = {owner} and Region = {region}" };
+        var byToken    = PublishedToolBinder.Bind(byMerchant, Json($$"""{"owner":"{{numeric}}","region":"eu"}"""));
+        var same       = FilterGuard.Prepare(byToken.Filter, policy, vault);
+        Assert.Null(same.Error);
         Assert.Equal(FilterGuard.Shape(FilterGuard.Prepare(byToken.Reference, policy, vault).Node), FilterGuard.Shape(same.Node));
-        Assert.True(Run(same).Matches(Event("x", new() { ["Owner"] = 6456116363L, ["Region"] = "eu" })));
+        Assert.True(Run(same).Matches(Event("x", new() { ["MerchantId"] = 6456116363L, ["Region"] = "eu" })));
+
+        // …and not where the field shows its values as stored: there it would find the value in the open.
+        var open = FilterGuard.Prepare(PublishedToolBinder.Bind(OrdersOf, Json($$"""{"owner":"{{numeric}}","region":"eu"}""")).Filter, policy, vault);
+        Assert.Contains("shows its values as they are stored", open.Error);
+        Assert.Equal(RefusalKind.Masking, open.Kind);
     }
 
     [Fact]

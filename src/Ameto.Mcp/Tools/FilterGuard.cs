@@ -73,23 +73,10 @@ internal static class FilterGuard
         public static Prepared Hidden(string error) => new(null, error, RefusalKind.Masking);
 
         public static readonly Prepared Nothing = new(null, null);
-
-        /// <summary>
-        /// The values the filter asked about by their tokens, for the answer to show as those
-        /// tokens wherever it would have shown the values (see <see cref="NamedValues"/>). Null
-        /// when it named none.
-        /// </summary>
-        public NamedValues? Named { get; init; }
     }
 
-    /// <summary>
-    /// A <c>select …</c> query ready to run, or the sentence that says why it will not. Like a
-    /// filter it carries the values it named by their tokens.
-    /// </summary>
-    internal sealed record PreparedQuery(AggregationQuery? Query, string? Error, RefusalKind Kind = RefusalKind.None)
-    {
-        public NamedValues? Named { get; init; }
-    }
+    /// <summary>A <c>select …</c> query ready to run, or the sentence that says why it will not.</summary>
+    internal sealed record PreparedQuery(AggregationQuery? Query, string? Error, RefusalKind Kind = RefusalKind.None);
 
     // ── Search filters ────────────────────────────────────────────────────────
 
@@ -153,9 +140,7 @@ internal static class FilterGuard
     internal static Prepared Judged(FilterNode root, MaskingPolicy policy, TokenVault vault)
     {
         var judge = new Judge(policy, vault);
-        return judge.Visit(root) is { } ready
-            ? new Prepared(ready, null) { Named = judge.Named.Count == 0 ? null : judge.Named }
-            : judge.Refusal!;
+        return judge.Visit(root) is { } ready ? new Prepared(ready, null) : judge.Refusal!;
     }
 
     /// <summary>
@@ -282,10 +267,7 @@ internal static class FilterGuard
             // it does not cover the sum of two.
             Admits     = (aggregate, value) => kept?.Contains(aggregate) == true
                                                 || policy.AdmitsToAggregate(value, firstOfProperty.Contains(aggregate) ? counted : null),
-        }, null)
-        {
-            Named = where.Named,
-        };
+        }, null);
     }
 
     // ── What a profile may see ────────────────────────────────────────────────
@@ -372,8 +354,12 @@ internal static class FilterGuard
     {
         public Prepared? Refusal { get; private set; }
 
-        /// <summary>The values behind the tokens this filter used, each with the token it was named by.</summary>
-        public NamedValues Named { get; } = new();
+        /// <summary>
+        /// Plain words seen so far in the whole filter. Each is three tests on every event read and
+        /// none is helped by an index (they are written as alternatives), so the limit is on the
+        /// filter — not on each run of words, which <c>w0 and w1 and …</c> would make 450 of.
+        /// </summary>
+        private int _words;
 
         public FilterNode? Visit(FilterNode node)
         {
@@ -398,7 +384,7 @@ internal static class FilterGuard
                     {
                         if (IsToken(list.Values[i], out _) && BuiltinFields.TryResolve(list.Property, out _))
                             return Refuse(Prepared.Hidden(TokenOnBuiltIn(list.Values[i]!, list.Property)));
-                        if (!Operand(list.Values[i], out values[i])) return null;
+                        if (!Operand(list.Values[i], list.Property, out values[i])) return null;
                     }
                     return new InNode(list.Property, values);
                 }
@@ -456,7 +442,7 @@ internal static class FilterGuard
                 // few such questions are a binary search for it.
                 if (!equality) return Refuse(Prepared.Hidden(TokenMisplaced(compare.Value!)));
                 if (BuiltinFields.TryResolve(compare.Property, out _)) return Refuse(Prepared.Hidden(TokenOnBuiltIn(compare.Value!, compare.Property)));
-                return Operand(compare.Value, out object? value) ? new CompareNode(compare.Property, compare.Op, value) : null;
+                return Operand(compare.Value, compare.Property, out object? value) ? new CompareNode(compare.Property, compare.Op, value) : null;
             }
             if (!equality && IsHidden(policy, compare.Property)) return Refuse(Prepared.Hidden(HiddenField(compare.Property)));
             return compare;
@@ -471,7 +457,7 @@ internal static class FilterGuard
         }
 
         /// <summary>The operand of an equality: itself, or — for a token — the value it stands for.</summary>
-        private bool Operand(object? written, out object? value)
+        private bool Operand(object? written, string property, out object? value)
         {
             value = written;
             if (!IsToken(written, out ulong bits)) return true;
@@ -482,10 +468,17 @@ internal static class FilterGuard
                     "run the search that produced it again."));
                 return false;
             }
+            // Only where the value is hidden whatever event it is read in. Elsewhere the token
+            // would find the events where it lies in the open, and every answer about them —
+            // the next call, a sum with a count beside it, an ordering of the same field — would
+            // read it there (TokenMayMeet).
+            if (!policy.TokenMayMeet(RulePath(property), entry.Text, entry.IsNumber))
+            {
+                Refuse(Prepared.Hidden(TokenInTheOpen(written!, property)));
+                return false;
+            }
             // A number is put back as a number, so that it equals the number it was read from.
             value = entry.IsNumber && TryNumber(entry.Text, out object? number) ? number : entry.Text;
-            // The answer shows this value as the token it was asked by, wherever it turns up.
-            Named.Add(entry.Text, (string)written!);
             return true;
         }
 
@@ -495,9 +488,10 @@ internal static class FilterGuard
         /// </summary>
         private FilterNode? Words(FreeTextNode words)
         {
-            if (words.Terms.Length > MaxWords)
+            _words += words.Terms.Length;
+            if (_words > MaxWords)
                 return Refuse(Prepared.Unreadable(
-                    $"{words.Terms.Length} plain words are more than one search takes ({MaxWords}). " +
+                    $"The filter has more plain words than one search takes ({MaxWords}). " +
                     "Search for the few that matter, or write an expression such as ci_contains(@mt, 'the phrase')."));
 
             FilterNode? all = null;
@@ -538,12 +532,19 @@ internal static class FilterGuard
     /// the service, the template, the exception's type — and every answer shows them as they
     /// are: in a group's header line, in an event's detail. So the only thing such a comparison
     /// can do is find the hidden value lying in the open, and an answer that cannot help but
-    /// show it. A property found that way is shown as the token instead (NamedValues); a
-    /// built-in field is not something an answer can leave out, so the question is refused.
+    /// show it — refused for the same reason as a property that shows its values (TokenInTheOpen),
+    /// and said apart, since no rule can change it.
     /// </summary>
     private static string TokenOnBuiltIn(object token, string property) =>
         $"{token} is a token for a hidden value, and {PropertyPath.ToDisplay(property)} is a built-in field, which every answer shows as it is. " +
         "Compare a token with a property, for example CardNumber = 'h:91c0e2aa5d17'.";
+
+    /// <summary>A token compared with a field that shows its values as stored somewhere (see MaskingPolicy.TokenMayMeet).</summary>
+    private static string TokenInTheOpen(object token, string property) =>
+        $"{token} is a token for a hidden value, and {PropertyPath.ToDisplay(property)} shows its values as they are stored — whole or in part, " +
+        "in some service at least: compared with it, the token would find the value in the open. Compare a token with a property " +
+        "logs_fields marks \"= only\" (not \"= only, no token\"), or — for a card number, an IIN or an email address a detector hid — " +
+        "with the unmarked property it was found in.";
 
     /// <summary>A node type as a person would name the construct: <c>ToJsonCompareNode</c> is <c>toJson()</c>.</summary>
     private static string Name(FilterNode node)

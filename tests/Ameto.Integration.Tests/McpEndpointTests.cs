@@ -414,7 +414,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.Host>
         await McpTesting.IngestAsync(admin,
             new(service, "Paid {Amount}")                { Properties = { ["Amount"] = 10, ["CardNumber"] = "4111111111111111" } },
             new(service, "Paid {Amount}")                { Properties = { ["Amount"] = 20, ["CardNumber"] = "4111111111111111" } },
-            new(service, "Declined {Reason}", "Error")   { Properties = { ["Reason"] = "insufficient_funds" } });
+            new(service, "Declined {Reason}", "Error")   { Properties = { ["Reason"] = "insufficient_funds", ["Pan"] = "5555555555554444" } });
         var (_, key) = await McpTesting.CreateProfileAsync(admin, new { name = "overview" });
         await using var client = await McpTesting.ConnectAsync(_host, key);
 
@@ -428,6 +428,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.Host>
         var (fields, fieldsError) = await McpTesting.CallAsync(client, "logs_fields", Args(("service", service)));
         Assert.False(fieldsError, fields);
         Assert.Matches(@"CardNumber\s+2\s+string\s+= only\s+h:[0-9a-f]{12}", fields);
+        // keepLast4 shows a part of every value: tested for equality only, and never with a token.
+        Assert.Matches(@"Pan\s+1\s+string\s+= only, no token\s+\*{4}4444", fields);
         Assert.Matches(@"Amount\s+2\s+number", fields);
         Assert.Contains("filter syntax", fields);
     }
