@@ -524,6 +524,130 @@ public sealed class LogIndexCaseFoldTests
     }
 
     /// <summary>
+    /// A trigram section folded by ANOTHER build's table is asked only its ASCII windows: a
+    /// non-ASCII trigram may be stored under a key this build's table would not produce.
+    /// </summary>
+    [Fact]
+    public void A_trigram_section_another_table_folded_is_asked_only_its_ascii_windows()
+    {
+        var table = CaseFold.CopyOfTable();
+        table['ω'] = 'ω';                                   // a table that no longer folds ω
+        byte[] section;
+        using (CaseFold.UseTableForTest(table))
+        {
+            var built = new SegmentTrigramIndex();
+            built.Add(0, "ωμέγα point");
+            built.Add(1, "another point");
+            section = built.Serialise();
+        }
+        var read = SegmentTrigramIndex.Deserialise(section);
+        using var lazy = SegmentIndexReader.Load([], section, []);
+        Assert.Equal(SegmentTrigramIndex.TrigramFold.Canonical, read.Fold);
+
+        foreach (var (search, expected) in new (string, uint[]?)[]
+        {
+            ("ΩΜΈΓΑ",       null),      // stored (ω, Μ, Έ) there; this build would ask (Ω, Μ, Έ)
+            ("POINT",       [0, 1]),
+            ("another",     [1]),
+            ("absent",      []),
+            ("ΩΜΈΓΑ POINT", [0, 1]),    // " po", "poi", … only
+        })
+        {
+            Assert.Equal(expected, read.Lookup(search));
+            Assert.Equal(expected, lazy.LookupTrigram(search));
+        }
+    }
+
+    /// <summary>
+    /// A host whose comparer treats a character differently from the table: a trigram holding it is
+    /// not asked, and the term narrows by the rest of its windows — never to proof of absence by it.
+    /// </summary>
+    [Fact]
+    public void A_host_that_compares_a_character_differently_does_not_ask_a_trigram_holding_it()
+    {
+        var built = new SegmentTrigramIndex();
+        built.Add(0, "οδος");
+        built.Add(1, "οδοx");
+        byte[] section = built.Serialise();
+        var read = SegmentTrigramIndex.Deserialise(section);
+
+        Assert.Equal([0u], read.Lookup("ΟΔΟΣ")!);         // both windows asked
+        using (CaseFold.UseHostDriftForTest("Σσς"))
+        {
+            using var lazy = SegmentIndexReader.Load([], section, []);
+            Assert.Equal([0u, 1u], read.Lookup("ΟΔΟΣ")!);  // "ΔΟΣ" not asked; "ΟΔΟ" narrows
+            Assert.Equal([0u, 1u], lazy.LookupTrigram("ΟΔΟΣ")!);
+            Assert.Null(read.Lookup("ΔΟΣ"));               // its one window holds Σ
+            Assert.Null(lazy.LookupTrigram("ΔΟΣ"));
+        }
+    }
+
+    /// <summary>
+    /// LIKE MEETS THE TRIGRAM INDEX WITH THE PATTERN AS TYPED. On a host whose casing is newer than
+    /// the table, a typed character can share its host lowercase with a stored one the table does
+    /// not fold it with — here a build whose table predates the Ohm sign's lowercase (U+2126 → ω):
+    /// LIKE takes a typed Ω (U+03A9) and a stored Ohm sign both to ω. The host-drift set marked
+    /// the Ohm sign and ω, but not Ω, so <c>'%Ωyz%'</c> asked (Ω, Y, Z) of a group that stored
+    /// (U+2126, Y, Z) and dropped it. Ω is now marked through its lowercase (review of #168).
+    /// </summary>
+    [Fact]
+    public void A_pattern_typed_in_capitals_is_not_trusted_where_the_host_lowercases_what_the_table_does_not_fold()
+    {
+        Assert.True(char.ToLowerInvariant('Ω') == 'ω', "this host does not lowercase the Ohm sign — the premise is gone");
+
+        var table = CaseFold.CopyOfTable();
+        table['Ω'] = 'Ω';
+        using var fold  = CaseFold.UseTableForTest(table);
+        using var drift = CaseFold.UseHostDriftAgainstTableForTest(table);
+        Assert.True(CaseFold.HostDisagrees('Ω'));
+        Assert.True(CaseFold.HostDisagrees('ω'));
+        Assert.True(CaseFold.HostDisagrees('Ω'), "the typed capital is not marked through its lowercase");
+
+        var built = new SegmentTrigramIndex();
+        built.Add(0, "xΩyz");
+        byte[] section = built.Serialise();
+        var read = SegmentTrigramIndex.Deserialise(section);
+        using var lazy = SegmentIndexReader.Load([], section, []);
+        foreach (string search in new[] { "Ωyz", "ωyz", "Ωyz", "xΩy" })
+        {
+            var hits = read.Lookup(search);
+            Assert.True(hits is null || Array.IndexOf(hits, 0u) >= 0, $"'{search}' ruled out the row LIKE matches");
+            Assert.Equal(hits, lazy.LookupTrigram(search));
+        }
+    }
+
+    /// <summary>
+    /// A canonical trigram section cut short anywhere is either unreadable — which the executor
+    /// answers by reading the group — or "no information"; it never proves a term it holds absent.
+    /// </summary>
+    [Fact]
+    public void A_torn_canonical_trigram_section_never_proves_absence()
+    {
+        var built = new SegmentTrigramIndex();
+        built.Add(0, "Connection refused");
+        built.Add(1, "Ошибка платежа");
+        byte[] section = built.Serialise();
+
+        for (int length = 0; length < section.Length; length++)
+        {
+            byte[] torn = section.AsSpan(0, length).ToArray();
+            foreach (string search in new[] { "refused", "ПЛАТЕЖА" })
+            foreach (var ask in new Func<uint[]?>[]
+            {
+                () => SegmentTrigramIndex.Deserialise(torn).Lookup(search),
+                () => { using var lazy = SegmentIndexReader.Load([], torn, []); return lazy.LookupTrigram(search); },
+            })
+            {
+                uint[]? hits;
+                try { hits = ask(); }
+                catch (Exception) { continue; }            // unreadable: QueryExecutor reads the group
+                Assert.True(hits is null || hits.Length > 0,
+                    $"'{search}' proved absent from the section cut at {length} of {section.Length} bytes");
+            }
+        }
+    }
+
+    /// <summary>
     /// A surrogate that is half of a pair in the stored text is half of the same collapsed scalar in
     /// the search: a substring that starts or ends inside a pair still finds its trigrams.
     /// </summary>

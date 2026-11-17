@@ -28,10 +28,11 @@ namespace Ameto.Indexing;
 /// <see cref="_unsorted"/> records the violation and serialisation sorts — they merely give
 /// up the free ordering.</para>
 ///
-/// <para>SECTION BYTES ARE PINNED: buckets are numbered in first-seen order and serialised in
-/// that order, which is the insertion order the previous dictionary-backed build wrote, so a
-/// segment written by this build is byte-identical to one written before it
-/// (<c>IndexBuildParityTests</c>, <c>SegmentTrigramBuildParityTests</c>).</para>
+/// <para>BUCKET BYTES ARE PINNED: buckets are numbered in first-seen order and serialised in
+/// that order, which is the insertion order the previous dictionary-backed build wrote, so the
+/// buckets this build writes are that build's, byte for byte, behind the canonical layout's
+/// header (see <see cref="CanonicalMagic"/>) — <c>SegmentTrigramBuildParityTests</c> holds the two
+/// builds together, and <c>IndexBuildParityTests</c> the streaming and reference walks.</para>
 ///
 /// <para>THREADING: the build side has no lock. One index belongs to one index group's
 /// builder, and <c>SegmentWriter.WriteEvents</c> drives that from a single thread; the
@@ -101,13 +102,21 @@ public sealed class SegmentTrigramIndex
     /// </summary>
     internal enum TrigramFold : byte
     {
-        /// <summary><c>ToLowerInvariant</c> of the writer's host: every layout before the canonical
-        /// one (and the single-byte layouts before that, which had also truncated every non-ASCII
-        /// character to its low byte).</summary>
+        /// <summary><c>ToLowerInvariant</c> of the writer's host: every V2 section before the
+        /// canonical layout.</summary>
         Lower,
 
         /// <summary><see cref="CaseFold"/>, by the table whose fingerprint the section records.</summary>
         Canonical,
+
+        /// <summary>
+        /// The single-byte layouts before V2 (<see cref="PackedKind.Legacy"/>,
+        /// <see cref="PackedKind.Codec"/>): lowercased, then every character cut to its low byte.
+        /// Not even an ASCII trigram is proof there: a non-ASCII one that cuts down to the same three
+        /// bytes (<c>ѡbc</c> to <c>abc</c>) repeats the key, the last bucket wins, and the real
+        /// <c>abc</c> postings are gone. So such a section answers nothing.
+        /// </summary>
+        Truncated,
     }
 
     /// <summary>How this index's keys were folded.</summary>
@@ -367,7 +376,8 @@ public sealed class SegmentTrigramIndex
         if (_loaded.Count == 0 && _sets.Count == 0) return null;
         if (text.Length < 3) return null;
 
-        long[] keys = ArrayPool<long>.Shared.Rent(text.Length);
+        long[]? rented = text.Length > MaxStackKeys ? ArrayPool<long>.Shared.Rent(text.Length) : null;
+        Span<long> keys = rented ?? stackalloc long[MaxStackKeys];
         try
         {
             int k = QueryKeys(text, _fold, _foldFingerprint, keys);
@@ -386,7 +396,7 @@ public sealed class SegmentTrigramIndex
                         // A build-phase bucket is only ascending while the contract holds. When
                         // it does not, the flag says so and the set-based path answers instead —
                         // a merge over unordered input would silently drop rows.
-                        if (_unsorted) return LookupUnsorted(keys.AsSpan(0, k));
+                        if (_unsorted) return LookupUnsorted(keys[..k]);
                         posts[i] = decoded;
                     }
                     else
@@ -402,8 +412,12 @@ public sealed class SegmentTrigramIndex
                 ArrayPool<int[]>.Shared.Return(posts, clearArray: true);
             }
         }
-        finally { ArrayPool<long>.Shared.Return(keys); }
+        finally { if (rented is not null) ArrayPool<long>.Shared.Return(rented); }
     }
+
+    /// <summary>A search term's trigram keys fit on the stack up to this many characters (2 KB);
+    /// a longer term rents its buffer.</summary>
+    internal const int MaxStackKeys = 256;
 
     /// <summary>
     /// THE TRIGRAMS OF A SEARCH TERM THAT A SECTION FOLDED <paramref name="fold"/> CAN ANSWER FOR,
@@ -421,14 +435,15 @@ public sealed class SegmentTrigramIndex
     ///     differently from the table (<see cref="CaseFold.HostDisagrees"/>; on no host this build
     ///     runs on). A surrogate — the astral collapse is coarser than any host's astral casing.</item>
     ///   <item><b>Canonical, another build's table:</b> ASCII only, which every table folds alike.</item>
-    ///   <item><b>Lowercase, every section before the canonical fold:</b> ASCII only, lowercased.
+    ///   <item><b>Lowercase, every V2 section before the canonical fold:</b> ASCII only, lowercased.
     ///     The writer's lowercase of anything else is its host's, unrecorded, and not the scan's
     ///     equivalence anyway (<c>ς</c> against <c>σ</c>, <c>ᲀ</c> against <c>в</c>); ASCII
     ///     lowercases the same everywhere, and no non-ASCII character equals an ASCII one under the
     ///     comparer — while for LIKE, the one that lowercases onto ASCII (the Kelvin sign onto
     ///     <c>k</c>) was stored lowercased onto it too.</item>
+    ///   <item><b>The single-byte layouts before V2:</b> nothing (<see cref="TrigramFold.Truncated"/>).</item>
     /// </list>
-    /// <para>A trigram is asked when all three of its scalars are trusted. So an old section still
+    /// <para>A trigram is asked when all three of its scalars are trusted. So an old V2 section still
     /// prunes an ASCII term fully, and a mixed one by its ASCII runs —
     /// <c>ΟΔΟΣ.EXCEPTION</c> by <c>.ex</c>, <c>exc</c>, … — and a term with no all-ASCII window is
     /// answered by reading the group. Nothing is trusted on a host whose comparer equates a
@@ -436,7 +451,7 @@ public sealed class SegmentTrigramIndex
     /// </summary>
     internal static int QueryKeys(ReadOnlySpan<char> text, TrigramFold fold, ulong foldFingerprint, Span<long> keys)
     {
-        if (text.Length < 3 || CaseFold.HostDisagreesOnAscii) return 0;
+        if (text.Length < 3 || fold == TrigramFold.Truncated || CaseFold.HostDisagreesOnAscii) return 0;
 
         bool canonical = fold == TrigramFold.Canonical;
         bool sameTable = canonical && foldFingerprint == CaseFold.Fingerprint;
@@ -718,10 +733,11 @@ public sealed class SegmentTrigramIndex
     }
 
     /// <summary>Legacy RoaringBitmap serialisation — retained only to generate blobs for the
-    /// backward-compatibility read test. The keys are written the way the builds that wrote this
-    /// layout folded them: lowercase, truncated to a byte. Over ASCII that is the canonical key
-    /// with A-Z lowered back, which is exactly what those builds stored; anything else they
-    /// destroyed anyway, and a reader trusts only ASCII trigrams of a legacy section.</summary>
+    /// backward-compatibility read test. Keys are cut to a byte as the builds that wrote this layout
+    /// cut them, ASCII lowered as they lowered it; a non-ASCII key is cut from its canonical fold
+    /// rather than from the lowercase those builds cut, so its collisions are not theirs. That
+    /// changes only what such a section holds: a reader asks it nothing
+    /// (<see cref="TrigramFold.Truncated"/>).</summary>
     internal byte[] SerialiseRoaringV1()
     {
         ObjectDisposedException.ThrowIf(_released, this);
@@ -841,8 +857,8 @@ public sealed class SegmentTrigramIndex
                                         BinaryPrimitives.ReadUInt64LittleEndian(data[12..]));
             return new PackedHeader(PackedKind.Wide, count, 8, TrigramFold.Lower, 0);
         }
-        if (first == CodecMagic) return new PackedHeader(PackedKind.Codec, BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8, TrigramFold.Lower, 0);
-        return new PackedHeader(PackedKind.Legacy, first, 4, TrigramFold.Lower, 0);
+        if (first == CodecMagic) return new PackedHeader(PackedKind.Codec, BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8, TrigramFold.Truncated, 0);
+        return new PackedHeader(PackedKind.Legacy, first, 4, TrigramFold.Truncated, 0);
     }
 
     /// <summary>A trigram as one 48-bit number — its three UTF-16 units as a wide section stores

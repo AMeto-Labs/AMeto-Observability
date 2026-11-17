@@ -63,8 +63,17 @@ namespace Ameto.Core;
 /// </summary>
 internal static class CaseFold
 {
-    /// <summary>Folded into <see cref="Fingerprint"/>, so a change of rule outside the table (the
-    /// astral collapse, say) changes it too. Bump it with any such change.</summary>
+    /// <summary>
+    /// Folded into <see cref="Fingerprint"/>, so a change of rule outside the table (the astral
+    /// collapse, say) changes it too. Bump it with any such change.
+    ///
+    /// <para>ONE THING NO TABLE AND NO RULE MAY CHANGE: ASCII folds to upper case (a-z to A-Z,
+    /// nothing else moves). A reader that meets a section folded by another fingerprint trusts it
+    /// for ASCII literals by folding them with ITS OWN table — sound only while every table agrees
+    /// on ASCII. A rule that folds ASCII any other way needs a new section marker (the log bloom's
+    /// <c>LBC1</c>, the log trigram index's <c>LTC1</c>, the span bloom index's <c>RDB3</c>), not just
+    /// a new fingerprint, or a build rolled back from it would probe its ASCII wrongly.</para>
+    /// </summary>
     private const ulong RuleVersion = 1;
 
     /// <summary>(first, last, delta, stride) — see the type docstring. Generated; do not hand-edit.</summary>
@@ -360,8 +369,12 @@ internal static class CaseFold
     /// differently from the table; an index's silence about a literal holding one is no proof.
     /// Computed once, on first use, from the host's own comparer: every BMP scalar bucketed by
     /// <c>string.GetHashCode(s, OrdinalIgnoreCase)</c> (equal under the comparer ⇒ equal hash), every
-    /// comparer-equal pair the table folds apart marked together with its lowercases, and every
-    /// scalar whose host lowercase the table folds elsewhere marked with that lowercase.
+    /// comparer-equal pair the table folds apart marked together with its lowercases, every scalar
+    /// whose host lowercase the table folds elsewhere marked with that lowercase — and then every
+    /// scalar whose host lowercase is marked. That last pass is for LIKE as the log index meets it:
+    /// a pattern run arrives as TYPED, and a typed <c>Ω</c> lowercases to the same <c>ω</c> as a
+    /// stored character the table may not fold with either (the Ohm sign, on a table that predates
+    /// the mapping), so the typed character is marked through its lowercase.
     /// </summary>
     internal static bool HostDisagrees(char c) => (Drift.Bits[c >> 6] & (1UL << (c & 63))) != 0;
 
@@ -396,6 +409,20 @@ internal static class CaseFold
         foreach (char c in marked) Mark(bits, c);
         var saved = Volatile.Read(ref s_drift);
         Volatile.Write(ref s_drift, NewDriftSet(bits));
+        return new DriftSwap(saved);
+    }
+
+    /// <summary>
+    /// TEST SEAM: the host-drift set this host would have against <paramref name="table"/> as the
+    /// compiled one, until disposed. With <see cref="UseTableForTest"/> over the same table it is a
+    /// build whose table knows less casing than this host — the case <see cref="HostDisagrees"/>
+    /// exists for, which no host this build runs on presents.
+    /// </summary>
+    internal static DriftSwap UseHostDriftAgainstTableForTest(char[] table)
+    {
+        ArgumentOutOfRangeException.ThrowIfNotEqual(table.Length, 65_536);
+        var saved = Volatile.Read(ref s_drift);
+        Volatile.Write(ref s_drift, ComputeDrift(table));
         return new DriftSwap(saved);
     }
 
@@ -520,8 +547,25 @@ internal static class CaseFold
             i = j;
         }
 
+        // Scalars whose host lowercase is marked. LIKE equates a typed character with a stored one
+        // whenever their host lowercases agree; when the table folds them apart, the first pass
+        // marked one of the two and their common lowercase, so the other is caught here, through
+        // that lowercase. Until nothing more is marked — lowercase is idempotent, so in practice once.
+        for (bool more = true; more; )
+        {
+            more = false;
+            for (int c = 0; c < 65_536; c++)
+            {
+                if (c is >= 0xD800 and <= 0xDFFF || IsMarked(bits, (char)c)) continue;
+                char l = char.ToLowerInvariant((char)c);
+                if (l != c && IsMarked(bits, l)) { Mark(bits, (char)c); more = true; }
+            }
+        }
+
         return NewDriftSet(bits);
     }
+
+    private static bool IsMarked(ulong[] bits, char c) => (bits[c >> 6] & (1UL << (c & 63))) != 0;
 
     /// <summary>Wraps a marked set with its count and whether it touches ASCII (U+0000–U+007F, the first two words).</summary>
     private static DriftSet NewDriftSet(ulong[] bits)

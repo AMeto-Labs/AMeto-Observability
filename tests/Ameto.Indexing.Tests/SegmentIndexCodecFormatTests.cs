@@ -74,9 +74,9 @@ public sealed class SegmentIndexCodecFormatTests
         Assert.Equal(fromCodec.Lookup("region", "ae-dxb"),  fromRoaring.Lookup("region", "ae-dxb"));
     }
 
-    // ── Trigram: codec round-trip ≡ build-mode, and legacy reads the same ───────
+    // ── Trigram: codec round-trip ≡ build-mode; the legacy layout answers nothing ─
     [Fact]
-    public void Trigram_CodecRoundTrip_And_LegacyBlob_Match()
+    public void Trigram_CodecRoundTrip_Matches_And_LegacyBlob_IsNoInformation()
     {
         var built       = BuildTrigram(300);
         var fromCodec   = SegmentTrigramIndex.Deserialise(built.Serialise());
@@ -86,7 +86,9 @@ public sealed class SegmentIndexCodecFormatTests
         {
             var expected = built.Lookup(q);
             Assert.Equal(expected, fromCodec.Lookup(q));
-            Assert.Equal(expected, fromRoaring.Lookup(q));
+            // Single-byte keys: a cut-down non-ASCII trigram can stand where an ASCII one stood, so
+            // nothing in such a section is proof (SegmentTrigramIndex.TrigramFold.Truncated).
+            Assert.Null(fromRoaring.Lookup(q));
         }
     }
 

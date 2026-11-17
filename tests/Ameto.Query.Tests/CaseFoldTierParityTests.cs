@@ -148,9 +148,9 @@ public sealed class CaseFoldTierParityTests : IAsyncLifetime
     /// THE SEGMENT THE PREVIOUS BUILD WROTE. <see cref="Corpus"/>, written through
     /// <see cref="WriteCorpus"/> into a <see cref="StorageEngine"/> with the production index
     /// wiring (<c>new SegmentIndexBuilder(events, 5, terms)</c>) and flushed with
-    /// <see cref="StorageEngine.FlushHotTierAsync"/> — by <c>main</c> at <c>bc182d60</c>, the last
-    /// commit whose bloom and trigram sections fold with <c>ToLowerInvariant</c>, on a Windows host
-    /// with ICU. Byte-identical over two runs; SHA-256
+    /// <see cref="StorageEngine.FlushHotTierAsync"/> — by <c>main</c> at <c>bc182d60</c>, a build whose
+    /// bloom and trigram sections fold with <c>ToLowerInvariant</c> (as every build before the
+    /// canonical fold does), on a Windows host with ICU. Byte-identical over two runs; SHA-256
     /// <c>738556e4f97372c069032739f2472d4e715eaebf47ad64e027131b643a4e1b23</c>. One index group of
     /// fourteen events. Nothing in this build can write it again: that is what makes it the old
     /// format rather than a description of it.

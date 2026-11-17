@@ -775,8 +775,9 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         var header = TrigramHeader(src);
         if (header.Count == 0) return null;
 
-        long[]   keys  = ArrayPool<long>.Shared.Rent(text.Length);
-        int[][]? posts = null;
+        long[]?    rentedKeys = text.Length > SegmentTrigramIndex.MaxStackKeys ? ArrayPool<long>.Shared.Rent(text.Length) : null;
+        Span<long> keys       = rentedKeys ?? stackalloc long[SegmentTrigramIndex.MaxStackKeys];
+        int[][]?   posts      = null;
         try
         {
             int k = SegmentTrigramIndex.QueryKeys(text, header.Fold, header.FoldFingerprint, keys);
@@ -806,7 +807,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
                 }
             }
 
-            if (unknown > 0 && !Resolve(keys.AsSpan(0, k), posts, header, src)) return [];
+            if (unknown > 0 && !Resolve(keys[..k], posts, header, src)) return [];
             return SegmentTrigramIndex.IntersectRarestFirst(posts, k);
         }
         finally
@@ -814,7 +815,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             // Cleared: the rented array holds references to the memo's arrays, and a pooled
             // array outlives the call.
             if (posts is not null) ArrayPool<int[]>.Shared.Return(posts, clearArray: true);
-            ArrayPool<long>.Shared.Return(keys);
+            if (rentedKeys is not null) ArrayPool<long>.Shared.Return(rentedKeys);
         }
     }
 
