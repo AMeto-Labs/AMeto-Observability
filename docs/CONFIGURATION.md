@@ -193,7 +193,7 @@ What the frozen tiers may hold is unchanged — `MemoryBudgets`' native share, 2
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `MaxPropertyFlattenDepth` | int | `5` | Max recursion depth when flattening nested structured properties into the inverted index. `0` = index only top-level keys. |
+| `MaxPropertyFlattenDepth` | int | `5` | Max recursion depth when flattening nested structured properties into the segment index (its inverted buckets, bloom filter and trigrams). `0` = index only top-level keys; a negative value indexes no property at all. Queries read it too: a search on a property path with more levels below its first segment than this — `Ctx.Tenant = 'acme'` at `0`, equality and `contains`/`startsWith`/`like` alike — is answered by reading the rows rather than from an index that never held their values, and so is free text whenever this is below `5`, since free text matches property values five levels down. The rows returned do not change; below `5`, those searches are slower. (Before this was read on the query side, those searches lost every row of a flushed segment.) **Lowering it** is safe at any time. **Raising it** is safe for the segments written afterwards, but a segment written under the lower value never held the deeper values and nothing in it says so: until retention removes such segments — compaction rewrites only some of them — a search that now asks the index for a deeper path, or for free text, can miss rows from them. Values above `5` index deeper than any search asks. |
 
 ---
 

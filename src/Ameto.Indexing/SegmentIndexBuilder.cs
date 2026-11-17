@@ -80,7 +80,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// What the previous group measured (distinct terms and trigrams), to pre-size the
     /// accumulators; the builder writes its own counts back when it seals. Optional.
     /// </param>
-    public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5,
+    public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = IndexingOptions.DefaultMaxPropertyFlattenDepth,
                                int estimatedTermsPerEvent = EstimatedBloomTermsPerEvent,
                                IndexBuildHints? hints = null, Microsoft.Extensions.Logging.ILogger? log = null)
     {

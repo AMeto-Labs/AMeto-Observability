@@ -113,8 +113,23 @@ public sealed class IndexingOptions
     /// Maximum depth when recursively flattening nested structured properties.
     /// Prevents index explosion for deeply nested objects.
     /// Default: 5. Set to 0 to disable nested flattening (only top-level keys indexed).
+    ///
+    /// <para>Read on both sides of the index: by the builder, which stops walking a property
+    /// this many map levels below the top, and by the query executor, which then asks the index
+    /// nothing about a deeper path and — below the default — nothing about free text, which
+    /// searches <see cref="DefaultMaxPropertyFlattenDepth"/> levels down whatever this says;
+    /// such searches read the rows instead. A group does not record the depth it was built
+    /// with, so raising the value makes the queries ask segments written under the lower one
+    /// about values they never held (see docs/CONFIGURATION.md).</para>
     /// </summary>
-    public int MaxPropertyFlattenDepth { get; init; } = 5;
+    public int MaxPropertyFlattenDepth { get; init; } = DefaultMaxPropertyFlattenDepth;
+
+    /// <summary>
+    /// The flatten depth unless configured, and the deepest the query side ever relies on: a
+    /// property path is hinted to the index only within this many levels, and free text is
+    /// searched exactly this deep.
+    /// </summary>
+    public const int DefaultMaxPropertyFlattenDepth = 5;
 }
 
 /// <summary>

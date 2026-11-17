@@ -116,10 +116,13 @@ Bracket and dot segments may be freely mixed:
 
 Inside the brackets, escape a literal single quote with `\'`.
 
-> Top-level property indexes only cover the first segment, so filters on
-> nested paths are evaluated by full segment scan (without the bloom/inverted
-> index pre-filter). They are still trigram-accelerated when the right-hand
-> side is a string literal.
+> The segment index files nested properties down to five levels below the first
+> segment (`Indexing.MaxPropertyFlattenDepth` in
+> [CONFIGURATION.md](CONFIGURATION.md#indexing-options-ametoindexing)), so
+> `Request.User.Id = 42` and `contains(Request.Path, '/orders')` are answered from
+> it like a top-level property. A deeper path — or, with that option set lower,
+> any path deeper than it — is answered by reading the rows instead: the same
+> result, more slowly. Array subscripts do not count as levels.
 
 ## Built-in CLEF fields
 
