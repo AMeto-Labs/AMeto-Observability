@@ -54,6 +54,7 @@ public sealed class ValueFormsCoverTheScanTests
         "1234567890123456789", "1234567890123456789.0", "1.2345678901234568E+18",
         "9223372036854775808", "18446744073709551614", "18446744073709551615",
         "9007199254740993", "0.3", "0.30000000000000004", "Infinity", "-Infinity", "NaN", "1e300",
+        "nan", "infinity", "-infinity", "1234567890123456789.5",
     ];
 
     private static readonly string[] Cultures = ["", "ru-KZ", "sv-SE", "de-DE", "en-US"];
@@ -64,7 +65,10 @@ public sealed class ValueFormsCoverTheScanTests
         var misses = new List<string>();
         foreach (object? stored in Stored)
         {
-            using var index = IndexOf(stored);
+            var (invertedBytes, trigramBytes, bloomBytes) = SectionsOf(stored);
+            using var index = SegmentIndexReader.Load(invertedBytes, trigramBytes, bloomBytes);
+            using var bloom = SegmentBloomFilter.Deserialise(bloomBytes);
+            var decoded     = SegmentInvertedIndex.Deserialise(invertedBytes);   // the reference reader
             foreach (object literal in Literals)
             {
                 // The answer the scan gives on an invariant host; the next test holds every other
@@ -75,12 +79,66 @@ public sealed class ValueFormsCoverTheScanTests
 
                 bool might     = index.MightContain("P", literal);
                 uint[]? posted = index.Lookup("P", literal);
-                if (!might || posted is null || !posted.Contains(0u))
+                bool bloomed   = SegmentIndexReader.MightContainValue(bloom, literal);
+                uint[]? found  = decoded.Lookup("P", literal);
+                if (!might || posted is null || !posted.Contains(0u) || !bloomed || found is null || !found.Contains(0u))
                     misses.Add($"{Show(stored)} {(eq ? "=" : "in")} {Show(literal)}: " +
-                               $"bloom+inverted gate {might}, postings [{string.Join(",", posted ?? [])}]");
+                               $"bloom+inverted gate {might}, postings [{string.Join(",", posted ?? [])}], " +
+                               $"bloom {bloomed}, decoded postings [{string.Join(",", found ?? [])}]");
             }
         }
         Assert.True(misses.Count == 0, "the index lost rows the scan matches:\n" + string.Join("\n", misses));
+    }
+
+    /// <summary>
+    /// <c>A = B</c> and <c>B = A</c> agree for every pair of stored numbers: two properties compare
+    /// by the numbers they hold, whatever their types.
+    /// </summary>
+    [Fact]
+    public void Two_stored_numbers_compare_the_same_either_way_round()
+    {
+        var odd = new List<string>();
+        foreach (object? a in Stored)
+            foreach (object? b in Stored)
+            {
+                if (a is string or bool || b is string or bool) continue;    // the text and bool roads come first
+                var ab = IndexValueForms.CompareProperties(a, b);
+                var ba = IndexValueForms.CompareProperties(b, a);
+                var flipped = ba switch
+                {
+                    IndexValueForms.NumberOrder.Less    => IndexValueForms.NumberOrder.Greater,
+                    IndexValueForms.NumberOrder.Greater => IndexValueForms.NumberOrder.Less,
+                    _                                   => ba,
+                };
+                if (ab != flipped) odd.Add($"{Show(a)} vs {Show(b)}: {ab}, the other way round {ba}");
+            }
+        Assert.True(odd.Count == 0, string.Join("\n", odd));
+    }
+
+    /// <summary>
+    /// A segment written before the index went invariant, on a host whose minus is U+2212 (sv-SE):
+    /// that build filed -5 as "\0l−5" and gave the bloom "−5". Built by hand in the old shape, with
+    /// the culture pinned — elsewhere the form does not exist.
+    /// </summary>
+    [Fact]
+    public void A_negative_integer_a_legacy_build_spelled_with_the_host_minus_is_still_found()
+    {
+        InCulture("sv-SE", () =>
+        {
+            var inv = new SegmentInvertedIndex();
+            inv.AddSpan(0, "X", "\u0000l−5");
+            var legacyBloom = SegmentBloomFilter.Create(64);
+            legacyBloom.Add("−5");
+            byte[] invBytes = inv.Serialise(), bloomBytes = legacyBloom.Serialise();
+            legacyBloom.Dispose();
+
+            var filter = CompiledFilter.Compile("X = -5");
+            using var index = SegmentIndexView.OverSections(null, "legacy.seg", 0, invBytes, default, bloomBytes);
+            Assert.True(QueryExecutor.PassesBloomGate(filter, index), "the bloom gate dropped a legacy segment holding the value");
+            Assert.True(QueryExecutor.TryNarrowWithIndex(filter, index, out uint[]? candidates));
+            Assert.Equal([0u], candidates!);
+            return 0;
+        });
     }
 
     [Fact]
@@ -176,6 +234,13 @@ public sealed class ValueFormsCoverTheScanTests
     /// indexes a group, and read back the way a query reads one.</summary>
     private static SegmentIndexReader IndexOf(object? value)
     {
+        var (inverted, trigram, bloom) = SectionsOf(value);
+        return SegmentIndexReader.Load(inverted, trigram, bloom);
+    }
+
+    /// <summary>The three sections the builder writes for one event carrying <c>P</c> = <paramref name="value"/>.</summary>
+    private static (byte[] Inverted, byte[] Trigram, byte[] Bloom) SectionsOf(object? value)
+    {
         var buf = new ArrayBufferWriter<byte>(64);
         var w   = new MessagePackWriter(buf);
         w.WriteMapHeader(1);
@@ -205,6 +270,6 @@ public sealed class ValueFormsCoverTheScanTests
 
         using var builder = new SegmentIndexBuilder(hot.Count);
         builder.Build(hot, pool);
-        return SegmentIndexReader.Load(builder.SerialisedInvertedIndex, builder.SerialisedTrigramIndex, builder.SerialisedBloomFilter);
+        return (builder.SerialisedInvertedIndex, builder.SerialisedTrigramIndex, builder.SerialisedBloomFilter);
     }
 }

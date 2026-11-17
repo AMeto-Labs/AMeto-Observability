@@ -569,44 +569,40 @@ public static class FilterEvaluator
         // string-valued Elapsed, and still must) is unreachable. Everything outside that falls
         // through with its semantics untouched, at the cost of one extra frozen-dictionary probe.
         //
-        // The probe hands back a double, which holds both sides exactly only inside 2^53 — the
-        // literal (a long, or a double that is itself) and the stored value (a double is itself;
-        // an integer read as a double is exact below 2^53, and from 2^53 on may be rounded). There
-        // the double comparison IS the exact one; anything larger takes the general road, which
-        // reads the integer as the integer it is.
+        // The probe hands the number back as it was written — an integer exactly, a float as a
+        // double — and the comparison is the one the general road makes of the same value
+        // (IndexValueForms.CompareInteger / CompareDouble are what CompareNumber dispatches to),
+        // so an id past 2^53 is compared exactly here too, with no box and no second walk.
         if (node.RightProperty is null
             && node.Value is { } literal && IsNumeric(literal)
             && !BuiltinFields.TryResolve(node.Property, out _)
             && CanProbeUserValue(ev, node.Property))
         {
             if (Ameto.Core.Serialization.LogEventSerializer.TryReadPropertyNumber(
-                    ev.RawProperties, node.Property, out double number, out bool present))
-            {
-                if (Math.Abs(number) < TwoTo53 && (literal is not long l || l is >= -(long)TwoTo53 and <= (long)TwoTo53))
-                    return CompareExactDoubles(number, ToDouble(literal), node.Op);
-            }
+                    ev.RawProperties, node.Property, out double number, out Int128 integer, out bool isInteger, out bool present))
+                return Holds(isInteger ? IndexValueForms.CompareInteger(integer, literal)
+                                       : IndexValueForms.CompareDouble(number, literal), node.Op);
+
             // Absent is not "false": Compare(null, <a literal>, op) answers true for Ne and
             // false for everything else, and that is the answer the scan has always given.
-            else if (!present) return node.Op is CompareOp.Ne;
+            if (!present) return node.Op is CompareOp.Ne;
         }
 
         // Inline MatchAny: avoids closure/delegate allocation on every event
         object? actual = GetValue(ev, node.Property);
 
         // `A = B`: the right operand is read off the same event, not off the AST.
-        object? right = node.RightProperty is { } rhs ? GetValue(ev, rhs) : node.Value;
+        bool   twoProperties = node.RightProperty is not null;
+        object? right        = twoProperties ? GetValue(ev, node.RightProperty!) : node.Value;
 
         if (actual is IList list && actual is not byte[] && actual is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (CompareProperty(list[i], right, node.Op)) return true;
+                if (CompareProperty(list[i], right, node.Op, twoProperties)) return true;
             return false;
         }
-        return CompareProperty(actual, right, node.Op);
+        return CompareProperty(actual, right, node.Op, twoProperties);
     }
-
-    /// <summary>2^53: below it a double holds every integer exactly.</summary>
-    private const double TwoTo53 = 9007199254740992d;
 
     /// <summary>
     /// Applies <paramref name="predicate"/> to <paramref name="value"/>.
@@ -680,11 +676,24 @@ public static class FilterEvaluator
     private static bool IsNumeric(object o) =>
         o is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal;
 
+    /// <summary>How the numeric tail of <see cref="Compare(object?, object?, CompareOp, NumberRule)"/> compares.</summary>
+    private enum NumberRule : byte
+    {
+        /// <summary>A computed value against a literal: doubles, equal within 1e-15.</summary>
+        Tolerant,
+        /// <summary>A property against a literal: in the property's own terms (<see cref="IndexValueForms.CompareNumber"/>).</summary>
+        AgainstValue,
+        /// <summary>Two properties: by the exact numbers they hold (<see cref="IndexValueForms.CompareProperties"/>).</summary>
+        AgainstProperty,
+    }
+
     /// <summary>
-    /// A PROPERTY compared with a value — <c>Ratio = 0.3</c>, <c>OrderNo &gt; 5</c>, <c>A = B</c> —
-    /// which is what the segment index answers for, so a number compares in the property's own
-    /// terms (<see cref="IndexValueForms.TryCompareNumbers"/>): an integer exactly, as the integer
-    /// it is; a double as a double, by IEEE equality, the value read as the double nearest it.
+    /// A PROPERTY compared with a value — <c>Ratio = 0.3</c>, <c>OrderNo &gt; 5</c> — which is what
+    /// the segment index answers for, so a number compares in the property's own terms
+    /// (<see cref="IndexValueForms.CompareNumber"/>): an integer exactly, as the integer it is; a
+    /// double as a double, by IEEE equality, the value read as the double nearest it. Against
+    /// another property (<paramref name="rightIsProperty"/>, <c>A = B</c>) two numbers compare by
+    /// the exact numbers they hold, so <c>A = B</c> and <c>B = A</c> agree.
     ///
     /// <para>It used to be the tolerant comparison below, and that cost rows. Through a double,
     /// every integer past 2^53 that rounds to the same one was equal — order
@@ -695,8 +704,8 @@ public static class FilterEvaluator
     /// and one double, and the index is asked for both — and for -0.0 beside 0, which IEEE makes
     /// equal.</para>
     /// </summary>
-    private static bool CompareProperty(object? left, object? right, CompareOp op)
-        => Compare(left, right, op, exactNumbers: true);
+    private static bool CompareProperty(object? left, object? right, CompareOp op, bool rightIsProperty = false)
+        => Compare(left, right, op, rightIsProperty ? NumberRule.AgainstProperty : NumberRule.AgainstValue);
 
     /// <summary>
     /// A COMPUTED value compared with a literal — <c>bucket(…)</c>, <c>round(…)</c>,
@@ -705,9 +714,9 @@ public static class FilterEvaluator
     /// (0.31000000000000005 for 0.31), and no index is ever asked about a function's result.
     /// </summary>
     private static bool Compare(object? left, object? right, CompareOp op)
-        => Compare(left, right, op, exactNumbers: false);
+        => Compare(left, right, op, NumberRule.Tolerant);
 
-    private static bool Compare(object? left, object? right, CompareOp op, bool exactNumbers)
+    private static bool Compare(object? left, object? right, CompareOp op, NumberRule numbers)
     {
         if (left is null && right is null) return op is CompareOp.Eq;
         if (left is null || right is null) return op is CompareOp.Ne;
@@ -775,44 +784,31 @@ public static class FilterEvaluator
             };
         }
 
-        // Numeric comparison: a property's by exact value, a computed value's through doubles
-        // with the tolerance (see CompareProperty and Compare above).
-        return exactNumbers
-            ? CompareNumbersExactly(left, right, op)
-            : CompareNumbers(ToDouble(left), ToDouble(right), op);
+        // Numeric comparison: a property's exactly, in its own terms or against another property's
+        // number; a computed value's through doubles with the tolerance (see the rules above).
+        return numbers switch
+        {
+            NumberRule.AgainstValue    => Holds(IndexValueForms.CompareNumber(left, right), op),
+            NumberRule.AgainstProperty => Holds(IndexValueForms.CompareProperties(left, right), op),
+            _                          => CompareNumbers(ToDouble(left), ToDouble(right), op),
+        };
     }
 
     /// <summary>
-    /// The numeric tail of <see cref="CompareProperty"/>, in the left value's own terms
-    /// (<see cref="IndexValueForms.TryCompareNumbers"/> — the same reading the index's value forms
-    /// are built from). A pair that does not order — the right side no number of the left's kind,
-    /// or NaN — satisfies no operator, <c>!=</c> included, as it never did.
+    /// Whether <paramref name="op"/> holds for two numbers that compare as <paramref name="order"/> —
+    /// the same reading the index's value forms are built from. A pair that does not order — a side
+    /// no number of its kind, or NaN — satisfies no operator, <c>!=</c> included, as it never did;
+    /// a pair known to differ but not which way satisfies <c>!=</c> alone.
     /// </summary>
-    private static bool CompareNumbersExactly(object left, object right, CompareOp op)
-        => IndexValueForms.TryCompareNumbers(left, right, out int order) && op switch
-        {
-            CompareOp.Eq => order == 0,
-            CompareOp.Ne => order != 0,
-            CompareOp.Lt => order <  0,
-            CompareOp.Le => order <= 0,
-            CompareOp.Gt => order >  0,
-            CompareOp.Ge => order >= 0,
-            _            => false,
-        };
-
-    /// <summary>
-    /// <see cref="CompareNumbersExactly"/> for two doubles that each hold their number exactly —
-    /// the unboxed road in <see cref="EvalCompare"/> checks that before it comes here, so the
-    /// answer is the general road's. NaN never arrives: the road declines it.
-    /// </summary>
-    private static bool CompareExactDoubles(double left, double right, CompareOp op) => op switch
+    private static bool Holds(IndexValueForms.NumberOrder order, CompareOp op) => op switch
     {
-        CompareOp.Eq => left == right,
-        CompareOp.Ne => left != right,
-        CompareOp.Lt => left <  right,
-        CompareOp.Le => left <= right,
-        CompareOp.Gt => left >  right,
-        CompareOp.Ge => left >= right,
+        CompareOp.Eq => order == IndexValueForms.NumberOrder.Equal,
+        CompareOp.Ne => order is IndexValueForms.NumberOrder.Less or IndexValueForms.NumberOrder.Greater
+                              or IndexValueForms.NumberOrder.Unequal,
+        CompareOp.Lt => order == IndexValueForms.NumberOrder.Less,
+        CompareOp.Le => order is IndexValueForms.NumberOrder.Less or IndexValueForms.NumberOrder.Equal,
+        CompareOp.Gt => order == IndexValueForms.NumberOrder.Greater,
+        CompareOp.Ge => order is IndexValueForms.NumberOrder.Greater or IndexValueForms.NumberOrder.Equal,
         _            => false,
     };
 
@@ -1703,8 +1699,10 @@ public static class FilterEvaluator
     /// index holds for it (<see cref="IndexValueForms.PlainText"/> is both): this used to be
     /// <c>ToString()</c>, the host culture's, so on a <c>ru-KZ</c> host a stored 12.5 read
     /// <c>12,5</c> — <c>contains(Ratio, '2,5')</c> matched hot rows that the flushed index, holding
-    /// "12.5", then dropped, and <c>'2.5'</c> matched in neither tier. A filter now means the same
-    /// thing on every host.
+    /// "12.5", then dropped, and <c>'2.5'</c> matched in neither tier. A number now reads the same
+    /// on every host. (Dates and time spans are still PARSED in the host culture, by
+    /// <c>dateTime()</c>, <c>datePart()</c>, <c>timeSpan()</c> and their kin — no index is asked
+    /// about those.)
     /// </summary>
     private static string? Text(object? v) => v switch
     {

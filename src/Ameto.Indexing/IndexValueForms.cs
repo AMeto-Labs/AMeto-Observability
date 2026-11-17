@@ -7,7 +7,7 @@ namespace Ameto.Indexing;
 /// The one place that knows what a VALUE is called inside a segment index — the sibling of
 /// <c>BuiltinFields</c>, which knows what a property is called — and, since the two have to agree,
 /// what a value MEANS to the scan that the index stands in front of: the text a scalar reads as
-/// (<see cref="PlainText"/>) and how its number compares (<see cref="TryCompareNumbers"/>).
+/// (<see cref="PlainText"/>) and how its number compares (<see cref="CompareNumber"/>).
 /// <c>FilterEvaluator</c> reads values through both, so the index and the scan cannot come to
 /// disagree about them again.
 ///
@@ -183,44 +183,103 @@ public static class IndexValueForms
         return false;
     }
 
-    /// <summary>
-    /// Orders <paramref name="value"/>, a property's number, against <paramref name="other"/>, what it
-    /// is compared with, in the property's own terms (see above): the sign of <paramref name="order"/>
-    /// says which is greater, 0 that they are equal. False — unordered, so neither equal nor unequal —
-    /// when <paramref name="value"/> is not a number, <paramref name="other"/> reads as no number of
-    /// its kind, or either is NaN.
-    /// </summary>
-    public static bool TryCompareNumbers(object? value, object? other, out int order)
+    /// <summary>How two numbers compare — which is what <c>=</c>, <c>!=</c> and the orderings ask.</summary>
+    public enum NumberOrder : sbyte
     {
-        order = 0;
-        switch (value)
-        {
-            case double or float:
-                if (!TryReadDouble(value, out double v) || !TryReadDouble(other, out double o)
-                    || double.IsNaN(v) || double.IsNaN(o))
-                    return false;
-                order = v.CompareTo(o);           // -0.0 and 0.0 are equal to CompareTo, as to ==
-                return true;
-
-            case long or ulong or int or uint or short or ushort or byte or sbyte:
-                TryReadInteger(value, out Int128 integer);
-                if (TryReadInteger(other, out Int128 exact))
-                {
-                    order = integer.CompareTo(exact);
-                    return true;
-                }
-                if (!TryReadDouble(other, out double real) || double.IsNaN(real)) return false;
-
-                // Not an integer, so not equal — but its double may be: past 2^52 every double is
-                // an integer, and text such as '1234567890123456789.5' rounds onto one. Then the
-                // double cannot say which side is greater, and the pair is unordered, like NaN.
-                order = CompareIntegerWithReal(integer, real);
-                return order != 0;
-
-            default:
-                return false;
-        }
+        /// <summary>Nothing holds, not even "unequal": a side is NaN, or reads as no number of its kind.</summary>
+        Unordered = -2,
+        Less      = -1,
+        Equal     = 0,
+        Greater   = 1,
+        /// <summary>They differ, and no reading at hand can say which is greater.</summary>
+        Unequal   = 2,
     }
+
+    /// <summary>
+    /// A property's number, <paramref name="value"/>, against what a filter compares it with,
+    /// <paramref name="other"/> — a literal — in the property's own terms (see above). Unordered when
+    /// <paramref name="value"/> is no number.
+    /// </summary>
+    public static NumberOrder CompareNumber(object? value, object? other) => value switch
+    {
+        double d => CompareDouble(d, other),
+        float f  => CompareDouble(f, other),
+        long or ulong or int or uint or short or ushort or byte or sbyte
+                 => TryReadInteger(value, out Int128 integer) ? CompareInteger(integer, other) : NumberOrder.Unordered,
+        _        => NumberOrder.Unordered,
+    };
+
+    /// <summary>
+    /// An INTEGER property's value against <paramref name="other"/>: exactly against what denotes an
+    /// integer; against anything else through the double it reads as, which orders the two exactly
+    /// whenever it orders them at all. Unboxed, for the scan's numeric road.
+    /// </summary>
+    public static NumberOrder CompareInteger(Int128 value, object? other)
+    {
+        if (TryReadInteger(other, out Int128 exact)) return Order(value.CompareTo(exact));
+        if (!TryReadDouble(other, out double real) || double.IsNaN(real)) return NumberOrder.Unordered;
+
+        int c = CompareIntegerWithReal(value, real);
+        if (c != 0) return Order(c);
+
+        // Not an integer, so not equal — but its double met this integer's: past 2^52 every double
+        // is an integer, and text such as '1234567890123456789.5' rounds onto one. The decimal it
+        // reads as is exact to 28 digits, and rounding is monotonic, so a strict answer there is the
+        // true one; failing that, the two differ and nothing says which way.
+        if (value >= MinDecimal && value <= MaxDecimal
+            && (other is decimal m || other is string s && decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out m)))
+        {
+            int dc = ((decimal)value).CompareTo(m);
+            if (dc != 0) return Order(dc);
+        }
+        return NumberOrder.Unequal;
+    }
+
+    /// <summary>
+    /// A DOUBLE property's value against <paramref name="other"/>, read as the double nearest it:
+    /// IEEE order, so -0.0 equals 0. Unboxed, for the scan's numeric road.
+    /// </summary>
+    public static NumberOrder CompareDouble(double value, object? other)
+        => double.IsNaN(value) || !TryReadDouble(other, out double o) || double.IsNaN(o)
+            ? NumberOrder.Unordered
+            : Order(value.CompareTo(o));          // -0.0 and 0.0 are equal to CompareTo, as to ==
+
+    /// <summary>
+    /// Two PROPERTIES compared with each other (<c>A = B</c>): when both hold numbers, by the exact
+    /// numbers they hold, so that <c>A = B</c> and <c>B = A</c> agree whatever their types — an
+    /// integer and a double meet only where the double is that very integer. Against anything else
+    /// <paramref name="b"/> is read in <paramref name="a"/>'s terms, as a literal would be.
+    /// </summary>
+    public static NumberOrder CompareProperties(object? a, object? b)
+    {
+        bool aReal = a is double or float, bReal = b is double or float;
+        if (IsIntegerType(a) && bReal)  return CompareIntegerWithDouble(a!, b!);
+        if (aReal && IsIntegerType(b))  return Flip(CompareIntegerWithDouble(b!, a!));
+        return CompareNumber(a, b);
+    }
+
+    private static NumberOrder CompareIntegerWithDouble(object integerValue, object doubleValue)
+    {
+        TryReadInteger(integerValue, out Int128 integer);
+        TryReadDouble(doubleValue, out double d);
+        if (double.IsNaN(d)) return NumberOrder.Unordered;
+        if (TryIntegral(d, out Int128 whole)) return Order(integer.CompareTo(whole));
+        return Order(CompareIntegerWithReal(integer, d));   // a fraction, an infinity, or past 2^127: never 0
+    }
+
+    private static bool IsIntegerType(object? value) =>
+        value is long or ulong or int or uint or short or ushort or byte or sbyte;
+
+    private static NumberOrder Order(int c) => c < 0 ? NumberOrder.Less : c > 0 ? NumberOrder.Greater : NumberOrder.Equal;
+
+    private static NumberOrder Flip(NumberOrder o) => o switch
+    {
+        NumberOrder.Less    => NumberOrder.Greater,
+        NumberOrder.Greater => NumberOrder.Less,
+        _                   => o,
+    };
+
+    private static readonly Int128 MinDecimal = (Int128)decimal.MinValue, MaxDecimal = (Int128)decimal.MaxValue;
 
     /// <summary>
     /// An integer against a double, exactly whenever the answer is not 0. Past 2^127, infinities
@@ -265,6 +324,10 @@ public static class IndexValueForms
             {
                 Append(forms, ref n, "\0l" + digits);
                 if (integer >= int.MinValue && integer <= int.MaxValue) Append(forms, ref n, "\0i" + digits);
+
+                // Back-compat: a pre-invariant build wrote the host's minus sign (U+2212 on sv-SE).
+                if (integer < 0 && !CultureInfo.CurrentCulture.Equals(CultureInfo.InvariantCulture))
+                    Append(forms, ref n, "\0l" + integer.ToString(CultureInfo.CurrentCulture));
             }
             else if (integer > long.MaxValue && integer <= ulong.MaxValue)
             {
@@ -320,7 +383,11 @@ public static class IndexValueForms
 
         // A stored integer's digits, and a stored double's round-trip text (both zeros for 0).
         if (TryReadInteger(value, out Int128 integer))
+        {
             Append(forms, ref n, integer.ToString(CultureInfo.InvariantCulture));
+            if (integer < 0 && !CultureInfo.CurrentCulture.Equals(CultureInfo.InvariantCulture))
+                Append(forms, ref n, integer.ToString(CultureInfo.CurrentCulture));   // a pre-invariant build's minus
+        }
         if (TryReadDouble(value, out double d))
         {
             AppendDoubleText(forms, ref n, d);

@@ -223,6 +223,38 @@ public sealed class ValueFormsAcrossTheFlushTests : IAsyncLifetime
             Long("small", "Ts", 42L),
         ], expected);
 
+    /// <summary>The same rules reach an array's elements and a nested property.</summary>
+    [Theory]
+    [InlineData("Ids = 1234567890123456789",         "arr")]
+    [InlineData("Ids = '1234567890123456789'",       "arr")]
+    [InlineData("Ids = 1234567890123456790")]
+    [InlineData("Ids in ['1234567890123456789']",    "arr")]
+    [InlineData("Order.No = 1234567890123456789",    "nested")]
+    [InlineData("Order.No = '1234567890123456789'",  "nested")]
+    [InlineData("Order.No = 1234567890123456800")]
+    [InlineData("Order.Ratio = 0.3")]
+    [InlineData("Order.Ratio = 0.30000000000000004", "nested")]
+    [InlineData("Order.Zero = 0",                    "nested")]
+    [InlineData("contains(Order.Ratio, '0.300')",    "nested")]
+    public Task Arrays_and_nested_values_follow_the_same_rules(string filter, params string[] expected)
+        => AssertRowsAsync(filter,
+        [
+            new("arr", "Ids", static (ref MessagePackWriter w) =>
+            {
+                w.WriteArrayHeader(2);
+                w.Write(1234567890123456789L);
+                w.Write(42L);
+            }),
+            new("nested", "Order", static (ref MessagePackWriter w) =>
+            {
+                w.WriteMapHeader(3);
+                w.Write("No");    w.Write(1234567890123456789L);
+                w.Write("Ratio"); w.Write(0.1 + 0.2);
+                w.Write("Zero");  w.Write(-0.0);
+            }),
+            Long("plain", "Other", 7L),
+        ], expected);
+
     /// <summary>2^53 + 1 is the first long a double cannot hold; it rounds to 2^53.</summary>
     [Theory]
     [InlineData("OrderNo = '9007199254740993'", "edge")]

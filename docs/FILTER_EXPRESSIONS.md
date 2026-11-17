@@ -100,6 +100,9 @@ A property is compared in the terms of the value it holds, whatever the literal 
 | `true` / `false` | with `true` / `false`, or the text `'true'` / `'false'` in any case | `Enabled = 'TRUE'` matches; `Enabled = 0`, `= 1` or `= 'no'` match no bool, so `!=` holds |
 
 A number that does not compare — text that is not numeric, `NaN` — satisfies neither `=` nor `!=`.
+Two properties compared with each other (`A = B`) compare by the numbers they hold, so `A = B` and
+`B = A` agree whatever their types: an integer equals a floating-point value only where that value
+is exactly the integer.
 The results of functions (`round`, `bucket`, `toNumber`, …) are compared as doubles that are equal
 within 1e-15, since their own arithmetic can land a hair off the value meant.
 

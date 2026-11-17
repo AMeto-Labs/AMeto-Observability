@@ -567,8 +567,19 @@ public sealed class FilterEvaluatorTests
     [InlineData(1234567890123456789L, "X = 1234567890123456800",      false)]   // a browser's digits for it
     [InlineData(1234567890123456789L, "X <> 1234567890123456790",     true)]
     [InlineData(1234567890123456789L, "X < 1234567890123456790",      true)]
-    [InlineData(1234567890123456789L, "X = '1234567890123456789.5'",  false)]   // not an integer…
-    [InlineData(1234567890123456789L, "X <> '1234567890123456789.5'", false)]   // …and a double cannot order it
+    [InlineData(1234567890123456789L, "X = '1234567890123456789.5'",  false)]   // not an integer, and its double
+    [InlineData(1234567890123456789L, "X <> '1234567890123456789.5'", true)]    // meets this one's: the decimal
+    [InlineData(1234567890123456789L, "X < '1234567890123456789.5'",  true)]    // it reads as orders them
+    [InlineData(1234567890123456789L, "X > '1234567890123456788.5'",  true)]
+    [InlineData(1234567890123456789L, "X >= '1234567890123456789.5'", false)]
+    [InlineData(1234567890123456789L, "X <> '1234567890123456789.00000000000000000000001'", true)]   // past 28 digits: differs, unordered
+    [InlineData(1234567890123456789L, "X < '1234567890123456789.00000000000000000000001'",  false)]
+    [InlineData(9007199254740991L,   "X = 9007199254740991",          true)]    // the last integer a double holds…
+    [InlineData(9007199254740992L,   "X = 9007199254740992",          true)]    // …the first it holds and its neighbour does not…
+    [InlineData(9007199254740992L,   "X = 9007199254740993",          false)]
+    [InlineData(9007199254740992L,   "X < 9007199254740993",          true)]    // …and past it, on both roads
+    [InlineData(-9007199254740993L,  "X = -9007199254740992",         false)]
+    [InlineData(-9007199254740993L,  "X < -9007199254740992",         true)]
     [InlineData(5L,                  "X = 5.0",                       true)]
     [InlineData(5L,                  "X = '5.0'",                     true)]
     [InlineData(5L,                  "X = 4.5",                       false)]
@@ -617,6 +628,56 @@ public sealed class FilterEvaluatorTests
     {
         foreach (var ev in BothRoads("X", stored))
             Assert.Equal(expected, Eval(filter, ev));
+    }
+
+    /// <summary>
+    /// Two properties compare by the exact numbers they hold, so the order of the operands does not
+    /// matter: an integer and a double meet only where the double is that very integer.
+    /// </summary>
+    [Theory]
+    [InlineData(9007199254740993L, 9007199254740992.0, "A = B",  false)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "B = A",  false)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "A <> B", true)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "B <> A", true)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "A > B",  true)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "B < A",  true)]
+    [InlineData(1234567890123456789L, 1234567890123456768.0, "A > B", true)]
+    [InlineData(1234567890123456789L, 1234567890123456768.0, "B < A", true)]
+    [InlineData(5L, 5.0,  "A = B", true)]
+    [InlineData(5L, 5.0,  "B = A", true)]
+    [InlineData(5L, 5.5,  "A < B", true)]
+    [InlineData(5L, 5.5,  "B > A", true)]
+    [InlineData(0L, -0.0, "A = B", true)]
+    [InlineData(0L, -0.0, "B = A", true)]
+    public void Two_properties_compare_the_same_either_way_round(long a, double b, string filter, bool expected)
+    {
+        var ev = MakeEvent(props: new() { ["A"] = a, ["B"] = b });
+        Assert.Equal(expected, Eval(filter, ev));
+    }
+
+    /// <summary>
+    /// The ids and nanosecond timestamps past 2^53 that the exact comparison is for stay on the
+    /// unboxed road: the probe reads the integer as it was written, so nothing is boxed and the
+    /// map is walked once.
+    /// </summary>
+    [Theory]
+    [InlineData("X = 1234567890123456789")]
+    [InlineData("X > 1700000000000000000")]
+    [InlineData("X = 42")]
+    [InlineData("X = 1234567890123456768.0")]
+    [InlineData("X <> 2.5")]
+    public void An_integer_past_2_to_the_53_is_compared_without_a_box(string filter)
+    {
+        var ev       = BothRoads("X", 1234567890123456789L).First();   // the raw msgpack one
+        var compiled = CompiledFilter.Compile(filter);
+        for (int i = 0; i < 100; i++) compiled.Matches(ev);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1_000; i++) compiled.Matches(ev);
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.False(ev.PropertiesMaterialised);
+        Assert.True(bytes == 0, $"expected zero allocation over 1000 evaluations of `{filter}`, saw {bytes} B");
     }
 
     [Fact]
