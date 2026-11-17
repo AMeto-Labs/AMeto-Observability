@@ -18,11 +18,14 @@ namespace Ameto.Indexing;
 /// <see cref="MessagePackReader"/> and feeds the indexes directly — no per-event
 /// <c>Dictionary</c>, no boxing, no per-attribute strings. This is the flush-path allocation hot
 /// spot (index build was ~16 KB/event); the streaming walk is byte-parity with the old dictionary
-/// path (see <see cref="BuildReference"/>, exercised by the parity test) for every valid UTF-8
-/// input — keys that are not strings, nil and extension elements of arrays and binary values
-/// included, which it files as the reader reads them (see the note above <c>WalkMap</c>). A key or
-/// value that is NOT valid UTF-8 is indexed as its raw bytes, where the char-based walk indexed
-/// the U+FFFD-replaced decoding — see <see cref="SegmentInvertedIndex"/>.
+/// path (see <see cref="BuildReference"/>, exercised by the parity tests) for every valid UTF-8
+/// input without a repeated key — keys that are not strings, nil and extension elements of arrays
+/// and binary values included, which it files as the reader reads them (see the note above
+/// <c>WalkMap</c>). A key repeated in one map is filed once per occurrence, where the dictionary
+/// keeps only the last value: the index then holds more than the scan reads, which costs a
+/// re-check and never a row. A key or value that is NOT valid UTF-8 is indexed as its raw bytes,
+/// where the char-based walk indexed the U+FFFD-replaced decoding — see
+/// <see cref="SegmentInvertedIndex"/>.
 /// </summary>
 public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 {
@@ -621,6 +624,12 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     // ELEMENT of an array is the string "<null>" and a binary value the text "System.Byte[]"
     // (AddScalar). The reference build reads the properties through that same reader, so the
     // parity tests hold the walk to it.
+    //
+    // Not every reading is followed. A map or an array is not filed as a WHOLE: the scan's text
+    // predicates read one as its .NET type name ("System.Object[]", "System.Collections.Generic.
+    // Dictionary`2[…]"), which no client is shown and no filter should match — there the scan is
+    // the side that is wrong, and `contains(Payload, 'Dictionary')` still finds a row hot that a
+    // flushed group drops. That is left to the scan.
 
     private void WalkMap(ref MessagePackReader reader, int prefixLen, uint offset, int depth)
     {
@@ -682,9 +691,9 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// <c>ReadArray</c> turns it into the string <c>"&lt;null&gt;"</c>, which the scan compares,
     /// the events API shows and the UI's "filter by this value" builds <c>Tags[1] = '&lt;null&gt;'</c>
     /// from, so it is filed as that string. A binary value is a <c>byte[]</c>, which the scan's text
-    /// predicates (<c>contains</c>, <c>like</c>, <c>startsWith</c>, <c>in</c>) read as its
-    /// <c>ToString()</c>, <c>"System.Byte[]"</c> — the text clients are shown for it too — so it is
-    /// filed as that text. The walk used to file a nil element as a nil and skip the other two,
+    /// predicates (<c>contains</c>, <c>like</c>, <c>startsWith</c>, <c>in</c> and the text
+    /// functions) read as its <c>ToString()</c>, <c>"System.Byte[]"</c> — the text clients are shown
+    /// for it too — so it is filed as that text. The walk used to file a nil element as a nil and skip the other two,
     /// and those filters found the row hot and nothing once flushed.</para>
     ///
     /// <para>The index follows the reader rather than the reader the index because the reader's

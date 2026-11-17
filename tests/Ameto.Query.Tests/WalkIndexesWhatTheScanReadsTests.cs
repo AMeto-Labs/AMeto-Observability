@@ -259,6 +259,26 @@ public sealed class WalkIndexesWhatTheScanReadsTests : IAsyncLifetime
             ("needle",               ["subject"]),
         ]),
 
+        // ... and in a map inside an array: the scan reads the top-level property through it, and
+        // the walk used to stop inside it, the properties after the array unfiled.
+        ["key-in-a-map-in-an-array"] = new(
+        [
+            new("subject", 2, static (ref MessagePackWriter w) =>
+            {
+                w.Write("L");     w.WriteArrayHeader(2); w.WriteMapHeader(2); w.Write(1); w.Write("x"); w.Write("K"); w.Write("kept"); w.Write("needle");
+                w.Write("After"); w.Write("later");
+            }),
+            new("plain", 2, static (ref MessagePackWriter w) => { w.Write("L"); w.WriteArrayHeader(1); w.Write("other"); w.Write("After"); w.Write("sooner"); }),
+        ],
+        [
+            ("L = 'needle'",        ["subject"]),
+            ("contains(L, 'eedl')", ["subject"]),
+            ("L in ['needle']",     ["subject"]),
+            ("L like '%needle'",    ["subject"]),
+            ("L[0].K = 'kept'",     ["subject"]),
+            ("After = 'later'",     ["subject"]),
+        ]),
+
         // 2. A nil element of an array: the string "<null>" to the scan and to every client.
         ["nil-element"] = new(
         [

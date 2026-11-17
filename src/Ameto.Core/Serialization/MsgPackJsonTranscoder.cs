@@ -80,9 +80,9 @@ public static class MsgPackJsonTranscoder
             return;
         }
 
-        // Non-string key: msgpack allows it, and the client is shown it under its text. The scan
-        // and the index skip such a pair (LogEventSerializer.ReadMap, SegmentIndexBuilder.WalkMap):
-        // no filter can name it.
+        // Non-string key: msgpack allows it, and it is shown under the text ReadScalarAsObject
+        // makes of it. The scan and the index skip such a pair (LogEventSerializer.ReadMap,
+        // SegmentIndexBuilder.WalkMap): no filter can name it.
         object? key = ReadScalarAsObject(ref reader);
         writer.WritePropertyName(key?.ToString() ?? string.Empty);
     }

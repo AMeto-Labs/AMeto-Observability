@@ -75,6 +75,9 @@ public sealed class WalkParityOnUnusualShapesTests
         Assert.Equal(Of("every-key-kind"), index.Lookup("P", "kinds"));
         Assert.Equal(Of("nested-int-key"), index.Lookup(Flat("Counts", "Kept"), "yes"));
         Assert.Equal(Of("map-under-a-key"), index.Lookup("P", "after-map"));
+        Assert.Equal(Of("key-in-a-map-in-an-array"), index.Lookup("L", "needle"));
+        Assert.Equal(Of("key-in-a-map-in-an-array"), index.Lookup(Flat("L", "K"), "kept"));
+        Assert.Equal(Of("key-in-a-map-in-an-array"), index.Lookup("Then", "after-the-array"));
         // ... and nothing of a skipped pair's value, however deep it goes.
         Assert.Equal(Array.Empty<uint>(), index.LookupTrigram("hidden"));
 
@@ -125,6 +128,11 @@ public sealed class WalkParityOnUnusualShapesTests
             w.Write("Counts"); w.WriteMapHeader(3); w.Write(500); w.Write(3); w.Write("Kept"); w.Write("yes"); w.Write(404); w.Write(1);
             w.Write("R");      w.Write("needle");
             w.Write("S");      w.Write(4242L);
+        }),
+        new("key-in-a-map-in-an-array", 2, static (ref MessagePackWriter w) =>
+        {
+            w.Write("L");    w.WriteArrayHeader(2); w.WriteMapHeader(2); w.Write(1); w.Write("x"); w.Write("K"); w.Write("kept"); w.Write("needle");
+            w.Write("Then"); w.Write("after-the-array");
         }),
         new("nil-key", 2, static (ref MessagePackWriter w) => { w.WriteNil(); w.Write("x"); w.Write("P"); w.Write("nil-key"); }),
         new("every-key-kind", 8, static (ref MessagePackWriter w) =>
