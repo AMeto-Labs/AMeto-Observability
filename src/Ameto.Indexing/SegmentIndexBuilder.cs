@@ -200,6 +200,24 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     // IndexBuildParityTests pins that against the reference build, which still adds every
     // time on purpose. What the writer sizes the next group's filter from is the number of
     // terms PRESENTED (_bloomPresented), repeats included, exactly the count it saw before.
+    //
+    // "NEW TO THE INVERTED INDEX" STANDS FOR "NEW TO THE BLOOM" ONLY WHERE WHOEVER FILED THE
+    // TERM FIRST GAVE THE BLOOM THE SAME TEXT. A client property may be named like a bucket
+    // filed here, and a string in it that spells a value the header files IS the header's
+    // term. For the level, the service, the ids and the exception types that costs no row:
+    // each gives the bloom the very bytes it files, folded as the walk folds a string, so the
+    // text is there whichever of the two came first. The exception marker is the one that
+    // does not — its bloom term is the bucket's name — and it keeps its own account: see
+    // AddExists.
+    //
+    // Two things that rule does NOT make true, said here so the sentences above are read as
+    // narrowly as they hold. The KEY of such a property: where the header made the bucket,
+    // the walk never sees the key as new and never adds it, so for that input the filter
+    // differs from the reference build's by that one term. Nothing asks the bloom for a
+    // property's name — the gate probes values — so no query can tell. And a term two
+    // SCALARS share: a string that spells another value's type-tagged form ("\0l5" beside
+    // the long 5) is that value's term with a different bloom text, and whichever of the two
+    // is filed second is skipped. That one does cost rows (`P = 5` after a flush), and is open.
 
     private static readonly byte[][] LevelUtf8 = BuildLevelTable();
 
@@ -436,11 +454,49 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         _hints?.NoteMalformedException();
     }
 
+    /// <summary>
+    /// Files the row under the exception marker: the bucket <c>@x.exists</c>, the one value
+    /// <c>"true"</c>. The bloom is given the bucket's NAME and never that value — which makes this
+    /// the one term filed from the header whose presence does not mean the bloom holds its text.
+    ///
+    /// <para>The property walk reads "already in the inverted index" as "already in the bloom"
+    /// (see the note on first sight above), and a client can reach this term: a property
+    /// literally named <c>@x.exists</c> shares the bucket, and the string <c>"true"</c> in it IS
+    /// this term. Filed after the marker it read as a repeat and its bloom add was skipped. If
+    /// nothing else in the group had given the bloom that text — a boolean <c>true</c> under any
+    /// property does — the bloom gate then dropped the group for a filter on the value:
+    /// <c>['@x.exists'][0] = 'true'</c>, the property as an array, which is the shape a filter
+    /// can reach, returned its row from the hot tier and nothing once the tier was flushed.
+    /// Filed BEFORE any exception it was new, and added; that is the whole difference.</para>
+    ///
+    /// <para>So a term the marker made is remembered as owing the bloom its text
+    /// (<see cref="_markerOwesBloom"/>), and the walk pays that the first time a client files
+    /// the value (the string case of <see cref="AddScalar"/>) — once for the group. A term the
+    /// client made first owes nothing: the walk added the text, and the bucket's name with it,
+    /// as the property's key.</para>
+    /// </summary>
     private void AddExists(uint offset)
     {
-        if (_inverted.AddUtf8(offset, "@x.exists"u8, "true"u8) != IndexAddOutcome.Existing) _bloom.Add("@x.exists"u8);
+        int prop = _inverted.PropertyId(MarkerBucket, out _);
+        if (_inverted.AddValue(offset, prop, MarkerValue) == IndexAddOutcome.NewValue)
+        {
+            _bloom.Add(MarkerBucket);
+            _markerOwesBloom = prop;
+        }
         _bloomPresented++;
     }
+
+    /// <summary>The exception marker's bucket (<see cref="ClefFields.ExceptionExists"/>) and the
+    /// one value it files there — spelled once, for the marker and for the walk that meets it.</summary>
+    private static ReadOnlySpan<byte> MarkerBucket => "@x.exists"u8;
+    private static ReadOnlySpan<byte> MarkerValue  => "true"u8;
+
+    /// <summary>
+    /// The property id of the marker's bucket while its <c>"true"</c> is of the marker's own
+    /// making and the bloom has not been given that text; -1 otherwise — no exception indexed
+    /// yet, the value filed by a client first, or the debt already paid. See <see cref="AddExists"/>.
+    /// </summary>
+    private int _markerOwesBloom = -1;
 
     /// <summary>Trigram of a UTF-8 value: byte-wise fold when ASCII, the UTF-16 path otherwise.</summary>
     private void TrigramUtf8(uint offset, ReadOnlySpan<byte> utf8)
@@ -598,7 +654,12 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 var r    = _inverted.AddValue(offset, prop, v);          // serialised == plain for strings
                 _bloomPresented += 2;
                 if (newKey) _bloom.AddUtf8(flatKey);
-                FoldValue(offset, v, bloom: r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
+                // New to the inverted index — or a repeat the bloom has not been given: the
+                // exception marker's own term, met by a client's value for the first time
+                // (see AddExists). The debt is struck off once the text is in the filter.
+                bool owed = r == IndexAddOutcome.Existing && prop == _markerOwesBloom && v.SequenceEqual(MarkerValue);
+                FoldValue(offset, v, bloom: owed || r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
+                if (owed) _markerOwesBloom = -1;
                 break;
             }
             case MessagePackType.Integer:
