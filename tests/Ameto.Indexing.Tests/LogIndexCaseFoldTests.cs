@@ -631,7 +631,7 @@ public sealed class LogIndexCaseFoldTests
         for (int length = 0; length < section.Length; length++)
         {
             byte[] torn = section.AsSpan(0, length).ToArray();
-            foreach (string search in new[] { "refused", "ПЛАТЕЖА" })
+            foreach (var (search, row) in new (string, uint)[] { ("refused", 0), ("ПЛАТЕЖА", 1) })
             foreach (var ask in new Func<uint[]?>[]
             {
                 () => SegmentTrigramIndex.Deserialise(torn).Lookup(search),
@@ -641,8 +641,8 @@ public sealed class LogIndexCaseFoldTests
                 uint[]? hits;
                 try { hits = ask(); }
                 catch (Exception) { continue; }            // unreadable: QueryExecutor reads the group
-                Assert.True(hits is null || hits.Length > 0,
-                    $"'{search}' proved absent from the section cut at {length} of {section.Length} bytes");
+                Assert.True(hits is null || Array.IndexOf(hits, row) >= 0,
+                    $"'{search}' lost its row in the section cut at {length} of {section.Length} bytes");
             }
         }
     }

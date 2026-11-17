@@ -776,7 +776,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         if (header.Count == 0) return null;
 
         long[]?    rentedKeys = text.Length > SegmentTrigramIndex.MaxStackKeys ? ArrayPool<long>.Shared.Rent(text.Length) : null;
-        Span<long> keys       = rentedKeys ?? stackalloc long[SegmentTrigramIndex.MaxStackKeys];
+        Span<long> keys       = rentedKeys ?? stackalloc long[text.Length];
         int[][]?   posts      = null;
         try
         {

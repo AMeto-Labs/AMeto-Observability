@@ -28,11 +28,13 @@ namespace Ameto.Indexing;
 /// <see cref="_unsorted"/> records the violation and serialisation sorts — they merely give
 /// up the free ordering.</para>
 ///
-/// <para>BUCKET BYTES ARE PINNED: buckets are numbered in first-seen order and serialised in
-/// that order, which is the insertion order the previous dictionary-backed build wrote, so the
-/// buckets this build writes are that build's, byte for byte, behind the canonical layout's
-/// header (see <see cref="CanonicalMagic"/>) — <c>SegmentTrigramBuildParityTests</c> holds the two
-/// builds together, and <c>IndexBuildParityTests</c> the streaming and reference walks.</para>
+/// <para>BUCKET ORDER AND POSTINGS ARE PINNED: buckets are numbered in first-seen order and
+/// serialised in that order, which is the insertion order the previous dictionary-backed build
+/// wrote, so over keys folded the same way the buckets this build writes are that build's, byte
+/// for byte — <c>SegmentTrigramBuildParityTests</c> holds the two together (its reference folds
+/// with <see cref="CaseFold"/> too: the keys themselves, and the header in front of them, are the
+/// canonical layout's, not what releases before it wrote; see <see cref="CanonicalMagic"/>), and
+/// <c>IndexBuildParityTests</c> the streaming and reference walks.</para>
 ///
 /// <para>THREADING: the build side has no lock. One index belongs to one index group's
 /// builder, and <c>SegmentWriter.WriteEvents</c> drives that from a single thread; the
@@ -377,7 +379,7 @@ public sealed class SegmentTrigramIndex
         if (text.Length < 3) return null;
 
         long[]? rented = text.Length > MaxStackKeys ? ArrayPool<long>.Shared.Rent(text.Length) : null;
-        Span<long> keys = rented ?? stackalloc long[MaxStackKeys];
+        Span<long> keys = rented ?? stackalloc long[text.Length];
         try
         {
             int k = QueryKeys(text, _fold, _foldFingerprint, keys);
@@ -415,8 +417,8 @@ public sealed class SegmentTrigramIndex
         finally { if (rented is not null) ArrayPool<long>.Shared.Return(rented); }
     }
 
-    /// <summary>A search term's trigram keys fit on the stack up to this many characters (2 KB);
-    /// a longer term rents its buffer.</summary>
+    /// <summary>A search term's trigram keys go on the stack — sized from the term, at most 2 KB —
+    /// up to this many characters; a longer term rents its buffer.</summary>
     internal const int MaxStackKeys = 256;
 
     /// <summary>

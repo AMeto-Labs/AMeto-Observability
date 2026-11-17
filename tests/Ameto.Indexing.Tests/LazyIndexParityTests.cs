@@ -522,7 +522,10 @@ public sealed class LazyIndexParityTests
     }
 
     /// <summary>The canonical layout, the V1 Roaring one, and the V2 layout every build wrote before
-    /// the canonical fold — keys lowercased, which a reader asks only for ASCII trigrams.</summary>
+    /// the canonical fold — keys lowercased, which a reader asks only for ASCII trigrams. The Roaring
+    /// layout is asked nothing by either reader (<see cref="SegmentTrigramIndex.TrigramFold.Truncated"/>),
+    /// so its rows pin only that the two agree on that; its decoding is held by
+    /// <see cref="ARepeatedLegacyKey_IsWhyASingleByteSectionAnswersNothing"/>.</summary>
     public static TheoryData<string> TrigramLayouts => new() { "codec", "roaring", "lower-v2" };
 
     private static byte[] TrigramSection(SegmentTrigramIndex built, IEnumerable<(uint, string)> adds, string layout) => layout switch
