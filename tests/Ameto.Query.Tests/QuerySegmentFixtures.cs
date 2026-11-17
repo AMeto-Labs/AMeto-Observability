@@ -213,6 +213,9 @@ internal static class QuerySegmentFixtures
     /// <summary>Segments in <see cref="ErrorSegmentsAsync"/>.</summary>
     public const int ErrorSegments = 8;
 
+    /// <summary>The <c>Lane</c> of the even rows of <see cref="ErrorSegmentsAsync"/>, and of the odd ones.</summary>
+    public const string EvenLane = "even", OddLane = "odd";
+
     /// <summary>
     /// What a level-split store's Error level looks like to a search for exceptions: eight
     /// one-group segments of <paramref name="rowsPerSegment"/> Error events each, written through
@@ -223,11 +226,23 @@ internal static class QuerySegmentFixtures
     /// for before it returns a row.
     ///
     /// <para><c>Row</c> is unique and ascending, so a result can be checked for which rows it
-    /// holds and in what order. <paramref name="cache"/> is the index cache production runs with;
-    /// null answers every query from the sections.</para>
+    /// holds and in what order. <c>Lane</c> alternates between <see cref="EvenLane"/> and
+    /// <see cref="OddLane"/> by row, so an equality on it names every other row of every group:
+    /// the ordinary indexed equality, neither a lookup of one row nor the whole group.
+    /// <paramref name="cache"/> is the index cache production runs with; null answers every query
+    /// from the sections.</para>
     /// </summary>
+    /// <param name="segments">
+    /// How many flushes the rows are written in, <see cref="ErrorSegments"/> unless said otherwise.
+    /// </param>
+    /// <param name="groupPayloadBudgetBytes">
+    /// When set, the index-group payload budget, so that one large flush comes out as ONE segment
+    /// of several index groups — the shape compaction leaves a day's Error level in — where the
+    /// default budget makes each segment here a single group.
+    /// </param>
     public static async Task<(StorageEngine Engine, QueryExecutor Query)> ErrorSegmentsAsync(
-        string dir, int rowsPerSegment, int percentWithException, SegmentIndexCache? cache = null)
+        string dir, int rowsPerSegment, int percentWithException, SegmentIndexCache? cache = null,
+        int segments = ErrorSegments, long? groupPayloadBudgetBytes = null)
     {
         Directory.CreateDirectory(dir);
         var options = new ServerOptions
@@ -239,6 +254,7 @@ internal static class QuerySegmentFixtures
             Options.Create(options),
             new RetentionStore(options, NullLogger<RetentionStore>.Instance),
             NullLogger<StorageEngine>.Instance);
+        if (groupPayloadBudgetBytes is { } budget) engine._groupPayloadBudgetBytes = budget;
         engine.IndexSinkFactory = static (estimatedEventCount, termsPerEvent) =>
             new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
         var query = new QueryExecutor(engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance, cache);
@@ -256,14 +272,15 @@ internal static class QuerySegmentFixtures
         var  buf       = new ArrayBufferWriter<byte>(64);
 
         int row = 0;
-        for (int s = 0; s < ErrorSegments; s++)
+        for (int s = 0; s < segments; s++)
         {
             for (int i = 0; i < rowsPerSegment; i++, row++)
             {
                 buf.ResetWrittenCount();
                 var w = new MessagePackWriter(buf);
-                w.WriteMapHeader(1);
-                w.Write("Row"); w.Write(row.ToString("D7", System.Globalization.CultureInfo.InvariantCulture));
+                w.WriteMapHeader(2);
+                w.Write("Row");  w.Write(row.ToString("D7", System.Globalization.CultureInfo.InvariantCulture));
+                w.Write("Lane"); w.Write(row % 2 == 0 ? EvenLane : OddLane);
                 w.Flush();
 
                 Assert.True(engine.TryWrite(new LogEventHeader
@@ -277,7 +294,7 @@ internal static class QuerySegmentFixtures
             }
             await engine.FlushHotTierAsync();
         }
-        Assert.Equal(ErrorSegments, engine.ListSegments().Count);
+        Assert.Equal(segments, engine.ListSegments().Count);
         return (engine, query);
     }
 
