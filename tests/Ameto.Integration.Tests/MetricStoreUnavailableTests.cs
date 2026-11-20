@@ -7,6 +7,7 @@ using Ameto.Alerts;
 using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
+using Ameto.Testing;
 
 namespace Ameto.Integration.Tests;
 
@@ -389,7 +390,7 @@ public sealed class MetricStoreUnavailableTests
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Ameto-metricstore-" + Guid.NewGuid().ToString("N"));
         public TempDir() => Directory.CreateDirectory(Path);
-        public void Dispose() { try { Directory.Delete(Path, recursive: true); } catch { /* best effort */ } }
+        public void Dispose() => TestDataDirectory.Delete(Path);   // clears the pool the alert stores' connections to Ameto.db are parked in
     }
 
     private sealed class NoopProtector : ISecretProtector

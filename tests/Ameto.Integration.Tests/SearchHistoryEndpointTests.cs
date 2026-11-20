@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using Ameto.Server.Auth;
+using Ameto.Testing;
 using Microsoft.Data.Sqlite;
 
 namespace Ameto.Integration.Tests;
@@ -348,10 +349,9 @@ public sealed class SearchHistoryEndpointTests : IClassFixture<AmetoWebAppFactor
         }
         finally
         {
-            // Pooled SQLite connections keep the file handle open; without this the
-            // directory delete fails on Windows and the test litters %TEMP%.
-            SqliteConnection.ClearAllPools();
-            try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+            // Pooled SQLite connections keep the file handle open; without the pool clear in
+            // the helper the directory delete fails on Windows and the test litters %TEMP%.
+            TestDataDirectory.Delete(dir);
         }
     }
 }

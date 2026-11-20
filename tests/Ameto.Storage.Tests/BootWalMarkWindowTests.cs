@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
+using Ameto.Testing;
 
 namespace Ameto.Storage.Tests;
 
@@ -20,11 +21,7 @@ public sealed class BootWalMarkWindowTests : IDisposable
 
     private readonly string _root = Path.Combine(Path.GetTempPath(), "ameto-bootmark-" + Guid.NewGuid().ToString("N"));
 
-    public void Dispose()
-    {
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();   // the retention store's Ameto.db, or the delete fails on Windows
-        try { Directory.Delete(_root, recursive: true); } catch { /* best-effort */ }
-    }
+    public void Dispose() => TestDataDirectory.Delete(_root);
 
     private string Dir(string name) => Path.Combine(_root, name);
 

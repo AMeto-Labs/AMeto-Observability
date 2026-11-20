@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Alerts;
 using Ameto.Core;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 
@@ -352,7 +353,7 @@ public sealed class TraceStoreUnavailableTests
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Ameto-tracestore-" + Guid.NewGuid().ToString("N"));
         public TempDir() => Directory.CreateDirectory(Path);
-        public void Dispose() { try { Directory.Delete(Path, recursive: true); } catch { /* best effort */ } }
+        public void Dispose() => TestDataDirectory.Delete(Path);   // clears the pool the alert stores' connections to Ameto.db are parked in
     }
 
     private sealed class NoopProtector : ISecretProtector

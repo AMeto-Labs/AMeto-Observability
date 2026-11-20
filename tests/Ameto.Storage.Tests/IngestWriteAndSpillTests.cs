@@ -5,6 +5,7 @@ using MessagePack;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
+using Ameto.Testing;
 
 namespace Ameto.Storage.Tests;
 
@@ -31,10 +32,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
 
     private readonly string _root = Path.Combine(Path.GetTempPath(), "ameto-ingest-spill-" + Guid.NewGuid().ToString("N"));
 
-    public void Dispose()
-    {
-        try { Directory.Delete(_root, recursive: true); } catch { /* best-effort */ }
-    }
+    public void Dispose() => TestDataDirectory.Delete(_root);
 
     private string NewDir()
     {
@@ -6413,20 +6411,37 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
     /// <summary>
     /// Round-5 review M-B, the teardown's own wait for the swap lock (round-6: unreached). Out of memory while shutdown
     /// waits for the lock, the shutdown fails — and the lock is free; a queued waiter there was handed it for good.
-    /// (The engine is left half torn down: the test's directory goes with the rest.)
+    ///
+    /// <para>THE ENGINE IS LEFT HALF TORN DOWN, AND WHAT IT STILL HOLDS IS CLOSED HERE. The teardown is claimed, so a
+    /// second <c>DisposeAsync</c> returns at once: the boot log stays mapped (64 MB on disk) and <c>counts.db</c> open
+    /// for as long as the process lives. A server is on its way out and loses nothing by it. This fact was not: on
+    /// Windows nothing could delete the directory under the two, and every run of the suite left it in TEMP —
+    /// the largest single thing a run left there. The loops ended before the wait that failed, so nothing is
+    /// inside either, and the fact closes them itself.</para>
     /// </summary>
     [Fact]
     public async Task An_out_of_memory_while_shutdown_waits_for_the_swap_lock_leaves_the_lock_free()
     {
         var engine = Engine(Options(NewDir()));   // nothing written: no final flush, the teardown's wait is the first
-        engine._shutdownWaitBudget = TimeSpan.FromSeconds(3);
-        Assert.True(engine.FlushLockForTest.Wait(HangGuard), "setup: the swap lock stayed taken");   // a swap holds it as the teardown comes
-        engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushLockForTest, static () => true, static () => { },
-                                                                 "shutdown waits for the swap lock");
+        try
+        {
+            engine._shutdownWaitBudget = TimeSpan.FromSeconds(3);
+            Assert.True(engine.FlushLockForTest.Wait(HangGuard), "setup: the swap lock stayed taken");   // a swap holds it as the teardown comes
+            engine._beforeOwnerPollForTest = FailOnceWhileWaitingFor(engine.FlushLockForTest, static () => true, static () => { },
+                                                                     "shutdown waits for the swap lock");
 
-        await Assert.ThrowsAsync<OutOfMemoryException>(async () => await engine.DisposeAsync());
-        engine._beforeOwnerPollForTest = null;
-        Assert.True(engine.FlushLockForTest.CurrentCount == 1, "the swap lock shutdown waited for was kept by its failed wait");
+            await Assert.ThrowsAsync<OutOfMemoryException>(async () => await engine.DisposeAsync());
+            engine._beforeOwnerPollForTest = null;
+            Assert.True(engine.FlushLockForTest.CurrentCount == 1, "the swap lock shutdown waited for was kept by its failed wait");
+        }
+        finally
+        {
+            engine._beforeOwnerPollForTest = null;
+            // Returns at once after the teardown above; is the whole teardown if the fact failed before it.
+            try { await engine.DisposeAsync(); } catch { /* the teardown's own failure is the fact's, above */ }
+            engine.LiveWalForTest?.Dispose();
+            engine.CountsStoreForTest?.Dispose();
+        }
     }
 
     // ── A publish that fails keeps its block (round-5 H-A) ────────────────────

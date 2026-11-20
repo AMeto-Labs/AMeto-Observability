@@ -5,6 +5,7 @@ using Ameto.Alerts;
 using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Storage;
+using Ameto.Testing;
 
 namespace Ameto.Integration.Tests;
 
@@ -83,7 +84,7 @@ public sealed class AlertHeaderCountTests : IAsyncLifetime
     {
         await _evaluator.DisposeAsync();
         await _engine.DisposeAsync();
-        try { Directory.Delete(_root, true); } catch { }
+        TestDataDirectory.Delete(_root);   // clears the pool the alert stores' connections to Ameto.db are parked in
     }
 
     /// <summary>A level-less rule with no service filter: "at least <see cref="Events"/> events in the last hour".</summary>

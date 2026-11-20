@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Core;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 using Xunit.Abstractions;
@@ -46,7 +47,10 @@ public sealed class ColdSegmentFaultTests : IDisposable
         Directory.CreateDirectory(_root);
     }
 
-    public void Dispose() { try { Directory.Delete(_root, true); } catch { } }
+    // Not a bare Directory.Delete: four facts here leave a junction in the root, and .NET's recursive
+    // delete throws "Access to the path 'link' is denied" for one — after removing it and everything
+    // else — and leaves the emptied root. The helper's second attempt finds no junction.
+    public void Dispose() => TestDataDirectory.Delete(_root);
 
     private static void Write(TraceStorageEngine e, ulong id, long startNano)
         => e.WriteSpan(new SpanIngestItem
