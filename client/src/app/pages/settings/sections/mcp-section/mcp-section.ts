@@ -197,11 +197,12 @@ export class McpSectionComponent {
    * up in its place at once or arrives just after the dialog closed; a key shown with nothing
    * taken down just before it is not held up.
    *
-   * A click that is the second or a later one of a run — a double click, however slow the
-   * system lets one be — takes nothing down either while the key has only just come up: the
-   * pause is 700 ms, and a double click can be set to 900. That covers a key that comes up
-   * under a double click begun elsewhere as well. The pause stays for whatever does not count
-   * its clicks.
+   * A click that is the second or a later one of a run — the rest of a double click — takes
+   * nothing down either while the key has only just come up (DOUBLE_CLICK_MS): the pause is
+   * 700 ms, and the slowest double click a system's settings offer is 900. That covers a key
+   * that comes up under a double click begun elsewhere as well. A system set past a second by
+   * other means is not covered; a rule with no end to it was, and dropped every click of
+   * somebody clicking on. The pause stays for whatever does not count its clicks.
    */
   done(key: RevealedKey, click?: Event): void {
     if (click instanceof MouseEvent && click.detail > 1 && Date.now() - this.shownAt < DOUBLE_CLICK_MS) return;

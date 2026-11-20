@@ -56,10 +56,11 @@
      the rotation still on its way, say: every dialog stands at the same height, and of two the
      later one in the page is on top.
 
-     The dialog is as tall for one key as for the next (m-key-dialog: a title of one line, a row
-     for Done of one height). It is centred, so a difference in height between two keys would
-     move Done by half of it — a long profile name that took a second line did — and the second
-     click of a double click would miss Done again. -->
+     Done stands at one height for every key (m-key-dialog): the dialog's lower edge is held
+     rather than its middle, and Done's row is of one height. Centred, a difference in height
+     between two keys moved Done by half of it — a long profile name on two lines of the title
+     did — and the second click of a double click missed Done again. The name is shown whole:
+     it is how one key is told from the next. -->
 <app-modal class="m-key-dialog" [open]="revealed() !== null" [title]="keyTitle()" [dismissable]="false">
   <!-- `shown` is the key as drawn: Done names it, not whatever the store holds first by the
        time a click is handled. The block is kept when the next key takes its place, and so is

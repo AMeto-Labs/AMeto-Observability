@@ -42,17 +42,22 @@ app-modal { display: contents; }
   z-index: 1000;
 }
 
-/* The key dialog is as tall for one key as for the next: it is centred, and a difference in
-   height between two keys moves Done by half of it, out from under a second click.
+/* Done stands at one height for every key. The key dialog is not centred, as the others are:
+   a centred one moves Done by half of any difference in height between two keys, out from
+   under the second click of a double click — and a profile's name that takes a second line of
+   the title is such a difference. Holding the title to one line hid the end of a long name,
+   which is where two profiles may differ ("… — production", "… — staging"), for as long as its
+   key was on screen. So it is the dialog's lower edge that is held, and the name is shown
+   whole: the edge is 108 px below the middle of the window, where a dialog of the usual height
+   ends anyway, and the dialog grows upwards from it. */
+:host ::ng-deep .m-key-dialog .modal-backdrop {
+  align-items: flex-end;
+  padding-bottom: max(var(--page-pad), calc(50dvh - 108px));
+}
 
-   Its title is one line. A profile's name may be a hundred characters, and one that took a
-   second line made its dialog taller than the next key's. The whole name is in the page still,
-   for a screen reader and for whoever selects it; the Profiles tab shows it whole. */
-:host ::ng-deep .m-key-dialog .modal__title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+/* No taller than the room above that edge; past it the dialog's body scrolls, as any dialog's. */
+:host ::ng-deep .m-key-dialog .modal {
+  max-height: calc(100dvh - var(--page-pad) - max(var(--page-pad), calc(50dvh - 108px)));
 }
 
 /* Done's row is two lines of what is said beside it, with that or without: on a narrow screen

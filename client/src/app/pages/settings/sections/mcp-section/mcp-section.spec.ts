@@ -1151,14 +1151,18 @@ describe('Settings → AI / MCP', () => {
     expect(all(f, '.modal .m-key-behind').map(n => n.parentElement)).toEqual([row]);
     expect(row.querySelector('.m-key-behind')!.textContent).toBe('Another key is waiting: it is shown after this one.');
 
-    // The dialog is as tall for this key as for the next. It stands in the centre of the
-    // window, so a difference in height moves Done by half of it: a profile's name that took a
-    // second line of the title did, and so did what is said beside Done where it wrapped. The
-    // title is one line; Done's row is two lines of that sentence, with it or without, and the
-    // sentence is held to them — its whole text is its title.
+    // Done stands at one height for this key and for the next. In the centre of the window a
+    // difference in height between two keys moved Done by half of it: a profile's name that
+    // took a second line of the title did, and so did what is said beside Done where it
+    // wrapped. So the dialog's lower edge is what is held, not its middle; Done's row is two
+    // lines of that sentence, with it or without, and the sentence is held to them — its whole
+    // text is its title. The name in the dialog's title is not cut: it is how one key is told
+    // from the next, and two names may differ at their end.
     const dialog = el(f, 'app-modal.m-key-dialog');
+    expect(getComputedStyle(dialog.querySelector('.modal-backdrop')!).alignItems).toBe('flex-end');
     const drawnTitle = getComputedStyle(dialog.querySelector('.modal__title')!);
-    expect([drawnTitle.whiteSpace, drawnTitle.overflow, drawnTitle.textOverflow]).toEqual(['nowrap', 'hidden', 'ellipsis']);
+    expect([drawnTitle.whiteSpace, drawnTitle.textOverflow]).not.toContain('nowrap');
+    expect([drawnTitle.whiteSpace, drawnTitle.textOverflow]).not.toContain('ellipsis');
     expect(getComputedStyle(row).minHeight).toBe('32px');
     const behind = row.querySelector<HTMLElement>('.m-key-behind')!;
     expect([getComputedStyle(behind).maxHeight, getComputedStyle(behind).overflow]).toEqual(['32px', 'hidden']);
@@ -1204,14 +1208,44 @@ describe('Settings → AI / MCP', () => {
     expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
 
     // Not for ever: every click made inside the system's interval lengthens the run, and
-    // somebody clicking on would never get through. A second after the key came up, a click is
-    // a click, whichever of its run the browser calls it.
-    await vi.advanceTimersByTimeAsync(DOUBLE_CLICK_MS - DONE_PAUSE_MS - 150);
+    // somebody clicking on would never get through. A second after the key came up — one
+    // second, and no longer — a click is a click, whichever of its run the browser calls it.
+    expect(DOUBLE_CLICK_MS).toBe(1000);
+    await vi.advanceTimersByTimeAsync(1000 - DONE_PAUSE_MS - 150);
     await settle(f);
     click(4);
     await settle(f);
     expect(all(f, '.modal')).toEqual([]);
     expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a key that queues behind the one on screen does not make that one a key just come up', async () => {
+    const f = await open('profiles');
+    const post = await createSupport(f);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    const rotate = await rotateInCard(f);
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+
+    // The first key has been on screen for two seconds when the second arrives behind it.
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(2000);
+    rotate.flush({ key: 'the-rotated-key' });
+    await vi.advanceTimersByTimeAsync(50);
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+    expect(el(f, '.modal').textContent).toContain('Another key is waiting');
+
+    // A click the browser counts as the second of a run takes the first key down: it is that
+    // key the click is judged by, and that key was read long ago.
+    button(f, 'Done', '.modal').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail: 2 }));
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    vi.useRealTimers();
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
   });
 
   it('a key that comes up under a double click begun elsewhere is not taken down by its second click', async () => {
