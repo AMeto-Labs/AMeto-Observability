@@ -667,7 +667,7 @@ public sealed class CatalogScanShutdownTests : IDisposable
     /// the writer fence and two lock statements, whose exits are among them. With nothing in the
     /// live tier no final flush comes to put that right, the teardown reports the store closed, and
     /// a write after it blocks for good where it should be answered. So the failure ends the
-    /// teardown, as it does at the await above it, and nothing is left locked.
+    /// teardown, as it does at the <c>CancelAsync</c> that begins it, and nothing is left locked.
     ///
     /// <para>The seam fails the teardown's first later suspension on a configured task awaiter,
     /// which is the wait for the scan. THE ENGINE IS LEFT HALF TORN DOWN — the teardown is claimed,
@@ -708,14 +708,16 @@ public sealed class CatalogScanShutdownTests : IDisposable
             Assert.Equal(1, Volatile.Read(ref asked));   // setup: the wait for the scan was a later suspension, and the seam failed it
             Assert.IsType<OutOfMemoryException>(failure);
 
-            // Nothing is left locked: a write is answered — taken, the write path was never closed — and a reader opens.
+            // Nothing is left locked: a write is ANSWERED, and a reader opens. (Answered how is not this
+            // fact's: today the write is taken, since a teardown that ended here never closed the write
+            // path — the engine is half torn down, as the summary says.)
             var write = Task.Run(() => engine.TryWrite(new LogEventHeader
             {
                 TimestampUtcTicks        = DateTime.UtcNow.Ticks,
                 Level                    = LogLevel.Information,
                 MessageTemplatePoolIndex = engine.TemplatePool.Intern("evt {n}"),
             }, Props(0)));
-            Assert.True(await write.WaitAsync(HangGuard), "a write after the teardown that failed was refused");
+            await write.WaitAsync(HangGuard);
             await Task.Run(() => engine.OpenHotTierReader().Dispose()).WaitAsync(HangGuard);
         }
         finally
@@ -868,6 +870,62 @@ public sealed class CatalogScanShutdownTests : IDisposable
         DeleteAtOnce(dir);
     }
 
+    /// <summary>
+    /// …and one that does not end within the budget is left behind, as the teardown leaves one: the
+    /// failing constructor says so at Error — on a sink that may throw — and its own failure is
+    /// still what goes on to its caller. Through a constructor the budget is the 30 s an engine is
+    /// born with, so the stop is run here by hand, on an engine that was built, with the budget
+    /// shortened and the scan parked at a file.
+    /// </summary>
+    [Fact]
+    public async Task A_start_that_fails_says_so_when_the_scan_it_started_outlasts_the_budget()
+    {
+        var (dir, segments) = await StoreAsync(flushes: 2);
+        string stuck = segments[1];
+        var log = new CapturingLogger();
+        log.OnLine = static line =>
+        {
+            if (line.Contains("failed to start", StringComparison.Ordinal)) throw new InvalidOperationException("test: the log sink threw");
+        };
+        var hold   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var engine = OpenHeld(dir, hold.Task, log);
+        engine._shutdownWaitBudget = TimeSpan.FromMilliseconds(200);
+
+        var atFile = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        engine._beforeScanOpensSegment = file =>
+        {
+            if (!Same(file, stuck)) return;
+            atFile.TrySetResult();
+            release.Wait(HangGuard);
+        };
+
+        try
+        {
+            hold.SetResult();
+            await atFile.Task.WaitAsync(HangGuard);
+
+            // Returns, having waited the budget and not the scan — and without the sink's throw.
+            await Task.Run(engine.StopCatalogScanOfAFailedStart).WaitAsync(HangGuard);
+
+            Assert.False(engine.CatalogLoaded.IsCompleted, "setup: the scan ended while it was parked");
+            Assert.Single(log.Snapshot(), static l =>
+                l.Level == MsLogLevel.Error && l.Message.Contains("failed to start", StringComparison.Ordinal)
+                                            && l.Message.Contains("had not ended", StringComparison.Ordinal));
+
+            release.Set();   // the call the scan was in comes back
+            await Task.WhenAny(engine.CatalogLoaded, Task.Delay(HangGuard));
+            Assert.True(engine.CatalogLoaded.IsCanceled, "the scan of a start that failed went on past the file it was in");
+        }
+        finally
+        {
+            release.Set();
+            await engine.DisposeAsync();   // this engine was built: its own teardown runs to its end
+            await Task.WhenAny(engine.CatalogLoaded, Task.Delay(HangGuard));
+        }
+        Assert.Equal(QueryAvailability.Closed, engine.Availability);
+    }
+
     // ── As a host meets it ────────────────────────────────────────────────────
 
     /// <summary>
@@ -958,22 +1016,31 @@ public sealed class CatalogScanShutdownTests : IDisposable
     ///
     /// <para>Somebody else's handle that shares as little fails it the same way: a third party
     /// reading a file written a moment ago. One that shares for delete, as a virus scanner's does,
-    /// does not — the entry is gone at once on this OS, and the runtime does not mind a directory
-    /// that is not yet empty (both measured in review). CI's runners scan in real time, and their
-    /// runs so far have left nothing behind from several hundred bare deletes each; should one
-    /// ever fail here, the message names the file it met.</para>
+    /// does not fail the delete — measured in review on Windows 11 (NTFS, .NET 10.0.15), where
+    /// the entry is gone at once. Where such an entry lingered instead, the delete would still
+    /// return, since the runtime does not mind a directory that is not yet empty: the last
+    /// assertion below is the line that would say so. CI's runners scan in real time, and their
+    /// runs so far have left nothing behind from several hundred bare deletes each.</para>
     /// </summary>
     private static void DeleteAtOnce(string dir)
     {
         try { Directory.Delete(dir, recursive: true); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            string left = Directory.Exists(dir)
-                ? string.Join(", ", Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Select(f => Path.GetRelativePath(dir, f)))
-                : "nothing";
-            Assert.Fail($"The data directory could not be removed the moment DisposeAsync had returned: {ex.Message} Left: {left}");
+            Assert.Fail($"The data directory could not be removed the moment DisposeAsync had returned: {ex.Message} Left: {Left(dir)}");
         }
-        Assert.False(Directory.Exists(dir), $"Directory.Delete returned, and {dir} is still there");
+        Assert.False(Directory.Exists(dir), $"Directory.Delete returned, and {dir} is still there. Left: {Left(dir)}");
+
+        static string Left(string dir)
+        {
+            try
+            {
+                return Directory.Exists(dir)
+                    ? string.Join(", ", Directory.GetFileSystemEntries(dir, "*", SearchOption.AllDirectories).Select(e => Path.GetRelativePath(dir, e)))
+                    : "nothing";
+            }
+            catch (Exception ex) { return "entries that cannot be listed (" + ex.Message + ")"; }
+        }
     }
 
     /// <summary>Whether somebody has <paramref name="path"/> open: an open that shares nothing is refused.</summary>

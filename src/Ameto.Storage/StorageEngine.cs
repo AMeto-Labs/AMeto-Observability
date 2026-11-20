@@ -1150,14 +1150,17 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// is stopped and waited for as the teardown does it — between two files, within the shutdown
     /// budget, with an Error for a scan that outlasts it — on the thread the constructor is failing
     /// on. Never throws: the constructor's own failure is what its caller must hear.
+    ///
+    /// <para>Internal so a test can run it by hand on an engine it holds, with the budget
+    /// shortened: through the constructor the budget is the 30 s it is born with.</para>
     /// </summary>
-    private void StopCatalogScanOfAFailedStart()
+    internal void StopCatalogScanOfAFailedStart()
     {
-        try
-        {
-            _cts.Cancel();
-            _catalogLoad.Wait(_shutdownWaitBudget);   // throws for a scan that ended Canceled or faulted: ended is all that is asked
-        }
+        // Each in a try of its own: a callback that throws from the cancel has told the scan all the
+        // same, and the wait must still be made — the line below says the budget ran out.
+        try { _cts.Cancel(); }
+        catch (Exception) { /* the token is cancelled whatever a callback threw */ }
+        try { _catalogLoad.Wait(_shutdownWaitBudget); }   // throws for a scan that ended Canceled or faulted: ended is all that is asked
         catch (Exception) { /* however the scan ended */ }
 
         if (_catalogLoad.IsCompleted) return;
@@ -8474,13 +8477,14 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // However the scan ends — stopped, failed, or not within the budget — this does not throw
             // for it: what it did is read off its task below.
             //
-            // NOT in a try of its own, on purpose. All that can throw here is the wait's own setup
-            // running out of memory, and a catch would not make that road safe: a registration that
-            // fails leaves this method's later finallys unrun until a suspension resumes (see
+            // NOT in a try of its own, on purpose. What can throw here is the wait's own setup running
+            // out of memory, and a catch would not make that road safe: a REGISTRATION that fails
+            // leaves this method's later finallys unrun until a suspension resumes (see
             // OwnerTaskMethodBuilder), so going on would reach the writer fence and the two lock
             // statements below with their exits skipped — a write after the teardown then blocked for
-            // good where it should be refused. It ends the teardown instead, as it does at the
-            // CancelAsync above.
+            // good where it should be refused. (An allocation that fails before the registration
+            // leaves them intact; a catch cannot tell the two apart.) It ends the teardown instead,
+            // as it does at the CancelAsync that begins it.
             await _catalogLoad.WaitAsync(Until(deadline)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             if (!_catalogLoad.IsCompleted)
             {
