@@ -516,6 +516,182 @@ public sealed class FilterEvaluatorTests
         Assert.True(Eval("bucket(Duration, 0.1) > 0", ev));
     }
 
+    /// <summary>
+    /// A computed value keeps the 1e-15 tolerance a property comparison no longer has: bucket()'s
+    /// arithmetic lands 0.31 on 0.31000000000000005, and no index is asked about a function's result.
+    /// </summary>
+    [Fact]
+    public void Bucket_Compare_KeepsTheToleranceForItsOwnArithmetic()
+    {
+        var ev = MakeEvent(props: new() { ["Ratio"] = 0.31 });
+        Assert.True(Eval("bucket(Ratio, 0.1) = 0.31", ev));
+        Assert.False(Eval("bucket(Ratio, 0.1) <> 0.31", ev));
+    }
+
+    // ── Numbers: a property in its own terms ─────────────────────────────────
+
+    /// <summary>
+    /// The same event both ways the evaluator reads a property: off its msgpack bytes (the unboxed
+    /// numeric road, and the general road it falls back to past 2^53) and out of the decoded
+    /// dictionary. The two have to agree.
+    /// </summary>
+    private static IEnumerable<LogEvent> BothRoads(string name, object value)
+    {
+        var buf = new System.Buffers.ArrayBufferWriter<byte>(64);
+        var w   = new MessagePack.MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write(name);
+        switch (value)
+        {
+            case long l:   w.Write(l); break;
+            case ulong u:  w.Write(u); break;
+            case double d: w.Write(d); break;
+            default: throw new ArgumentException(value.GetType().Name);
+        }
+        w.Flush();
+
+        yield return new LogEvent
+        {
+            Id = new EventId(0u, 1u), Timestamp = DateTimeOffset.UtcNow, Level = LogLevel.Information,
+            MessageTemplate = "evt", RawProperties = buf.WrittenMemory.ToArray(),
+        };
+        yield return MakeEvent(props: new() { [name] = value });
+    }
+
+    [Theory]
+    [InlineData(9007199254740993L,   "X = 9007199254740993",          true)]
+    [InlineData(9007199254740993L,   "X = 9007199254740992",          false)]   // its double, not it
+    [InlineData(9007199254740993L,   "X > 9007199254740992",          true)]
+    [InlineData(9007199254740993L,   "X = '9007199254740993'",        true)]
+    [InlineData(9007199254740993L,   "X = 9007199254740992.0",        false)]
+    [InlineData(1234567890123456789L, "X = 1234567890123456800",      false)]   // a browser's digits for it
+    [InlineData(1234567890123456789L, "X <> 1234567890123456790",     true)]
+    [InlineData(1234567890123456789L, "X < 1234567890123456790",      true)]
+    [InlineData(1234567890123456789L, "X = '1234567890123456789.5'",  false)]   // not an integer, and its double
+    [InlineData(1234567890123456789L, "X <> '1234567890123456789.5'", true)]    // meets this one's: the decimal
+    [InlineData(1234567890123456789L, "X < '1234567890123456789.5'",  true)]    // it reads as orders them
+    [InlineData(1234567890123456789L, "X > '1234567890123456788.5'",  true)]
+    [InlineData(1234567890123456789L, "X >= '1234567890123456789.5'", false)]
+    [InlineData(1234567890123456789L, "X <> '1234567890123456789.00000000000000000000001'", true)]   // past 28 digits: differs, unordered
+    [InlineData(1234567890123456789L, "X < '1234567890123456789.00000000000000000000001'",  false)]
+    [InlineData(9007199254740991L,   "X = 9007199254740991",          true)]    // the last integer a double holds…
+    [InlineData(9007199254740992L,   "X = 9007199254740992",          true)]    // …the first it holds and its neighbour does not…
+    [InlineData(9007199254740992L,   "X = 9007199254740993",          false)]
+    [InlineData(9007199254740992L,   "X < 9007199254740993",          true)]    // …and past it, on both roads
+    [InlineData(-9007199254740993L,  "X = -9007199254740992",         false)]
+    [InlineData(-9007199254740993L,  "X < -9007199254740992",         true)]
+    [InlineData(5L,                  "X = 5.0",                       true)]
+    [InlineData(5L,                  "X = '5.0'",                     true)]
+    [InlineData(5L,                  "X = 4.5",                       false)]
+    [InlineData(5L,                  "X > 4.5",                       true)]
+    [InlineData(0L,                  "X = -0.0",                      true)]
+    [InlineData(long.MinValue,       "X = -9223372036854775808",      true)]
+    [InlineData(long.MinValue,       "X < -9223372036854775807",      true)]
+    public void An_integer_property_compares_exactly(long stored, string filter, bool expected)
+    {
+        foreach (var ev in BothRoads("X", stored))
+            Assert.Equal(expected, Eval(filter, ev));
+    }
+
+    [Theory]
+    [InlineData(18446744073709551615UL, "X = 18446744073709551615", true)]
+    [InlineData(18446744073709551615UL, "X = 18446744073709551614", false)]
+    [InlineData(18446744073709551615UL, "X > 9223372036854775807",  true)]
+    public void An_unsigned_integer_property_compares_exactly(ulong stored, string filter, bool expected)
+    {
+        foreach (var ev in BothRoads("X", stored))
+            Assert.Equal(expected, Eval(filter, ev));
+    }
+
+    /// <summary>
+    /// A double property compares as a double: the literal reads as the double nearest it, so the
+    /// digits a browser shows for a stored double — 1234567890123456800 for 1234567890123456768 —
+    /// find it, and -0.0 equals 0, but nothing is equal within a tolerance.
+    /// </summary>
+    [Theory]
+    [InlineData(1234567890123456768d, "X = 1234567890123456800",      true)]
+    [InlineData(1234567890123456768d, "X = '1.2345678901234568E+18'", true)]
+    [InlineData(1234567890123456768d, "X = 1234567890123456789",      true)]   // the same double
+    [InlineData(0.30000000000000004,  "X = 0.3",                      false)]
+    [InlineData(0.30000000000000004,  "X <> 0.3",                     true)]
+    [InlineData(0.30000000000000004,  "X = 0.30000000000000004",      true)]
+    [InlineData(0.30000000000000004,  "X > 0.3",                      true)]
+    [InlineData(-0.0,                 "X = 0",                        true)]
+    [InlineData(-0.0,                 "X <> 0",                       false)]
+    [InlineData(-0.0,                 "X >= 0",                       true)]
+    [InlineData(4.9406564584124654E-324, "X = 0",                     false)]  // the smallest double is not 0
+    [InlineData(4.9406564584124654E-324, "X > 0",                     true)]
+    [InlineData(2.5,                  "X = '2.5'",                    true)]
+    [InlineData(2.5,                  "X = 'abc'",                    false)]
+    [InlineData(2.5,                  "X <> 'abc'",                   false)]  // no number: unordered, as before
+    public void A_double_property_compares_as_a_double(double stored, string filter, bool expected)
+    {
+        foreach (var ev in BothRoads("X", stored))
+            Assert.Equal(expected, Eval(filter, ev));
+    }
+
+    /// <summary>
+    /// Two properties compare by the exact numbers they hold, so the order of the operands does not
+    /// matter: an integer and a double meet only where the double is that very integer.
+    /// </summary>
+    [Theory]
+    [InlineData(9007199254740993L, 9007199254740992.0, "A = B",  false)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "B = A",  false)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "A <> B", true)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "B <> A", true)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "A > B",  true)]
+    [InlineData(9007199254740993L, 9007199254740992.0, "B < A",  true)]
+    [InlineData(1234567890123456789L, 1234567890123456768.0, "A > B", true)]
+    [InlineData(1234567890123456789L, 1234567890123456768.0, "B < A", true)]
+    [InlineData(5L, 5.0,  "A = B", true)]
+    [InlineData(5L, 5.0,  "B = A", true)]
+    [InlineData(5L, 5.5,  "A < B", true)]
+    [InlineData(5L, 5.5,  "B > A", true)]
+    [InlineData(0L, -0.0, "A = B", true)]
+    [InlineData(0L, -0.0, "B = A", true)]
+    public void Two_properties_compare_the_same_either_way_round(long a, double b, string filter, bool expected)
+    {
+        var ev = MakeEvent(props: new() { ["A"] = a, ["B"] = b });
+        Assert.Equal(expected, Eval(filter, ev));
+    }
+
+    /// <summary>
+    /// The ids and nanosecond timestamps past 2^53 that the exact comparison is for stay on the
+    /// unboxed road: the probe reads the integer as it was written, so nothing is boxed and the
+    /// map is walked once.
+    /// </summary>
+    [Theory]
+    [InlineData("X = 1234567890123456789")]
+    [InlineData("X > 1700000000000000000")]
+    [InlineData("X = 42")]
+    [InlineData("X = 1234567890123456768.0")]
+    [InlineData("X <> 2.5")]
+    public void An_integer_past_2_to_the_53_is_compared_without_a_box(string filter)
+    {
+        var ev       = BothRoads("X", 1234567890123456789L).First();   // the raw msgpack one
+        var compiled = CompiledFilter.Compile(filter);
+        for (int i = 0; i < 100; i++) compiled.Matches(ev);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1_000; i++) compiled.Matches(ev);
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.False(ev.PropertiesMaterialised);
+        Assert.True(bytes == 0, $"expected zero allocation over 1000 evaluations of `{filter}`, saw {bytes} B");
+    }
+
+    [Fact]
+    public void NaN_equals_nothing_and_differs_from_nothing()
+    {
+        foreach (var ev in BothRoads("X", double.NaN))
+        {
+            Assert.False(Eval("X = 'NaN'", ev));
+            Assert.False(Eval("X <> 'NaN'", ev));
+            Assert.False(Eval("X <> 0", ev));
+            Assert.True(Eval("X in ['NaN']", ev));   // `in` compares text
+        }
+    }
+
     [Fact]
     public void OffsetIn_Compare_Works()
     {

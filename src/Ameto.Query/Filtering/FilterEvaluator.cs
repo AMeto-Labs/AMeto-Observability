@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using System.Xml.XPath;
 using Ameto.Core;
+using Ameto.Indexing;
 
 namespace Ameto.Query.Filtering;
 
@@ -556,7 +557,7 @@ public static class FilterEvaluator
     /// other way would be a second definition of <c>=</c>).
     /// </summary>
     internal static bool CompareValues(object? actual, object? expected, CompareOp op)
-        => Compare(actual, expected, op);
+        => CompareProperty(actual, expected, op);
 
     /// <summary>Same for a non-list, non-null value against an <c>in (...)</c> list.</summary>
     internal static bool InValues(object? actual, object?[] values)
@@ -567,19 +568,25 @@ public static class FilterEvaluator
         // THE UNBOXED NUMERIC ROAD, and it is narrow on purpose. It engages only when the
         // right operand is a numeric LITERAL — not another property, not a string, not a bool —
         // and the left is a plain top-level key whose msgpack value is genuinely a number.
-        // Under exactly those conditions Compare() is provably the numeric tail and nothing
-        // else: neither side is null, a container or a bool, and the left is not a string, so
-        // the string road (which would compare `Elapsed > 100` textually for a string-valued
-        // Elapsed, and still must) is unreachable. Everything outside that falls through with
-        // its semantics untouched, at the cost of one extra frozen-dictionary probe.
+        // Under exactly those conditions CompareProperty() is provably the numeric tail and
+        // nothing else: neither side is null, a container or a bool, and the left is not a
+        // string, so the string road (which would compare `Elapsed > 100` textually for a
+        // string-valued Elapsed, and still must) is unreachable. Everything outside that falls
+        // through with its semantics untouched, at the cost of one extra frozen-dictionary probe.
+        //
+        // The probe hands the number back as it was written — an integer exactly, a float as a
+        // double — and the comparison is the one the general road makes of the same value
+        // (IndexValueForms.CompareInteger / CompareDouble are what CompareNumber dispatches to),
+        // so an id past 2^53 is compared exactly here too, with no box and no second walk.
         if (node.RightProperty is null
             && node.Value is { } literal && IsNumeric(literal)
             && !BuiltinFields.TryResolve(node.Property, out _)
             && CanProbeUserValue(ev, node.Property))
         {
             if (Ameto.Core.Serialization.LogEventSerializer.TryReadPropertyNumber(
-                    ev.RawProperties, node.Property, out double number, out bool present))
-                return CompareNumbers(number, ToDouble(literal), node.Op);
+                    ev.RawProperties, node.Property, out double number, out Int128 integer, out bool isInteger, out bool present))
+                return Holds(isInteger ? IndexValueForms.CompareInteger(integer, literal)
+                                       : IndexValueForms.CompareDouble(number, literal), node.Op);
 
             // Absent is not "false": Compare(null, <a literal>, op) answers true for Ne and
             // false for everything else, and that is the answer the scan has always given.
@@ -590,15 +597,16 @@ public static class FilterEvaluator
         object? actual = GetValue(ev, node.Property);
 
         // `A = B`: the right operand is read off the same event, not off the AST.
-        object? expected = node.RightProperty is { } rhs ? GetValue(ev, rhs) : node.Value;
+        bool   twoProperties = node.RightProperty is not null;
+        object? right        = twoProperties ? GetValue(ev, node.RightProperty!) : node.Value;
 
         if (actual is IList list && actual is not byte[] && actual is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (Compare(list[i], expected, node.Op)) return true;
+                if (CompareProperty(list[i], right, node.Op, twoProperties)) return true;
             return false;
         }
-        return Compare(actual, expected, node.Op);
+        return CompareProperty(actual, right, node.Op, twoProperties);
     }
 
     /// <summary>
@@ -673,7 +681,47 @@ public static class FilterEvaluator
     private static bool IsNumeric(object o) =>
         o is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal;
 
+    /// <summary>How the numeric tail of <see cref="Compare(object?, object?, CompareOp, NumberRule)"/> compares.</summary>
+    private enum NumberRule : byte
+    {
+        /// <summary>A computed value against a literal: doubles, equal within 1e-15.</summary>
+        Tolerant,
+        /// <summary>A property against a literal: in the property's own terms (<see cref="IndexValueForms.CompareNumber"/>).</summary>
+        AgainstValue,
+        /// <summary>Two properties: by the exact numbers they hold (<see cref="IndexValueForms.CompareProperties"/>).</summary>
+        AgainstProperty,
+    }
+
+    /// <summary>
+    /// A PROPERTY compared with a value — <c>Ratio = 0.3</c>, <c>OrderNo &gt; 5</c> — which is what
+    /// the segment index answers for, so a number compares in the property's own terms
+    /// (<see cref="IndexValueForms.CompareNumber"/>): an integer exactly, as the integer it is; a
+    /// double as a double, by IEEE equality, the value read as the double nearest it. Against
+    /// another property (<paramref name="rightIsProperty"/>, <c>A = B</c>) two numbers compare by
+    /// the exact numbers they hold, so <c>A = B</c> and <c>B = A</c> agree.
+    ///
+    /// <para>It used to be the tolerant comparison below, and that cost rows. Through a double,
+    /// every integer past 2^53 that rounds to the same one was equal — order
+    /// 1234567890123456789 was …790 too — and the 1e-15 tolerance made <c>Ratio = 0.3</c> take a
+    /// stored <c>0.1 + 0.2</c>. Neither set can be listed by an index that files each value under
+    /// its own digits, so both held only while the events were hot: the flushed group was asked
+    /// for the literal's forms, had none of them, and was dropped. Now a literal names one integer
+    /// and one double, and the index is asked for both — and for -0.0 beside 0, which IEEE makes
+    /// equal.</para>
+    /// </summary>
+    private static bool CompareProperty(object? left, object? right, CompareOp op, bool rightIsProperty = false)
+        => Compare(left, right, op, rightIsProperty ? NumberRule.AgainstProperty : NumberRule.AgainstValue);
+
+    /// <summary>
+    /// A COMPUTED value compared with a literal — <c>bucket(…)</c>, <c>round(…)</c>,
+    /// <c>coalesce(…)</c> and the rest. Its numbers keep the 1e-15 tolerance: arithmetic such as
+    /// <c>bucket(Ratio, 0.1)</c> lands a hair off the literal it is meant to equal
+    /// (0.31000000000000005 for 0.31), and no index is ever asked about a function's result.
+    /// </summary>
     private static bool Compare(object? left, object? right, CompareOp op)
+        => Compare(left, right, op, NumberRule.Tolerant);
+
+    private static bool Compare(object? left, object? right, CompareOp op, NumberRule numbers)
     {
         if (left is null && right is null) return op is CompareOp.Eq;
         if (left is null || right is null) return op is CompareOp.Ne;
@@ -690,11 +738,19 @@ public static class FilterEvaluator
             return op == CompareOp.Eq ? eq : !eq;
         }
 
-        // Bool comparison — must come before numeric path; ToDouble(bool) → NaN
+        // Bool comparison — must come before numeric path; ToDouble(bool) → NaN. A bool equals a
+        // bool, or the TEXT of one: 'true' / 'false', in any case. Anything else — 0, 1, 'no',
+        // 'banana' — is not a bool and equals none, so `!=` holds for it.
+        //
+        // It used to read every text but "true" as false, so a stored false equalled 'banana',
+        // 0 and 1 alike. No index can follow that: the bloom gate is keyless, and asking it for
+        // "false" on behalf of every string and number literal would pass every group that holds
+        // a false anywhere — the cheap gate would stop pruning plain string equality. It held only
+        // while the events were hot; the flushed group was dropped.
         if (left is bool lb)
         {
-            bool rb = right is bool rb2 ? rb2
-                    : string.Equals(right?.ToString(), "true", StringComparison.OrdinalIgnoreCase);
+            bool? rb = right is bool rb2 ? rb2 : BoolText(Text(right));
+            if (rb is null) return op is CompareOp.Ne;
             return op is CompareOp.Eq ? lb == rb
                  : op is CompareOp.Ne ? lb != rb
                  : false;
@@ -704,8 +760,9 @@ public static class FilterEvaluator
         if (left is string ls)
         {
             // No ToString() when the right side is already a string — which it is for every
-            // literal a filter carries, and this runs per candidate event.
-            string rs = right as string ?? right?.ToString() ?? string.Empty;
+            // literal a filter carries, and this runs per candidate event. A number reads as
+            // its invariant text, the same on every host: `Code = 2.5` is "2.5", never "2,5".
+            string rs = right as string ?? Text(right) ?? string.Empty;
 
             // EQUALITY IS NOT AN ORDERING QUESTION. `@l = 'Error'` — the commonest predicate
             // in the product — went through string.Compare, which walks both strings to work
@@ -732,14 +789,37 @@ public static class FilterEvaluator
             };
         }
 
-        // Numeric comparison — coerce both sides to double
-        return CompareNumbers(ToDouble(left), ToDouble(right), op);
+        // Numeric comparison: a property's exactly, in its own terms or against another property's
+        // number; a computed value's through doubles with the tolerance (see the rules above).
+        return numbers switch
+        {
+            NumberRule.AgainstValue    => Holds(IndexValueForms.CompareNumber(left, right), op),
+            NumberRule.AgainstProperty => Holds(IndexValueForms.CompareProperties(left, right), op),
+            _                          => CompareNumbers(ToDouble(left), ToDouble(right), op),
+        };
     }
 
     /// <summary>
-    /// The numeric tail of <see cref="Compare(object?, object?, CompareOp)"/>, factored out so
-    /// the unboxed road in <see cref="EvalCompare"/> answers with the SAME arithmetic — epsilon
-    /// and all — rather than with a second spelling of it that could drift.
+    /// Whether <paramref name="op"/> holds for two numbers that compare as <paramref name="order"/> —
+    /// the same reading the index's value forms are built from. A pair that does not order — a side
+    /// no number of its kind, or NaN — satisfies no operator, <c>!=</c> included, as it never did;
+    /// a pair known to differ but not which way satisfies <c>!=</c> alone.
+    /// </summary>
+    private static bool Holds(IndexValueForms.NumberOrder order, CompareOp op) => op switch
+    {
+        CompareOp.Eq => order == IndexValueForms.NumberOrder.Equal,
+        CompareOp.Ne => order is IndexValueForms.NumberOrder.Less or IndexValueForms.NumberOrder.Greater
+                              or IndexValueForms.NumberOrder.Unequal,
+        CompareOp.Lt => order == IndexValueForms.NumberOrder.Less,
+        CompareOp.Le => order is IndexValueForms.NumberOrder.Less or IndexValueForms.NumberOrder.Equal,
+        CompareOp.Gt => order == IndexValueForms.NumberOrder.Greater,
+        CompareOp.Ge => order is IndexValueForms.NumberOrder.Greater or IndexValueForms.NumberOrder.Equal,
+        _            => false,
+    };
+
+    /// <summary>
+    /// The numeric tail of <see cref="Compare(object?, object?, CompareOp)"/> — a computed value
+    /// against a literal, through doubles, with equality inside 1e-15.
     /// </summary>
     private static bool CompareNumbers(double left, double right, CompareOp op) => op switch
     {
@@ -787,10 +867,10 @@ public static class FilterEvaluator
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && LikeMatchFast(s.AsSpan(), node)) return true;
+                if (Text(list[i]) is { } s && LikeMatchFast(s.AsSpan(), node)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && LikeMatchFast(sv.AsSpan(), node);
+        return Text(val) is { } sv && LikeMatchFast(sv.AsSpan(), node);
     }
 
     private static bool EvalStartsWith(StartsWithNode node, LogEvent ev)
@@ -819,10 +899,10 @@ public static class FilterEvaluator
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && s.StartsWith(node.Prefix, cmp)) return true;
+                if (Text(list[i]) is { } s && s.StartsWith(node.Prefix, cmp)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && sv.StartsWith(node.Prefix, cmp);
+        return Text(val) is { } sv && sv.StartsWith(node.Prefix, cmp);
     }
 
     private static bool EvalContains(ContainsNode node, LogEvent ev)
@@ -851,10 +931,10 @@ public static class FilterEvaluator
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && s.Contains(node.Text, cmp)) return true;
+                if (Text(list[i]) is { } s && s.Contains(node.Text, cmp)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && sv.Contains(node.Text, cmp);
+        return Text(val) is { } sv && sv.Contains(node.Text, cmp);
     }
 
     private static bool EvalEndsWith(EndsWithNode node, LogEvent ev)
@@ -883,10 +963,10 @@ public static class FilterEvaluator
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && s.EndsWith(node.Suffix, cmp)) return true;
+                if (Text(list[i]) is { } s && s.EndsWith(node.Suffix, cmp)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && sv.EndsWith(node.Suffix, cmp);
+        return Text(val) is { } sv && sv.EndsWith(node.Suffix, cmp);
     }
 
     private static bool EvalLengthCompare(LengthCompareNode node, LogEvent ev)
@@ -992,9 +1072,9 @@ public static class FilterEvaluator
                 var element = WalkJsonElementPath(doc.RootElement, node.Path);
                 if (element is null) return false;
                 var converted = ConvertJsonElement(element.Value);
-                string elemStr = converted?.ToString() ?? string.Empty;
+                string elemStr = Text(converted) ?? string.Empty;
                 foreach (var item in node.Values)
-                    if (string.Equals(elemStr, item?.ToString() ?? string.Empty, StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(elemStr, Text(item) ?? string.Empty, StringComparison.OrdinalIgnoreCase))
                         return true;
                 return false;
             }
@@ -1103,13 +1183,13 @@ public static class FilterEvaluator
     private static bool EvalToLowerCompare(ToLowerCompareNode node, LogEvent ev)
     {
         object? val = GetValue(ev, node.Property);
-        return MatchAny(val, e => e?.ToString() is { } s && Compare(s.ToLowerInvariant(), node.Value, node.Op));
+        return MatchAny(val, e => Text(e) is { } s && Compare(s.ToLowerInvariant(), node.Value, node.Op));
     }
 
     private static bool EvalToUpperCompare(ToUpperCompareNode node, LogEvent ev)
     {
         object? val = GetValue(ev, node.Property);
-        return MatchAny(val, e => e?.ToString() is { } s && Compare(s.ToUpperInvariant(), node.Value, node.Op));
+        return MatchAny(val, e => Text(e) is { } s && Compare(s.ToUpperInvariant(), node.Value, node.Op));
     }
 
     private static bool EvalToNumberCompare(ToNumberCompareNode node, LogEvent ev)
@@ -1128,7 +1208,7 @@ public static class FilterEvaluator
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
-            if (e?.ToString() is not { } s) return false;
+            if (Text(e) is not { } s) return false;
             if (node.Start < 0 || node.Start > s.Length) return false;
             if (node.Length is int len)
             {
@@ -1145,7 +1225,7 @@ public static class FilterEvaluator
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
-            if (e?.ToString() is not { } s) return false;
+            if (Text(e) is not { } s) return false;
             int idx = node.LastIndex
                 ? s.LastIndexOf(node.Substring, StringComparison.Ordinal)
                 : s.IndexOf(node.Substring, StringComparison.Ordinal);
@@ -1158,7 +1238,7 @@ public static class FilterEvaluator
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
-            if (e?.ToString() is not { } s) return false;
+            if (Text(e) is not { } s) return false;
             return Compare(s.Replace(node.Substring, node.Replacement, StringComparison.Ordinal), node.Value, node.Op);
         });
     }
@@ -1199,7 +1279,7 @@ public static class FilterEvaluator
         }
         else if (val is Dictionary<string, object?> dict)
         {
-            string key = node.Index?.ToString() ?? string.Empty;
+            string key = Text(node.Index) ?? string.Empty;
             dict.TryGetValue(key, out element);
         }
         return Compare(element, node.Value, node.Op);
@@ -1265,7 +1345,7 @@ public static class FilterEvaluator
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
-            if (e?.ToString() is not { } s) return false;
+            if (Text(e) is not { } s) return false;
             if (!DateTimeOffset.TryParse(s, out var dt)) return false;
             return Compare(dt.UtcTicks, node.Value, node.Op);
         });
@@ -1430,11 +1510,11 @@ public static class FilterEvaluator
 
     private static bool MatchesInValues(object? element, object?[] values)
     {
-        string elemStr = element?.ToString() ?? string.Empty;
+        string elemStr = Text(element) ?? string.Empty;
         foreach (var item in values)
         {
             // Avoid ToString() boxing for the common case where item is already a string
-            string itemStr = item is string si ? si : item?.ToString() ?? string.Empty;
+            string itemStr = item is string si ? si : Text(item) ?? string.Empty;
             if (string.Equals(elemStr, itemStr, StringComparison.OrdinalIgnoreCase))
                 return true;
         }
@@ -1617,6 +1697,31 @@ public static class FilterEvaluator
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The text a value reads as wherever the scan compares text — <c>contains</c>, <c>like</c>,
+    /// <c>in</c>, a string against a number, and every function that works on a string — or null
+    /// for a missing value. A string is itself. A number reads as its INVARIANT text, the text the
+    /// index holds for it (<see cref="IndexValueForms.PlainText"/> is both): this used to be
+    /// <c>ToString()</c>, the host culture's, so on a <c>ru-KZ</c> host a stored 12.5 read
+    /// <c>12,5</c> — <c>contains(Ratio, '2,5')</c> matched hot rows that the flushed index, holding
+    /// "12.5", then dropped, and <c>'2.5'</c> matched in neither tier. A number now reads the same
+    /// on every host. (Dates and time spans are still PARSED in the host culture, by
+    /// <c>dateTime()</c>, <c>datePart()</c>, <c>timeSpan()</c> and their kin — no index is asked
+    /// about those.)
+    /// </summary>
+    private static string? Text(object? v) => v switch
+    {
+        null     => null,
+        string s => s,
+        _        => IndexValueForms.PlainText(v),
+    };
+
+    /// <summary>The bool a text names — <c>true</c> or <c>false</c>, in any case — or null.</summary>
+    private static bool? BoolText(string? text) =>
+        string.Equals(text, "true",  StringComparison.OrdinalIgnoreCase) ? true
+      : string.Equals(text, "false", StringComparison.OrdinalIgnoreCase) ? false
+      : null;
+
     private static double ToDouble(object? v) => v switch
     {
         double d  => d,
@@ -1676,9 +1781,9 @@ public static class FilterEvaluator
                         XElement el   => el.Value,
                         XAttribute at => at.Value,
                         string str    => str,
-                        var other     => other?.ToString(),
+                        var other     => Text(other),
                     },
-                    _ => result?.ToString(),
+                    _ => Text(result),
                 };
                 return Compare(extracted, node.Value, node.Op);
             }
@@ -1707,7 +1812,7 @@ public static class FilterEvaluator
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
-            if (e?.ToString() is not { } s) return false;
+            if (Text(e) is not { } s) return false;
             var encoded = Convert.ToBase64String(Encoding.UTF8.GetBytes(s));
             return Compare(encoded, node.Value, node.Op);
         });
@@ -1719,10 +1824,10 @@ public static class FilterEvaluator
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && IsMatch(node.Compiled, s)) return true;
+                if (Text(list[i]) is { } s && IsMatch(node.Compiled, s)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && IsMatch(node.Compiled, sv);
+        return Text(val) is { } sv && IsMatch(node.Compiled, sv);
     }
 
     /// <summary>
@@ -1743,7 +1848,7 @@ public static class FilterEvaluator
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
-            if (e?.ToString() is not { } s) return false;
+            if (Text(e) is not { } s) return false;
             Match m;
             try { m = node.Compiled.Match(s); }
             catch (RegexMatchTimeoutException) { return false; }
