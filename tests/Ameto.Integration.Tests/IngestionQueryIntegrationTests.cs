@@ -339,7 +339,8 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
 
     /// <summary>
     /// Bound on the wait for those teardowns. Each engine gives up on its own waits after its 30 s
-    /// shutdown budget, so only a hang reaches this. Past it, the directory is deleted anyway.
+    /// shutdown budget, so only a hang reaches this. Past it, the delete is tried anyway, and fails
+    /// the class if an engine still holds a file there.
     /// </summary>
     private static readonly TimeSpan TeardownPatience = TimeSpan.FromSeconds(60);
 

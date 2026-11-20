@@ -17,13 +17,14 @@ namespace Ameto.Storage;
 /// the same choice for the same reason). Pooled, Microsoft.Data.Sqlite parked the open connection
 /// in a process-wide pool keyed by the connection string: four handles on <c>Ameto.db</c>, its
 /// <c>-wal</c> and its <c>-shm</c>, and a mapping of the last, which outlived every <c>using</c>
-/// in this class and the store itself, until the pool pruned the idle connection minutes later
-/// (381 s, measured on 10.0.9), <c>SqliteConnection.ClearPool</c> was called, or the process
-/// ended. A server never notices: it has one data directory and keeps it until it exits. Whatever
-/// builds a store over a directory and then removes the directory does — on Windows the delete
-/// fails with a sharing violation on <c>Ameto.db</c>, and that is how every test that built a
-/// store left its data directory in TEMP. Pooling bought nothing in exchange: three statements at
-/// a start and one write per change of the settings.</para>
+/// in this class and the store itself, until the pool's timer pruned the idle connection minutes
+/// later (381 s in one measurement, 10.0.9), <c>SqliteConnection.ClearPool</c> was called, or the
+/// process ended. A server never notices: it has one data directory and keeps it until it exits.
+/// Whatever builds a store over a directory and then removes the directory does — on Windows the
+/// delete fails with a sharing violation on <c>Ameto.db</c>, and that is how every test that built
+/// only a store and an engine left its data directory in TEMP: 728 directories with one run of the
+/// suite. Pooling bought nothing in exchange: three statements at a start and one write per change
+/// of the settings.</para>
 /// </summary>
 public sealed class RetentionStore
 {
@@ -41,15 +42,13 @@ public sealed class RetentionStore
             Pooling    = false,
         }.ToString();
 
-        // One connection, and one transaction, for everything the constructor does. Unpooled, each
-        // open is a real open and each close of the last connection a checkpoint; and each commit
-        // is an fsync, so the table and the first policy share one. On a database that holds both
-        // already, every later start, the transaction writes nothing and its commit is free: it
-        // costs the write lock (BEGIN IMMEDIATE, this library's default) for the length of a SELECT.
+        // One connection for everything the constructor does: unpooled, each open is a real open
+        // and each close of the last connection a checkpoint. It READS first, outside any
+        // transaction, so a database that already holds a sound policy — every start but the
+        // first — is only read, as it always was, and no write lock is asked of a file the auth and
+        // alert stores write to. What has to be written goes in one transaction below.
         using var conn = OpenConn();
-        using var tx   = conn.BeginTransaction();
-        InitTable(conn, tx);
-        var loaded = LoadFromDb(conn, tx);
+        var loaded = TableExists(conn) ? LoadFromDb(conn) : null;
         var source = loaded is null ? "configuration" : "database";
         var dto    = loaded ?? new RetentionDto
         {
@@ -74,8 +73,15 @@ public sealed class RetentionStore
                 "Retention windows from the {Source} were outside {Min}…{Max} days and were clamped: {Before} → {After}",
                 source, RetentionMath.MinDays, RetentionMath.MaxDays, dto, clamped);
         _current = clamped;
-        if (loaded is null || changed) SaveToDb(conn, tx, _current);
-        tx.Commit();
+        if (loaded is null || changed)
+        {
+            // The table and the policy in ONE transaction: each commit is an fsync, and a first
+            // start — every test that builds a store — pays one instead of two.
+            using var tx = conn.BeginTransaction();
+            InitTable(conn, tx);
+            SaveToDb(conn, tx, _current);
+            tx.Commit();
+        }
     }
 
     /// <summary>Returns the current retention settings DTO.</summary>
@@ -128,10 +134,16 @@ public sealed class RetentionStore
         cmd.ExecuteNonQuery();
     }
 
-    private static RetentionDto? LoadFromDb(SqliteConnection conn, SqliteTransaction tx)
+    private static bool TableExists(SqliteConnection conn)
     {
         using var cmd = conn.CreateCommand();
-        cmd.Transaction = tx;
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'retention'";
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private static RetentionDto? LoadFromDb(SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT level, days FROM retention";
         using var r   = cmd.ExecuteReader();
 

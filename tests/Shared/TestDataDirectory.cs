@@ -1,24 +1,27 @@
+using System.Runtime.InteropServices;
 using Microsoft.Data.Sqlite;
 
 namespace Ameto.Testing;
 
 /// <summary>
 /// Removes a test's data directory, and FAILS THE TEST WHEN IT CANNOT. Linked into the test
-/// projects that build engines, stores or hosts over a directory under TEMP.
+/// projects that build engines, stores or hosts over a directory under TEMP — the ones that
+/// reference Ameto.Storage, since it clears Microsoft.Data.Sqlite's pools.
 ///
 /// <para>WHY NOT <c>try { Directory.Delete(dir, true); } catch { }</c>. On Windows a file somebody
 /// still holds open cannot be deleted, a recursive delete removes everything else and throws for
 /// that one, and the empty <c>catch</c> made the throw say nothing: the directory stayed in TEMP
 /// for ever and no run was red. Measured on one developer machine in November 2026: 885
 /// <c>ameto-*</c> directories and 101 MB left by ONE green run of the suite, 36 472 directories
-/// and 5.4 GB by the time anyone looked. All but six of the 885 held only <c>Ameto.db</c>, which
-/// <c>RetentionStore</c> left open in Microsoft.Data.Sqlite's connection pool until that store
-/// stopped pooling. The rest are the reasons a delete can still fail, and what this helper is for:</para>
+/// and 5.4 GB by the time anyone looked. 879 of the 885 held only <c>Ameto.db</c>, kept open by
+/// Microsoft.Data.Sqlite's connection pool: 728 through <c>RetentionStore</c>, which has stopped
+/// pooling, and 151 through the pool the host's other stores use on purpose. Those 151 and the
+/// other six are the ways a delete can still fail, and what this helper is for:</para>
 /// <list type="bullet">
 ///   <item>A STORE THAT POOLS ON PURPOSE. <c>AuthDatabase</c>, <c>AlertRuleStore</c> and
 ///   <c>AlertPersistence</c> open <c>Ameto.db</c> through the pool, which is right for a server:
 ///   one data directory, kept until the process exits. A test that removes the directory is the
-///   one that has to let the pool go, so it is cleared here first.</item>
+///   one that has to let the pool go, so it is cleared here, before every attempt.</item>
 ///   <item>A HANDLE THAT IS ABOUT TO CLOSE. The boot catalog scan of an engine is a task its
 ///   <c>DisposeAsync</c> does not wait for, and it holds one segment open at a time: a delete that
 ///   meets it leaves that one <c>.seg</c>. An antivirus or an indexer reading files written a
@@ -40,9 +43,23 @@ namespace Ameto.Testing;
 /// beside its own failure if it had one. From a class fixture the tests stay Passed, the run
 /// exits 1, and at <c>-v minimal</c> — CI's verbosity — the log holds one line naming the class
 /// and the exception's TYPE, with no message: hence a type of its own,
-/// <see cref="TestDataDirectoryLeftBehindException"/>, so that line says what happened. In a
-/// <c>finally</c> the throw REPLACES the test's own failure, C# keeping one exception; the
-/// message says so.</para>
+/// <see cref="TestDataDirectoryLeftBehindException"/>, so that line says what happened; CI's
+/// report of what a run left in TEMP names the directory and its files.</para>
+///
+/// <para>A FACT THAT HAS ALREADY FAILED KEEPS ITS OWN FAILURE. In a <c>finally</c>, or the
+/// <c>Dispose</c> of a <c>using</c>, a throw from here would REPLACE the exception that is
+/// unwinding — C# keeps one — and the report would name a directory instead of the assertion that
+/// failed. So when an exception is already on its way (<see cref="FailureInFlight"/>) the delete
+/// is best effort: what can be removed within <see cref="ShortRetryLimit"/> is, and nothing is
+/// thrown. What that cannot see is a <c>finally</c> that awaits before it deletes, and an
+/// <c>await using</c>: the compiler has caught the exception by then and rethrows it afterwards,
+/// so there the throw from here still wins, and the message says a failure may be behind it.</para>
+///
+/// <para>A REGRESSION THAT LEAVES A HANDLE IN EVERY TEST MUST STILL END IN A RED RUN, NOT A
+/// CANCELLED ONE. Ten seconds of retries per teardown, in a few hundred teardowns, is more than
+/// CI's job limit. After <see cref="FailuresBeforeShortRetries"/> directories have been left
+/// behind in one process the limit drops to <see cref="ShortRetryLimit"/>: by then the run is
+/// red and the handle is not one that closes by itself.</para>
 /// </summary>
 internal static class TestDataDirectory
 {
@@ -50,44 +67,101 @@ internal static class TestDataDirectory
     public static readonly TimeSpan RetryLimit = TimeSpan.FromSeconds(10);
 
     /// <summary>
+    /// The limit where a long wait buys nothing: a fact that has already failed, and a process in
+    /// which <see cref="FailuresBeforeShortRetries"/> directories have been left behind already.
+    /// </summary>
+    internal static readonly TimeSpan ShortRetryLimit = TimeSpan.FromMilliseconds(500);
+
+    /// <summary>Left-behind directories in one process after which <see cref="RetryLimit"/> gives way to <see cref="ShortRetryLimit"/>.</summary>
+    internal const int FailuresBeforeShortRetries = 3;
+
+    private static int s_leftBehind;
+
+    /// <summary>
     /// Deletes <paramref name="dir"/> and everything in it; does nothing when it is not there.
     /// Call it once everything the test opened in the directory has been disposed.
     /// </summary>
-    /// <exception cref="TestDataDirectoryLeftBehindException">The directory is still there after <see cref="RetryLimit"/>.</exception>
-    public static void Delete(string dir) => Delete(dir, RetryLimit);
+    /// <exception cref="TestDataDirectoryLeftBehindException">
+    /// The directory is still there after the retries, and no other exception was already unwinding.
+    /// </exception>
+    public static void Delete(string dir)
+    {
+        if (FailureInFlight)
+        {
+            TryDelete(dir, ShortRetryLimit, out _);
+            return;
+        }
 
-    /// <summary><see cref="Delete(string)"/> with a retry limit of the caller's: for the facts about this helper.</summary>
+        try
+        {
+            Delete(dir, RetryLimitAfter(Volatile.Read(ref s_leftBehind)));
+        }
+        catch (TestDataDirectoryLeftBehindException)
+        {
+            Interlocked.Increment(ref s_leftBehind);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// True while an exception is unwinding through the caller, or being handled in a
+    /// <c>catch</c> above it: from the throw until its catch block ends. Measured on .NET 10.0.15,
+    /// Debug and Release, with the runtime's exception handling in both of its modes: set in a
+    /// <c>finally</c> and in a <c>using</c>'s <c>Dispose</c> that an exception runs through, in
+    /// sync and async methods alike, and in code they call; zero in plain code, in a
+    /// <c>finally</c> reached normally, and after an exception thrown deeper down was caught.
+    /// <c>TestDataDirectoryTests</c> holds the runtime to that. Asked on Windows only: nowhere
+    /// else does an open file block its delete, so nowhere else is there a throw to hold back.
+    /// </summary>
+    internal static bool FailureInFlight => OperatingSystem.IsWindows() && Marshal.GetExceptionPointers() != 0;
+
+    /// <summary>The retry limit of a <see cref="Delete(string)"/> in a process that has left <paramref name="leftBehindSoFar"/> directories behind.</summary>
+    internal static TimeSpan RetryLimitAfter(int leftBehindSoFar) =>
+        leftBehindSoFar < FailuresBeforeShortRetries ? RetryLimit : ShortRetryLimit;
+
+    /// <summary>
+    /// The delete itself, with a retry limit of the caller's and none of <see cref="Delete(string)"/>'s
+    /// two exceptions to it: for the facts about this helper.
+    /// </summary>
     internal static void Delete(string dir, TimeSpan retryLimit)
     {
-        SqliteConnection.ClearAllPools();
-
-        long      started = Environment.TickCount64;
-        Exception last;
-        for (int backoffMs = 10; ; backoffMs = Math.Min(backoffMs * 2, 500))
-        {
-            try
-            {
-                Directory.Delete(dir, recursive: true);
-                return;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                // Gone, whoever removed it. A DirectoryNotFoundException with the directory still
-                // there is a child that vanished under the walk, and is retried like the rest.
-                if (!Directory.Exists(dir)) return;
-                last = ex;
-                if (Environment.TickCount64 - started >= (long)retryLimit.TotalMilliseconds) break;
-                Thread.Sleep(backoffMs);
-            }
-        }
+        if (TryDelete(dir, retryLimit, out Exception? refused)) return;
+        Exception last = refused!;   // a delete that did not succeed was refused at least once
 
         throw new TestDataDirectoryLeftBehindException(
             $"The test data directory {dir} was left behind: after {retryLimit.TotalSeconds:0.#} s of retries "
           + $"it still holds {Describe(dir)}. Something in this process keeps a handle there — an engine, a "
           + "reader or a mapping that was not disposed, or a background task that never ends. (If this "
-          + "replaced the test's own failure, which a throw from a finally block does, look for that first: "
-          + "a test that stops half way can leave its handles open.) The last delete said: " + last.Message,
+          + "replaced the test's own failure, which a throw from a finally block that awaits does, look for "
+          + "that first: a test that stops half way can leave its handles open.) The last delete said: "
+          + last.Message,
             last);
+    }
+
+    private static bool TryDelete(string dir, TimeSpan retryLimit, out Exception? last)
+    {
+        last = null;
+        long started = Environment.TickCount64;
+        for (int backoffMs = 10; ; backoffMs = Math.Min(backoffMs * 2, 500))
+        {
+            // Before every attempt, not once before the first: a pooled connection opened and
+            // closed since the last clear has parked the file again.
+            SqliteConnection.ClearAllPools();
+            try
+            {
+                Directory.Delete(dir, recursive: true);
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Gone, whoever removed it. A DirectoryNotFoundException with the directory still
+                // there is a child that vanished under the walk, and is retried like the rest.
+                if (!Directory.Exists(dir)) return true;
+                last = ex;
+                if (Environment.TickCount64 - started >= (long)retryLimit.TotalMilliseconds) return false;
+                Thread.Sleep(backoffMs);
+            }
+        }
     }
 
     /// <summary>

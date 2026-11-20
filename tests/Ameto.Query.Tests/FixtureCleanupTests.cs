@@ -11,13 +11,16 @@ namespace Ameto.Query.Tests;
 /// and the <c>catch { }</c> that every teardown wrapped the delete in swallowed the failure in
 /// silence. Nothing was red and the directory stayed — one per test class, per run, holding a
 /// database and forty segments. The store no longer pools, and the teardown's delete
-/// (<see cref="QuerySegmentFixtures.DeleteDataDirectory"/>, the helper the test projects share)
-/// now fails its test instead of returning over a directory that is still there.</para>
+/// (<see cref="QuerySegmentFixtures.DeleteDataDirectory"/>, which is
+/// <c>TestDataDirectory.Delete</c>, the helper the test projects share) now fails its test
+/// instead of returning over a directory that is still there.</para>
 ///
 /// <para>This asserts the outcome rather than the mechanism, because the mechanism is what
 /// changes: build a real fixture, dispose the engine, hand the directory to the helper, and
-/// require that it is gone. <c>RetentionStoreFileLifetimeTests</c> (Ameto.Storage.Tests) holds the
-/// store itself to it, with a plain delete the helper's pool clear and retries cannot help.</para>
+/// require that it is gone. The helper throws by itself now when the directory stays, so the
+/// call is the fact and the assertion after it only states the outcome.
+/// <c>RetentionStoreFileLifetimeTests</c> (Ameto.Storage.Tests) holds the store itself to it,
+/// with a plain delete that no pool clear helps.</para>
 /// </summary>
 public sealed class FixtureCleanupTests
 {
