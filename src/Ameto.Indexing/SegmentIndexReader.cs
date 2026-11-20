@@ -761,8 +761,9 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
 
     /// <summary>
     /// <see cref="SegmentTrigramIndex.Lookup"/>'s answer, from the memo: null when the group holds
-    /// no trigram at all or the term is shorter than one, empty when some trigram of the term is
-    /// absent, otherwise the rarest-first intersection of its trigrams' postings. Trigrams the
+    /// no trigram at all, the term is shorter than one, or the section's fold can answer for none of
+    /// its trigrams (<see cref="SegmentTrigramIndex.QueryKeys"/>); empty when some trigram it asks is
+    /// absent; otherwise the rarest-first intersection of the asked trigrams' postings. Trigrams the
     /// memo lacks are found in ONE pass over the section's bucket headers, and decoded only when
     /// every one of them is present — one absent trigram is the whole answer.
     /// </summary>
@@ -774,23 +775,21 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         var header = TrigramHeader(src);
         if (header.Count == 0) return null;
 
-        char[]?    rentedChars = text.Length > 1024 ? ArrayPool<char>.Shared.Rent(text.Length) : null;
-        Span<char> lower       = rentedChars ?? stackalloc char[text.Length];
-        int[][]?   posts       = null;
+        long[]?    rentedKeys = text.Length > SegmentTrigramIndex.MaxStackKeys ? ArrayPool<long>.Shared.Rent(text.Length) : null;
+        Span<long> keys       = rentedKeys ?? stackalloc long[text.Length];
+        int[][]?   posts      = null;
         try
         {
-            int n = text.ToLowerInvariant(lower);
-            if (n < 0) { text.CopyTo(lower); n = text.Length; }   // never (dest sized to source)
-            if (n < 3) return null;
+            int k = SegmentTrigramIndex.QueryKeys(text, header.Fold, header.FoldFingerprint, keys);
+            if (k == 0) return null;                              // nothing this section can answer for
 
-            int k       = n - 2;                                  // trigram count
             int unknown = 0;
             posts = ArrayPool<int[]>.Shared.Rent(k);
             lock (_gate)
             {
                 for (int i = 0; i < k; i++)
                 {
-                    long key = SegmentTrigramIndex.PackedKey(lower[i], lower[i + 1], lower[i + 2]);
+                    long key = keys[i];
                     if (_trigrams is not null && _trigrams.TryGetValue(key, out var known))
                     {
                         if (known.Value is null)                   // absent: no candidates
@@ -808,7 +807,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
                 }
             }
 
-            if (unknown > 0 && !Resolve(lower[..n], k, posts, header, src)) return [];
+            if (unknown > 0 && !Resolve(keys[..k], posts, header, src)) return [];
             return SegmentTrigramIndex.IntersectRarestFirst(posts, k);
         }
         finally
@@ -816,18 +815,19 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             // Cleared: the rented array holds references to the memo's arrays, and a pooled
             // array outlives the call.
             if (posts is not null) ArrayPool<int[]>.Shared.Return(posts, clearArray: true);
-            if (rentedChars is not null) ArrayPool<char>.Shared.Return(rentedChars);
+            if (rentedKeys is not null) ArrayPool<long>.Shared.Return(rentedKeys);
         }
     }
 
     /// <summary>
-    /// Fills the null slots of <paramref name="posts"/> from the section and remembers what it
-    /// found. Returns false — having remembered every absent trigram and decoded nothing — when
-    /// any is absent.
+    /// Fills the null slots of <paramref name="posts"/> — those of the term's <paramref name="asked"/>
+    /// keys the memo did not know — from the section and remembers what it found. Returns false —
+    /// having remembered one absent trigram and decoded nothing — when any is absent.
     /// </summary>
-    private bool Resolve(ReadOnlySpan<char> lower, int k, int[][] posts,
+    private bool Resolve(ReadOnlySpan<long> asked, int[][] posts,
                          SegmentTrigramIndex.PackedHeader header, IIndexSectionSource src)
     {
+        int    k       = asked.Length;
         long[] keys    = ArrayPool<long>.Shared.Rent(k);
         int[]  offsets = ArrayPool<int>.Shared.Rent(k);
         int[]  lengths = ArrayPool<int>.Shared.Rent(k);
@@ -836,7 +836,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
         {
             int m = 0;
             for (int i = 0; i < k; i++)
-                if (posts[i] is null) keys[m++] = SegmentTrigramIndex.PackedKey(lower[i], lower[i + 1], lower[i + 2]);
+                if (posts[i] is null) keys[m++] = asked[i];
 
             var wanted = keys.AsSpan(0, m);
             wanted.Sort();
@@ -854,7 +854,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             for (int i = 0; i < k; i++)
             {
                 if (posts[i] is not null) continue;
-                long key = SegmentTrigramIndex.PackedKey(lower[i], lower[i + 1], lower[i + 2]);
+                long key = asked[i];
                 if (offsets[SegmentTrigramIndex.IndexOf(wanted, key)] >= 0) continue;
                 lock (_gate) RememberTrigramLocked(key, null);
                 return false;
@@ -874,7 +874,7 @@ public sealed class SegmentIndexReader : ISegmentIndex, IIndexSectionSource, IDi
             for (int i = 0, j; i < k; i++)
             {
                 if (posts[i] is not null) continue;
-                j = SegmentTrigramIndex.IndexOf(wanted, SegmentTrigramIndex.PackedKey(lower[i], lower[i + 1], lower[i + 2]));
+                j = SegmentTrigramIndex.IndexOf(wanted, asked[i]);
                 posts[i] = decoded[j];
             }
             return true;

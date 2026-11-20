@@ -508,21 +508,39 @@ public sealed class LazyIndexParityTests
         new string('a', 1500), "a" + new string('b', 1100),
     ];
 
+    private static IEnumerable<(uint, string)> TrigramAdds()
+    {
+        for (uint o = 0; o < 64; o++) yield return (o, Texts[o % Texts.Length]);
+        yield return (64, new string('a', 1500));
+    }
+
     private static SegmentTrigramIndex BuildTrigrams()
     {
         var t = new SegmentTrigramIndex();
-        for (uint o = 0; o < 64; o++)
-            t.Add(o, Texts[o % Texts.Length]);
-        t.Add(64, new string('a', 1500));
+        foreach (var (o, text) in TrigramAdds()) t.Add(o, text);
         return t;
     }
 
+    /// <summary>The canonical layout, the V1 Roaring one, and the V2 layout every build wrote before
+    /// the canonical fold — keys lowercased, which a reader asks only for ASCII trigrams. The Roaring
+    /// layout is asked nothing by either reader (<see cref="SegmentTrigramIndex.TrigramFold.Truncated"/>),
+    /// so its rows pin only that the two agree on that; its decoding is held by
+    /// <see cref="ARepeatedLegacyKey_IsWhyASingleByteSectionAnswersNothing"/>.</summary>
+    public static TheoryData<string> TrigramLayouts => new() { "codec", "roaring", "lower-v2" };
+
+    private static byte[] TrigramSection(SegmentTrigramIndex built, IEnumerable<(uint, string)> adds, string layout) => layout switch
+    {
+        "codec"   => built.Serialise(),
+        "roaring" => built.SerialiseRoaringV1(),
+        _         => LogIndexCaseFoldTests.LowercaseTrigrams(adds),
+    };
+
     [Theory]
-    [MemberData(nameof(Layouts))]
+    [MemberData(nameof(TrigramLayouts))]
     public void EveryTrigramSearch_GetsTheDecodedAnswer_FromTheSectionAndFromTheMemo(string layout)
     {
         var built = BuildTrigrams();
-        byte[] section = layout == "codec" ? built.Serialise() : built.SerialiseRoaringV1();
+        byte[] section = TrigramSection(built, TrigramAdds(), layout);
         var oracle = SegmentTrigramIndex.Deserialise(section);
         using var lazy = SegmentIndexReader.Load([], section, []);
 
@@ -541,11 +559,15 @@ public sealed class LazyIndexParityTests
 
     /// <summary>
     /// The single-byte-key layouts (V1 codec, and the older Roaring one) could repeat a key —
-    /// non-ASCII truncated onto '?' — and reading them assigned into a dictionary, so the LAST
-    /// bucket won. A lazy reader that stopped at the first would answer differently.
+    /// a non-ASCII trigram cut down onto an ASCII one (<c>ѡbc</c> onto <c>abc</c>) — and reading
+    /// them kept the LAST bucket. So the postings under <c>abc</c> may be another trigram's, and
+    /// the row that really holds <c>abc</c> may be missing from them: not even an ASCII search can
+    /// be proved absent there. Both readers ask such a section nothing — "no information" — and
+    /// the group is read; the last-bucket rule itself is still what <see cref="SegmentTrigramIndex.Locate"/>
+    /// keeps, for any reader that walks these layouts.
     /// </summary>
     [Fact]
-    public void ARepeatedLegacyKey_LastBucketWins()
+    public void ARepeatedLegacyKey_IsWhyASingleByteSectionAnswersNothing()
     {
         // V1 codec: magic, count, then (3 key bytes, u32 length, varint postings) per bucket.
         var blob = new List<byte>();
@@ -568,10 +590,19 @@ public sealed class LazyIndexParityTests
         var oracle = SegmentTrigramIndex.Deserialise(section);
         using var lazy = SegmentIndexReader.Load([], section, []);
 
-        Assert.Equal([7u, 9u], oracle.Lookup("abc")!);
-        Assert.Equal(oracle.Lookup("abc"), lazy.LookupTrigram("abc"));
-        Assert.Equal(oracle.Lookup("?bc"), lazy.LookupTrigram("?bc"));
-        Assert.Equal(oracle.Lookup("пbc"), lazy.LookupTrigram("пbc"));   // truncated on write: no match
+        foreach (string search in new[] { "abc", "ABC", "?bc", "пbc", "zzz" })
+        {
+            Assert.Null(oracle.Lookup(search));
+            Assert.Null(lazy.LookupTrigram(search));
+        }
+
+        // The rule the section is still walked by: the last of the repeated buckets is the one found.
+        var header = SegmentTrigramIndex.ReadPackedHeader(section);
+        Assert.Equal(SegmentTrigramIndex.TrigramFold.Truncated, header.Fold);
+        long[] wanted  = [SegmentTrigramIndex.PackedKey('a', 'b', 'c')];
+        int[]  offsets = new int[1], lengths = new int[1];
+        SegmentTrigramIndex.Locate(section, header, wanted, offsets, lengths);
+        Assert.Equal([7, 9], SegmentTrigramIndex.DecodePacked(section.AsSpan(offsets[0], lengths[0]), header.Kind));
     }
 
     [Fact]
@@ -581,10 +612,12 @@ public sealed class LazyIndexParityTests
         const string Alphabet = "abcAB-: Ωж1";
         for (int round = 0; round < 30; round++)
         {
-            var t = new SegmentTrigramIndex();
+            var t    = new SegmentTrigramIndex();
+            var adds = new List<(uint, string)>();
             int events = rng.Next(1, 200);
-            for (uint o = 0; o < events; o++) t.Add(o, RandomText(rng, Alphabet, rng.Next(0, 30)));
-            byte[] section = rng.Next(4) == 0 ? t.SerialiseRoaringV1() : t.Serialise();
+            for (uint o = 0; o < events; o++) adds.Add((o, RandomText(rng, Alphabet, rng.Next(0, 30))));
+            foreach (var (o, text) in adds) t.Add(o, text);
+            byte[] section = TrigramSection(t, adds, rng.Next(4) switch { 0 => "roaring", 1 => "lower-v2", _ => "codec" });
             var oracle = SegmentTrigramIndex.Deserialise(section);
             using var lazy = SegmentIndexReader.Load([], section, []);
 

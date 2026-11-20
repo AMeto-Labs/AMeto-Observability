@@ -43,6 +43,10 @@
     <!-- PinnedSpanMemoryManager: the index builder reads an event's payload and exception where they
          sit through it (the WAL's replay does too, under the grant above). -->
     <InternalsVisibleTo Include="Ameto.Indexing" />
+    <!-- CaseFold and SegmentBloomFilter's fold kinds: the log index tests build sections folded
+         the old way and the canonical way, and check the fold over every code point. -->
+    <InternalsVisibleTo Include="Ameto.Indexing.Tests" />
+    <InternalsVisibleTo Include="Ameto.Query.Tests" />
   </ItemGroup>
 
 </Project>

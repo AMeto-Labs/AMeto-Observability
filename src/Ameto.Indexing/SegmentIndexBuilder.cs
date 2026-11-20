@@ -33,15 +33,16 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 
     // Per-build scratch (Build is single-threaded per flush). Grown on demand. Everything is
     // UTF-8: keys are the payload's own bytes copied behind their prefix, numbers are formatted
-    // as UTF-8, and a value is case-folded ONCE (byte-wise, ASCII) for the bloom and the
-    // trigram together. The old walk decoded every key and every value to UTF-16, folded them
+    // as UTF-8, and a value is case-folded ONCE for the bloom and the trigram together — byte-wise
+    // when it is ASCII, which nearly every value is, and through CaseFold's table straight off the
+    // UTF-8 when it is not. The old walk decoded every key and every value to UTF-16, folded them
     // as chars, encoded them back for the bloom, and lowered them again for the trigram — six
     // passes over each value's bytes per event.
     private readonly PinnedSpanMemoryManager _payload = new();   // MessagePackReader needs a sequence
     private byte[] _key  = new byte[256];   // accumulated flat (dot-notation) key, UTF-8
     private byte[] _val  = new byte[64];    // formatted numeric value (serialised form, prefix at [0..2])
     private byte[] _fold = new byte[256];   // case-folded ASCII value for bloom + trigram
-    private char[] _wide = new char[256];   // non-ASCII value decoded for the UTF-16 fold path
+    private char[] _wide = new char[256];   // case-folded non-ASCII value, one UTF-16 unit per scalar
 
     /// <summary>
     /// Terms per event assumed when the caller has nothing measured to offer. The filter is a
@@ -258,18 +259,21 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         IndexException(in ev, offset);
 
         // TraceId / SpanId — 32 / 16 lowercase hex digits, formatted straight into stack scratch.
+        // The bucket files them as written (it copies them); the bloom takes them folded, which for
+        // hex digits is upper case, done in place — every event has its own ids, so this runs per
+        // event and must not cost a buffer.
         Span<byte> hex = stackalloc byte[32];
         if (ev.HasTraceId)
         {
             ev.TraceIdHi.TryFormat(hex,       out _, "x16");
             ev.TraceIdLo.TryFormat(hex[16..], out _, "x16");
-            if (_inverted.AddUtf8(offset, "@tr"u8, hex) != IndexAddOutcome.Existing) _bloom.Add(hex);   // already folded
+            if (_inverted.AddUtf8(offset, "@tr"u8, hex) != IndexAddOutcome.Existing) BloomAddHex(hex);
             _bloomPresented++;
         }
         if (ev.HasSpanId)
         {
             ev.SpanId.TryFormat(hex, out _, "x16");
-            if (_inverted.AddUtf8(offset, "@sp"u8, hex[..16]) != IndexAddOutcome.Existing) _bloom.Add(hex[..16]);
+            if (_inverted.AddUtf8(offset, "@sp"u8, hex[..16]) != IndexAddOutcome.Existing) BloomAddHex(hex[..16]);
             _bloomPresented++;
         }
 
@@ -308,6 +312,14 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     private string? _serviceRef;
     private byte[]  _serviceUtf8 = new byte[64];
     private int     _serviceLen;
+
+    /// <summary>Lowercase hex digits into the bloom as <see cref="CaseFold"/> folds them — upper
+    /// case, in the caller's scratch, which the bucket has already copied from.</summary>
+    private void BloomAddHex(Span<byte> hex)
+    {
+        System.Text.Ascii.ToUpperInPlace(hex, out _);
+        _bloom.Add(hex);
+    }
 
     private void IndexException(in SegmentEventRef ev, uint offset)
     {
@@ -498,7 +510,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         int prop = _inverted.PropertyId(MarkerBucket, out _);
         if (_inverted.AddValue(offset, prop, MarkerValue) == IndexAddOutcome.NewValue)
         {
-            _bloom.Add(MarkerBucket);
+            _bloom.AddUtf8(MarkerBucket);   // folded, as the reference build's string add folds it
             _markerOwesBloom = prop;
         }
         _bloomPresented++;
@@ -516,12 +528,12 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// </summary>
     private int _markerOwesBloom = -1;
 
-    /// <summary>Trigram of a UTF-8 value: byte-wise fold when ASCII, the UTF-16 path otherwise.</summary>
+    /// <summary>Trigram of a UTF-8 value: byte-wise fold when ASCII, the table off the UTF-8 otherwise.</summary>
     private void TrigramUtf8(uint offset, ReadOnlySpan<byte> utf8)
     {
         if (utf8.Length < 3) return;
         EnsureFold(utf8.Length);
-        if (System.Text.Ascii.ToLower(utf8, _fold, out int n) == OperationStatus.Done)
+        if (System.Text.Ascii.ToUpper(utf8, _fold, out int n) == OperationStatus.Done)
             _trigram.AddFoldedAscii(offset, _fold.AsSpan(0, n));
         else
             _trigram.Add(offset, utf8);
@@ -719,8 +731,8 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 var r    = _inverted.AddValue(offset, prop, b ? "\0true"u8 : "\0false"u8);
                 _bloomPresented += 2;
                 if (newKey) _bloom.AddUtf8(flatKey);
-                if (r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop)) _bloom.Add(b ? "true"u8 : "false"u8);   // "True"/"False" folded
-                _trigram.AddFoldedAscii(offset, b ? "true"u8 : "false"u8);
+                if (r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop)) _bloom.Add(b ? "TRUE"u8 : "FALSE"u8);   // "True"/"False" folded
+                _trigram.AddFoldedAscii(offset, b ? "TRUE"u8 : "FALSE"u8);
                 break;
             }
             case MessagePackType.Nil:
@@ -819,16 +831,18 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 
     /// <summary>
     /// Case-folds a value once and feeds the bloom (if asked) and the trigram from the same
-    /// bytes. ASCII — every number, id and the vast majority of strings — is lowered byte-wise
-    /// by <c>Ascii.ToLower</c>, which is what <c>ToLowerInvariant</c> does to ASCII, so the
-    /// bloom hashes and trigram keys are the ones the UTF-16 path produces. Anything else is
-    /// decoded and goes through that UTF-16 path unchanged.
+    /// result, folded by <see cref="CaseFold"/> — the fold whose equal is the scan's (see there).
+    /// ASCII — every number, id and the vast majority of strings — is upper-cased byte-wise by
+    /// <c>Ascii.ToUpper</c>, which IS that fold over ASCII, at the cost <c>Ascii.ToLower</c> had
+    /// here before; the bloom hashes and trigram keys are the ones the char path produces.
+    /// Anything else is folded through the table straight off its UTF-8, one char per scalar, and
+    /// that one result is hashed for the bloom and cut into trigrams.
     /// </summary>
     private void FoldValue(uint offset, ReadOnlySpan<byte> v, bool bloom, bool trigram)
     {
         if (!bloom && !trigram) return;
         EnsureFold(v.Length);
-        if (System.Text.Ascii.ToLower(v, _fold, out int n) == OperationStatus.Done)
+        if (System.Text.Ascii.ToUpper(v, _fold, out int n) == OperationStatus.Done)
         {
             var folded = _fold.AsSpan(0, n);
             if (bloom)   _bloom.Add(folded);
@@ -836,12 +850,12 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             return;
         }
 
-        int chars = System.Text.Encoding.UTF8.GetCharCount(v);
-        if (chars > _wide.Length) _wide = new char[Math.Max(chars, _wide.Length * 2)];
-        System.Text.Encoding.UTF8.GetChars(v, _wide);
-        var text = _wide.AsSpan(0, chars);
-        if (bloom)   _bloom.Add(text);
-        if (trigram) _trigram.Add(offset, text);
+        // Folded text is never longer than its UTF-8 counted in bytes.
+        if (v.Length > _wide.Length) _wide = new char[Math.Max(v.Length, _wide.Length * 2)];
+        int chars = CaseFold.FoldUtf8(v, _wide);
+        var text  = _wide.AsSpan(0, chars);
+        if (bloom)   _bloom.AddCanonical(text);
+        if (trigram) _trigram.AddFolded(offset, text);
     }
 
     private static ReadOnlySpan<byte> ReadStr(ref MessagePackReader reader)

@@ -19,6 +19,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Segments an earlier build wrote, read by this one (CaseFoldTierParityTests). -->
+    <None Include="Fixtures\**\*.seg" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Removes a test's data directory, and fails the test when something still holds a file in it;
          QuerySegmentFixtures.DeleteDataDirectory is this. -->
     <Compile Include="..\Shared\TestDataDirectory.cs" Link="Shared\TestDataDirectory.cs" />

@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using Ameto.Core;
 using Collections.Special;
 
 namespace Ameto.Indexing;
@@ -27,10 +28,13 @@ namespace Ameto.Indexing;
 /// <see cref="_unsorted"/> records the violation and serialisation sorts — they merely give
 /// up the free ordering.</para>
 ///
-/// <para>SECTION BYTES ARE PINNED: buckets are numbered in first-seen order and serialised in
-/// that order, which is the insertion order the previous dictionary-backed build wrote, so a
-/// segment written by this build is byte-identical to one written before it
-/// (<c>IndexBuildParityTests</c>, <c>SegmentTrigramBuildParityTests</c>).</para>
+/// <para>BUCKET ORDER AND POSTINGS ARE PINNED: buckets are numbered in first-seen order and
+/// serialised in that order, which is the insertion order the previous dictionary-backed build
+/// wrote, so over keys folded the same way the buckets this build writes are that build's, byte
+/// for byte — <c>SegmentTrigramBuildParityTests</c> holds the two together (its reference folds
+/// with <see cref="CaseFold"/> too: the keys themselves, and the header in front of them, are the
+/// canonical layout's, not what releases before it wrote; see <see cref="CanonicalMagic"/>), and
+/// <c>IndexBuildParityTests</c> the streaming and reference walks.</para>
 ///
 /// <para>THREADING: the build side has no lock. One index belongs to one index group's
 /// builder, and <c>SegmentWriter.WriteEvents</c> drives that from a single thread; the
@@ -72,6 +76,11 @@ public sealed class SegmentTrigramIndex
     // Loaded phase (deserialised): sorted arrays for intersection
     private readonly Dictionary<(char, char, char), int[]> _loaded = new();
 
+    /// <summary>How this index's keys were folded: <see cref="TrigramFold.Canonical"/> for one this
+    /// build is building, whatever the section said for one it read.</summary>
+    private TrigramFold _fold = TrigramFold.Canonical;
+    private ulong       _foldFingerprint = CaseFold.Fingerprint;
+
     /// <summary>Set when an offset arrived below its bucket's tail (contract violation).
     /// Serialisation then sorts before encoding, which requires ascending input.</summary>
     private bool _unsorted;
@@ -89,6 +98,32 @@ public sealed class SegmentTrigramIndex
             : (int)Math.Min(1 << 28, System.Numerics.BitOperations.RoundUpToPowerOf2((uint)expectedBuckets));
     }
 
+    /// <summary>
+    /// How a trigram section's keys were folded — read off the section, because it decides which
+    /// trigrams of a search term the section can answer for (<see cref="QueryKeys"/>).
+    /// </summary>
+    internal enum TrigramFold : byte
+    {
+        /// <summary><c>ToLowerInvariant</c> of the writer's host: every V2 section before the
+        /// canonical layout.</summary>
+        Lower,
+
+        /// <summary><see cref="CaseFold"/>, by the table whose fingerprint the section records.</summary>
+        Canonical,
+
+        /// <summary>
+        /// The single-byte layouts before V2 (<see cref="PackedKind.Legacy"/>,
+        /// <see cref="PackedKind.Codec"/>): lowercased, then every character cut to its low byte.
+        /// Not even an ASCII trigram is proof there: a non-ASCII one that cuts down to the same three
+        /// bytes (<c>ѡbc</c> to <c>abc</c>) repeats the key, the last bucket wins, and the real
+        /// <c>abc</c> postings are gone. So such a section answers nothing.
+        /// </summary>
+        Truncated,
+    }
+
+    /// <summary>How this index's keys were folded.</summary>
+    internal TrigramFold Fold => _fold;
+
     private readonly int _initialBuckets;
 
     /// <summary>Distinct trigrams seen by this build.</summary>
@@ -105,38 +140,42 @@ public sealed class SegmentTrigramIndex
 
     // ── Build ─────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Indexes <paramref name="text"/> folded by <see cref="CaseFold"/> — the fold whose equal is
+    /// the scan's (<c>OrdinalIgnoreCase</c> for free text and <c>contains</c>, lowercase for LIKE);
+    /// see there for why <c>ToLowerInvariant</c>, which this used to fold with, is not. Folded into
+    /// stack/pooled scratch — no per-add string allocations.
+    /// </summary>
     public void Add(uint localOffset, ReadOnlySpan<char> text)
     {
         if (text.Length < 3) return;
 
-        // Lowercase in place into stack/pooled scratch — no per-add string allocations.
         char[]? rented = text.Length > 1024 ? ArrayPool<char>.Shared.Rent(text.Length) : null;
-        Span<char> lower = rented ?? stackalloc char[text.Length];
-        int n = text.ToLowerInvariant(lower);
-        if (n < 0) { text.CopyTo(lower); n = text.Length; } // never (dest sized to source), but be safe
+        Span<char> folded = rented ?? stackalloc char[text.Length];
+        int n = CaseFold.FoldUtf16(text, folded);
 
-        AddFolded(localOffset, lower[..n]);
+        AddFolded(localOffset, folded[..n]);
 
         if (rented is not null) ArrayPool<char>.Shared.Return(rented);
     }
 
-    /// <summary>UTF-8 overload — decodes to chars on the stack, then indexes (no string alloc).</summary>
+    /// <summary>UTF-8 overload — folded scalar by scalar straight off the bytes into stack/pooled
+    /// chars (no string alloc). Folded text is never longer than its UTF-8 counted in bytes, so a
+    /// value under three bytes cannot hold a trigram.</summary>
     public void Add(uint localOffset, ReadOnlySpan<byte> utf8)
     {
-        if (utf8.IsEmpty) return;
-        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
-        if (charCount < 3) return;
-        char[]? rented = charCount > 1024 ? ArrayPool<char>.Shared.Rent(charCount) : null;
-        Span<char> chars = rented ?? stackalloc char[charCount];
-        System.Text.Encoding.UTF8.GetChars(utf8, chars);
-        Add(localOffset, (ReadOnlySpan<char>)chars[..charCount]);
+        if (utf8.Length < 3) return;
+        char[]? rented = utf8.Length > 1024 ? ArrayPool<char>.Shared.Rent(utf8.Length) : null;
+        Span<char> folded = rented ?? stackalloc char[utf8.Length];
+        int n = CaseFold.FoldUtf8(utf8, folded);
+        AddFolded(localOffset, folded[..n]);
         if (rented is not null) ArrayPool<char>.Shared.Return(rented);
     }
 
     /// <summary>
-    /// Indexes text that is ALREADY case-folded (<c>ToLowerInvariant</c>). Callers that fold
-    /// once for several consumers — the builder folds a value for the bloom and the trigram in
-    /// one pass — come in here.
+    /// Indexes text that is ALREADY folded by <see cref="CaseFold"/>. Callers that fold once for
+    /// several consumers — the builder folds a value for the bloom and the trigram in one pass —
+    /// come in here.
     /// </summary>
     internal void AddFolded(uint localOffset, ReadOnlySpan<char> lower)
     {
@@ -166,10 +205,10 @@ public sealed class SegmentTrigramIndex
 
     /// <summary>
     /// Indexes ASCII text that is ALREADY case-folded, as bytes — the builder's fast path, which
-    /// folds a raw UTF-8 value once (byte-wise, <c>Ascii.ToLower</c>) for the bloom and the
-    /// trigram together. A byte below 0x80 IS its UTF-16 code unit, so the slot-table key is the
-    /// same one <see cref="AddFolded"/> computes from chars, and the section is identical.
-    /// The caller guarantees every byte is ASCII.
+    /// folds a raw UTF-8 value once (byte-wise, <c>Ascii.ToUpper</c>, which is
+    /// <see cref="CaseFold"/> over ASCII) for the bloom and the trigram together. A byte below 0x80
+    /// IS its UTF-16 code unit, so the slot-table key is the same one <see cref="AddFolded"/>
+    /// computes from chars, and the section is identical. The caller guarantees every byte is ASCII.
     /// </summary>
     internal void AddFoldedAscii(uint localOffset, ReadOnlySpan<byte> lower)
     {
@@ -293,10 +332,11 @@ public sealed class SegmentTrigramIndex
     }
 
     /// <summary>
-    /// Local offsets that might contain <paramref name="text"/> — the intersection of its
-    /// trigrams' posting lists, ascending and distinct. Null when the index holds no
-    /// information (never built, or the term is shorter than a trigram); empty when the term is
-    /// provably absent.
+    /// Local offsets that might contain <paramref name="text"/> — the intersection of the posting
+    /// lists of its trigrams this index can answer for (<see cref="QueryKeys"/>), ascending and
+    /// distinct. Null when the index holds no information (never built, the term is shorter than a
+    /// trigram, or the index can answer for none of its trigrams); empty when the term is provably
+    /// absent.
     ///
     /// <para>Posting lists are sorted, so this is a two-pointer MERGE, run rarest list first —
     /// the same shape as <c>SegmentInvertedIndex.IntersectSorted</c>. It used to be a
@@ -306,9 +346,9 @@ public sealed class SegmentTrigramIndex
     /// parallel across eight workers. Starting from the rarest list also bounds the work by the
     /// SMALLEST posting list rather than the first one the term happens to spell.</para>
     ///
-    /// <para>The search text is folded into stack scratch, not through
-    /// <c>ToString().ToLowerInvariant()</c> — two strings per call, one of them a copy of a
-    /// filter literal that never changes.</para>
+    /// <para>The search text is folded as it is walked, into the keys and nothing else — not through
+    /// <c>ToString().ToLowerInvariant()</c>, two strings per call, one of them a copy of a filter
+    /// literal that never changes.</para>
     ///
     /// <para>Every posting list the merge sees is an ASCENDING, DISTINCT <c>int[]</c>, whichever
     /// side of the index it came from: <see cref="_loaded"/> by construction (delta+varint cannot
@@ -338,21 +378,19 @@ public sealed class SegmentTrigramIndex
         if (_loaded.Count == 0 && _sets.Count == 0) return null;
         if (text.Length < 3) return null;
 
-        char[]? rentedChars = text.Length > 1024 ? System.Buffers.ArrayPool<char>.Shared.Rent(text.Length) : null;
-        Span<char> lower = rentedChars ?? stackalloc char[text.Length];
+        long[]? rented = text.Length > MaxStackKeys ? ArrayPool<long>.Shared.Rent(text.Length) : null;
+        Span<long> keys = rented ?? stackalloc long[text.Length];
         try
         {
-            int n = text.ToLowerInvariant(lower);
-            if (n < 0) { text.CopyTo(lower); n = text.Length; }   // never (dest sized to source)
-            if (n < 3) return null;
+            int k = QueryKeys(text, _fold, _foldFingerprint, keys);
+            if (k == 0) return null;                              // nothing this index can answer for
 
-            int k = n - 2;                                        // trigram count
-            var posts = System.Buffers.ArrayPool<int[]>.Shared.Rent(k);
+            var posts = ArrayPool<int[]>.Shared.Rent(k);
             try
             {
                 for (int i = 0; i < k; i++)
                 {
-                    var key = (lower[i], lower[i + 1], lower[i + 2]);
+                    var key = Unpack(keys[i]);
                     if (_loaded.TryGetValue(key, out var arr))
                         posts[i] = arr;
                     else if (_sets.TryGetValue(key, out var decoded))
@@ -360,7 +398,7 @@ public sealed class SegmentTrigramIndex
                         // A build-phase bucket is only ascending while the contract holds. When
                         // it does not, the flag says so and the set-based path answers instead —
                         // a merge over unordered input would silently drop rows.
-                        if (_unsorted) return LookupUnsorted(lower[..n]);
+                        if (_unsorted) return LookupUnsorted(keys[..k]);
                         posts[i] = decoded;
                     }
                     else
@@ -373,11 +411,95 @@ public sealed class SegmentTrigramIndex
             {
                 // Cleared: the rented array holds references to the index's posting arrays, and
                 // a pooled array outlives the call.
-                System.Buffers.ArrayPool<int[]>.Shared.Return(posts, clearArray: true);
+                ArrayPool<int[]>.Shared.Return(posts, clearArray: true);
             }
         }
-        finally { if (rentedChars is not null) System.Buffers.ArrayPool<char>.Shared.Return(rentedChars); }
+        finally { if (rented is not null) ArrayPool<long>.Shared.Return(rented); }
     }
+
+    /// <summary>A search term's trigram keys go on the stack — sized from the term, at most 2 KB —
+    /// up to this many characters; a longer term rents its buffer.</summary>
+    internal const int MaxStackKeys = 256;
+
+    /// <summary>
+    /// THE TRIGRAMS OF A SEARCH TERM THAT A SECTION FOLDED <paramref name="fold"/> CAN ANSWER FOR,
+    /// as <see cref="PackedKey"/>s in the term's order (repeats kept), into
+    /// <paramref name="keys"/> (at least <paramref name="text"/>.Length long). Returns how many;
+    /// 0 means the section can answer for none of them — "no information", never "absent".
+    ///
+    /// <para>A missing trigram is read as PROOF that the group does not hold the term, so a trigram
+    /// is asked only where its absence from the section really is one: where every text the scan
+    /// would match against those three characters was stored under exactly the key asked. The term
+    /// is folded one scalar at a time, the way <see cref="CaseFold.FoldUtf16"/> folds what is
+    /// indexed, and a scalar is trusted where:</para>
+    /// <list type="bullet">
+    ///   <item><b>Canonical, this build's table:</b> always, unless the host compares the character
+    ///     differently from the table (<see cref="CaseFold.HostDisagrees"/>; on no host this build
+    ///     runs on). A surrogate — the astral collapse is coarser than any host's astral casing.</item>
+    ///   <item><b>Canonical, another build's table:</b> ASCII only, which every table folds alike.</item>
+    ///   <item><b>Lowercase, every V2 section before the canonical fold:</b> ASCII only, lowercased.
+    ///     The writer's lowercase of anything else is its host's, unrecorded, and not the scan's
+    ///     equivalence anyway (<c>ς</c> against <c>σ</c>, <c>ᲀ</c> against <c>в</c>); ASCII
+    ///     lowercases the same everywhere, and no non-ASCII character equals an ASCII one under the
+    ///     comparer — while for LIKE, the one that lowercases onto ASCII (the Kelvin sign onto
+    ///     <c>k</c>) was stored lowercased onto it too.</item>
+    ///   <item><b>The single-byte layouts before V2:</b> nothing (<see cref="TrigramFold.Truncated"/>).</item>
+    /// </list>
+    /// <para>A trigram is asked when all three of its scalars are trusted. So an old V2 section still
+    /// prunes an ASCII term fully, and a mixed one by its ASCII runs —
+    /// <c>ΟΔΟΣ.EXCEPTION</c> by <c>.ex</c>, <c>exc</c>, … — and a term with no all-ASCII window is
+    /// answered by reading the group. Nothing is trusted on a host whose comparer equates a
+    /// non-ASCII character with an ASCII one (<see cref="CaseFold.HostDisagreesOnAscii"/>).</para>
+    /// </summary>
+    internal static int QueryKeys(ReadOnlySpan<char> text, TrigramFold fold, ulong foldFingerprint, Span<long> keys)
+    {
+        if (text.Length < 3 || fold == TrigramFold.Truncated || CaseFold.HostDisagreesOnAscii) return 0;
+
+        bool canonical = fold == TrigramFold.Canonical;
+        bool sameTable = canonical && foldFingerprint == CaseFold.Fingerprint;
+        bool drift     = sameTable && CaseFold.HostDisagreementCount > 0;
+
+        int  k = 0, seen = 0;
+        char f0 = default, f1 = default;
+        bool t0 = false,   t1 = false;
+        int  i  = 0;
+        while (i < text.Length)
+        {
+            char c = text[i];
+            char f;
+            bool trusted;
+            if (char.IsSurrogate(c))
+            {
+                i += char.IsHighSurrogate(c) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]) ? 2 : 1;
+                f       = CaseFold.Collapsed;
+                trusted = sameTable;
+            }
+            else
+            {
+                i++;
+                if (c < 0x80)
+                {
+                    f       = canonical ? CaseFold.Bmp(c) : (char)((uint)(c - 'A') <= 'Z' - 'A' ? c | 0x20 : c);
+                    trusted = true;
+                }
+                else
+                {
+                    f       = CaseFold.Bmp(c);
+                    trusted = sameTable && !(drift && CaseFold.HostDisagrees(c));
+                }
+            }
+
+            if (seen >= 2 && t0 && t1 && trusted) keys[k++] = PackedKey(f0, f1, f);
+            f0 = f1; t0 = t1;
+            f1 = f;  t1 = trusted;
+            seen++;
+        }
+        return k;
+    }
+
+    /// <summary>A <see cref="PackedKey"/>'s three characters, as <see cref="_loaded"/> files them.</summary>
+    private static (char, char, char) Unpack(long key) =>
+        ((char)key, (char)(key >> 16), (char)(key >> 32));
 
     /// <summary>
     /// The intersection of the first <paramref name="k"/> posting lists (every one ascending and
@@ -445,12 +567,12 @@ public sealed class SegmentTrigramIndex
     /// <see cref="_unsorted"/>). Correct, not fast: an unsorted build is a contract violation
     /// that serialisation repairs, so no query path reaches this against a real segment.
     /// </summary>
-    private uint[]? LookupUnsorted(ReadOnlySpan<char> lower)
+    private uint[]? LookupUnsorted(ReadOnlySpan<long> keys)
     {
         HashSet<int>? result = null;
-        for (int i = 0; i <= lower.Length - 3; i++)
+        for (int i = 0; i < keys.Length; i++)
         {
-            var key = (lower[i], lower[i + 1], lower[i + 2]);
+            var key = Unpack(keys[i]);
 
             IEnumerable<int>? candidates = null;
             if (_loaded.TryGetValue(key, out var arr))      candidates = arr;
@@ -492,6 +614,28 @@ public sealed class SegmentTrigramIndex
     /// </summary>
     private const uint CodecMagicV2 = 0xFFFFFFFEu;
 
+    /// <summary>
+    /// The CANONICAL layout — keys folded by <see cref="CaseFold"/> rather than lowercased — marked
+    /// without a format version: "LTC1" little-endian, at byte 8, behind a V2 header that declares
+    /// NO buckets.
+    /// <code>
+    ///   uint32 CodecMagicV2, uint32 0     — a wide section holding nothing: what an older build reads
+    ///   uint32 CanonicalMagic
+    ///   uint64 the writer's CaseFold.Fingerprint
+    ///   uint32 bucket count, then the buckets exactly as V2 lays them out
+    /// </code>
+    /// <para>An older build reads a V2 section of zero buckets, which every build that knows V2 at
+    /// all treats as "no information" — an index that was never built (87986a5d made an empty index
+    /// mean that before V2 existed) — so it answers substring hints over a group this build wrote
+    /// by reading the group: slower, never short. It cannot see the canonical keys, and must not: it
+    /// would look them up with its own lowercase. No legacy section can be mistaken for this one: a
+    /// V2 section with no buckets was always exactly eight bytes long.</para>
+    /// </summary>
+    private const uint CanonicalMagic = 0x3143_544Cu;   // 'L' 'T' 'C' '1'
+
+    /// <summary>Bytes before a canonical section's first bucket.</summary>
+    private const int CanonicalHeaderBytes = 8 + 4 + 8 + 4;
+
     public byte[] Serialise()
     {
         ObjectDisposedException.ThrowIf(_released, this);
@@ -513,8 +657,15 @@ public sealed class SegmentTrigramIndex
         ObjectDisposedException.ThrowIf(_released, this);
         NormaliseIfUnsorted();
 
-        WriteUInt32(w, CodecMagicV2);
-        WriteUInt32(w, (uint)_bucketCount);
+        // The canonical layout (see CanonicalMagic): an empty V2 header for older builds, then the
+        // marker, the fold's fingerprint and the real count.
+        var head = w.GetSpan(CanonicalHeaderBytes);
+        BinaryPrimitives.WriteUInt32LittleEndian(head,        CodecMagicV2);
+        BinaryPrimitives.WriteUInt32LittleEndian(head[4..],   0);
+        BinaryPrimitives.WriteUInt32LittleEndian(head[8..],   CanonicalMagic);
+        BinaryPrimitives.WriteUInt64LittleEndian(head[12..],  _foldFingerprint);
+        BinaryPrimitives.WriteUInt32LittleEndian(head[20..],  (uint)_bucketCount);
+        w.Advance(CanonicalHeaderBytes);
 
         for (int id = 0; id < _bucketCount; id++)
         {
@@ -540,7 +691,7 @@ public sealed class SegmentTrigramIndex
     {
         ObjectDisposedException.ThrowIf(_released, this);
         NormaliseIfUnsorted();
-        long size = 8;
+        long size = CanonicalHeaderBytes;
         for (int id = 0; id < _bucketCount; id++)
             size += 10 + PostingArena.SerialisedSize(in _buckets[id].Postings);
         return size;
@@ -584,7 +735,11 @@ public sealed class SegmentTrigramIndex
     }
 
     /// <summary>Legacy RoaringBitmap serialisation — retained only to generate blobs for the
-    /// backward-compatibility read test.</summary>
+    /// backward-compatibility read test. Keys are cut to a byte as the builds that wrote this layout
+    /// cut them, ASCII lowered as they lowered it; a non-ASCII key is cut from its canonical fold
+    /// rather than from the lowercase those builds cut, so its collisions are not theirs. That
+    /// changes only what such a section holds: a reader asks it nothing
+    /// (<see cref="TrigramFold.Truncated"/>).</summary>
     internal byte[] SerialiseRoaringV1()
     {
         ObjectDisposedException.ThrowIf(_released, this);
@@ -595,9 +750,9 @@ public sealed class SegmentTrigramIndex
         for (int id = 0; id < _bucketCount; id++)
         {
             ref readonly var b = ref _buckets[id];
-            bw.Write((byte)b.C0);
-            bw.Write((byte)b.C1);
-            bw.Write((byte)b.C2);
+            bw.Write(LegacyKeyByte(b.C0));
+            bw.Write(LegacyKeyByte(b.C1));
+            bw.Write(LegacyKeyByte(b.C2));
             int[] sortedArr = new int[b.Postings.Count];
             _arena.Decode(in b.Postings, sortedArr);
             Array.Sort(sortedArr);
@@ -609,6 +764,8 @@ public sealed class SegmentTrigramIndex
             bw.Write(bitmapBytes);
         }
         return ms.ToArray();
+
+        static byte LegacyKeyByte(char c) => (byte)((uint)(c - 'A') <= 'Z' - 'A' ? c | 0x20 : c);
     }
 
     public static SegmentTrigramIndex Deserialise(ReadOnlySpan<byte> data)
@@ -616,12 +773,14 @@ public sealed class SegmentTrigramIndex
         var idx = new SegmentTrigramIndex();
         if (data.IsEmpty) return idx;
 
-        int pos    = 0;
-        uint first = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
-        bool wide  = first == CodecMagicV2;                  // 3 × uint16 trigram key
-        bool codec = wide || first == CodecMagic;            // varint postings either way
-        uint count = codec ? BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]) : first;
-        if (codec) pos += 4;
+        // The header rules are ReadPackedHeader's, so the two readers cannot disagree on a layout.
+        var header = ReadPackedHeader(data);
+        idx._fold            = header.Fold;
+        idx._foldFingerprint = header.FoldFingerprint;
+        bool wide  = header.Kind == PackedKind.Wide;          // 3 × uint16 trigram key
+        bool codec = header.Kind != PackedKind.Legacy;        // varint postings either way
+        uint count = header.Count;
+        int  pos   = header.BucketsStart;
 
         for (uint i = 0; i < count; i++)
         {
@@ -670,24 +829,38 @@ public sealed class SegmentTrigramIndex
         Wide,
     }
 
-    /// <summary>What a packed section's header says: its layout, how many buckets follow, and
-    /// where the first one starts. A class so a reader can publish it with one reference write.</summary>
-    internal sealed class PackedHeader(PackedKind kind, uint count, int bucketsStart)
+    /// <summary>What a packed section's header says: its layout, how many buckets follow, where
+    /// the first one starts, and how its keys were folded (<see cref="QueryKeys"/> asks only what
+    /// that fold can answer). A class so a reader can publish it with one reference write.</summary>
+    internal sealed class PackedHeader(PackedKind kind, uint count, int bucketsStart, TrigramFold fold, ulong foldFingerprint)
     {
-        public static readonly PackedHeader Absent = new(PackedKind.Wide, 0, 0);
+        public static readonly PackedHeader Absent = new(PackedKind.Wide, 0, 0, TrigramFold.Lower, 0);
 
-        public readonly PackedKind Kind         = kind;
-        public readonly uint       Count        = count;
-        public readonly int        BucketsStart = bucketsStart;
+        public readonly PackedKind  Kind            = kind;
+        public readonly uint        Count           = count;
+        public readonly int         BucketsStart    = bucketsStart;
+        public readonly TrigramFold Fold            = fold;
+        public readonly ulong       FoldFingerprint = foldFingerprint;
     }
 
     internal static PackedHeader ReadPackedHeader(ReadOnlySpan<byte> data)
     {
         if (data.IsEmpty) return PackedHeader.Absent;
         uint first = BinaryPrimitives.ReadUInt32LittleEndian(data);
-        if (first == CodecMagicV2) return new PackedHeader(PackedKind.Wide,  BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8);
-        if (first == CodecMagic)   return new PackedHeader(PackedKind.Codec, BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8);
-        return new PackedHeader(PackedKind.Legacy, first, 4);
+        if (first == CodecMagicV2)
+        {
+            uint count = BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
+            // A canonical section behind its empty V2 header (CanonicalMagic). One the marker
+            // cannot be read from is the empty V2 header it starts with — no information.
+            if (count == 0 && data.Length >= CanonicalHeaderBytes
+                && BinaryPrimitives.ReadUInt32LittleEndian(data[8..]) == CanonicalMagic)
+                return new PackedHeader(PackedKind.Wide, BinaryPrimitives.ReadUInt32LittleEndian(data[20..]),
+                                        CanonicalHeaderBytes, TrigramFold.Canonical,
+                                        BinaryPrimitives.ReadUInt64LittleEndian(data[12..]));
+            return new PackedHeader(PackedKind.Wide, count, 8, TrigramFold.Lower, 0);
+        }
+        if (first == CodecMagic) return new PackedHeader(PackedKind.Codec, BinaryPrimitives.ReadUInt32LittleEndian(data[4..]), 8, TrigramFold.Truncated, 0);
+        return new PackedHeader(PackedKind.Legacy, first, 4, TrigramFold.Truncated, 0);
     }
 
     /// <summary>A trigram as one 48-bit number — its three UTF-16 units as a wide section stores

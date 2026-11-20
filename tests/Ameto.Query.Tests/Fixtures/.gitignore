@@ -1,0 +1,3 @@
+# Segment files an earlier build wrote, kept here on purpose: the root .gitignore drops *.seg
+# as server data, and a test that reads the old format needs the old bytes.
+!*.seg

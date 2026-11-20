@@ -7,11 +7,14 @@ namespace Ameto.Indexing.Tests;
 /// The arena-backed trigram build must write the SAME BYTES the dictionary-of-lists build
 /// wrote: same bucket order (first seen), same postings (ascending, distinct), same codec.
 /// The reference here is that old build, reduced to its essentials, so the pin does not
-/// depend on the class under test agreeing with itself.
+/// depend on the class under test agreeing with itself — with the two things the canonical
+/// fold changed since: keys are folded by <see cref="Ameto.Core.CaseFold"/> (held to the
+/// comparer over every code point by its own tests), and the section is the canonical layout.
 /// </summary>
 public sealed class SegmentTrigramBuildParityTests
 {
-    private const uint CodecMagicV2 = 0xFFFFFFFEu;
+    private const uint CodecMagicV2   = 0xFFFFFFFEu;
+    private const uint CanonicalMagic = 0x3143_544Cu;   // "LTC1"
 
     /// <summary>The pre-arena build: tuple-keyed dictionary, list per bucket, tail dedup.</summary>
     private static byte[] Reference(IEnumerable<(uint offset, string text)> adds)
@@ -21,7 +24,8 @@ public sealed class SegmentTrigramBuildParityTests
         foreach (var (offset, text) in adds)
         {
             if (text.Length < 3) continue;
-            string lower = text.ToLowerInvariant();
+            var folded = new char[text.Length];
+            string lower = new(folded, 0, Ameto.Core.CaseFold.FoldUtf16(text, folded));
             for (int i = 0; i <= lower.Length - 3; i++)
             {
                 var key = (lower[i], lower[i + 1], lower[i + 2]);
@@ -39,9 +43,12 @@ public sealed class SegmentTrigramBuildParityTests
             }
 
         var ms = new MemoryStream();
-        Span<byte> tmp = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32LittleEndian(tmp, CodecMagicV2);   ms.Write(tmp);
-        BinaryPrimitives.WriteUInt32LittleEndian(tmp, (uint)sets.Count); ms.Write(tmp);
+        Span<byte> tmp = stackalloc byte[8];
+        BinaryPrimitives.WriteUInt32LittleEndian(tmp, CodecMagicV2);   ms.Write(tmp[..4]);
+        BinaryPrimitives.WriteUInt32LittleEndian(tmp, 0);              ms.Write(tmp[..4]);   // what an older build reads: no buckets
+        BinaryPrimitives.WriteUInt32LittleEndian(tmp, CanonicalMagic); ms.Write(tmp[..4]);
+        BinaryPrimitives.WriteUInt64LittleEndian(tmp, Ameto.Core.CaseFold.Fingerprint); ms.Write(tmp);
+        BinaryPrimitives.WriteUInt32LittleEndian(tmp, (uint)sets.Count); ms.Write(tmp[..4]);
         foreach (var ((c0, c1, c2), list) in sets)
         {
             BinaryPrimitives.WriteUInt16LittleEndian(tmp, c0); ms.Write(tmp[..2]);
@@ -49,7 +56,7 @@ public sealed class SegmentTrigramBuildParityTests
             BinaryPrimitives.WriteUInt16LittleEndian(tmp, c2); ms.Write(tmp[..2]);
             var enc = new byte[SegmentBitmapCodec.MaxEncodedSize(list.Count)];
             int n   = SegmentBitmapCodec.Encode(list.ToArray(), enc);
-            BinaryPrimitives.WriteUInt32LittleEndian(tmp, (uint)n); ms.Write(tmp);
+            BinaryPrimitives.WriteUInt32LittleEndian(tmp, (uint)n); ms.Write(tmp[..4]);
             ms.Write(enc, 0, n);
         }
         return ms.ToArray();
