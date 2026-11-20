@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Microsoft.Win32.SafeHandles;
 using Ameto.Core;
 using Ameto.Indexing;
@@ -43,16 +44,35 @@ public sealed class QueryExecutor : IQueryExecutor
     private readonly ILogger<QueryExecutor>   _logger;
     private readonly SegmentIndexCache?       _indexCache;
 
+    /// <summary>
+    /// How deep this server's index builder flattens nested properties —
+    /// <c>Indexing.MaxPropertyFlattenDepth</c>, the option <c>IndexingWiring</c> hands the builder.
+    /// Every filter is asked of the index as one that flattened only this deep
+    /// (<see cref="CompiledFilter.ForIndexDepth"/>): a hint on a deeper path, and free text below
+    /// the default, is not given, and those rows are read rather than looked up in an index that
+    /// never held their values. At the default and above, the filter is asked as it was compiled.
+    ///
+    /// <para>One number for every segment, because a group does not record the depth it was
+    /// flattened to: a segment replicated from a peer was flattened as deep as THAT node is
+    /// configured, and is asked at this one's. Hence the option has to be the same on every node
+    /// that replicates (docs/CONFIGURATION.md).</para>
+    /// </summary>
+    private readonly int _indexFlattenDepth;
+
+    /// <param name="options">The server's options, for <c>Indexing.MaxPropertyFlattenDepth</c>;
+    /// null means the default depth, which is what a builder made without options flattens to.</param>
     public QueryExecutor(
         ISegmentProvider         segments,
         SegmentIndexReaderFactory indexFactory,
         ILogger<QueryExecutor>   logger,
-        SegmentIndexCache?       indexCache = null)
+        SegmentIndexCache?       indexCache = null,
+        IOptions<ServerOptions>? options = null)
     {
-        _segments     = segments;
-        _indexFactory = indexFactory;
-        _logger       = logger;
-        _indexCache   = indexCache is { Enabled: true } ? indexCache : null;
+        _segments          = segments;
+        _indexFactory      = indexFactory;
+        _logger            = logger;
+        _indexCache        = indexCache is { Enabled: true } ? indexCache : null;
+        _indexFlattenDepth = options?.Value.Indexing.MaxPropertyFlattenDepth ?? IndexingOptions.DefaultMaxPropertyFlattenDepth;
     }
 
     /// <summary>
@@ -71,11 +91,12 @@ public sealed class QueryExecutor : IQueryExecutor
         // A caller that runs the same request shape over and over (the live tail, once per
         // poll) compiles the filter once and carries it on the request; it is trusted only
         // when it was compiled from this request's own text, so a mismatched pair costs a
-        // compile, never a wrong filter.
+        // compile, never a wrong filter. Either way it is asked of the index this server
+        // builds, which may flatten less deeply than a prepared filter was compiled for.
         var filter = request.Prepared is CompiledFilter prepared
                      && string.Equals(prepared.Expression, request.Filter, StringComparison.Ordinal)
-            ? prepared
-            : CompiledFilter.Compile(request.Filter);
+            ? prepared.ForIndexDepth(_indexFlattenDepth)
+            : CompiledFilter.Compile(request.Filter, _indexFlattenDepth);
         int limit  = request.Count;
         int count  = 0;
 
@@ -1413,9 +1434,14 @@ public sealed class QueryExecutor : IQueryExecutor
         var trigramHints  = filter.GetTrigramHints();
         var invertedHints = filter.GetInvertedHints();
 
-        // Definitive inverted-index check (bloom can have false positives)
+        // Definitive inverted-index check (bloom can have false positives) — for a hint that
+        // names a bucket. The message template's names none (CompiledFilter.TryGetIndexHint): the
+        // builder files it in no bucket, phase 1's bloom gate is all the index can say about it,
+        // and a bucket asked in its place is a client property that happens to share the
+        // filter's spelling (`Message`, `@mt`), whose values are not the template's.
         if (!filter.IsMatchAll
             && filter.TryGetIndexHint(out string prop, out object? val)
+            && prop.Length != 0
             && !idx.MightContain(prop, val))
             return GroupVerdict.Dropped;
 

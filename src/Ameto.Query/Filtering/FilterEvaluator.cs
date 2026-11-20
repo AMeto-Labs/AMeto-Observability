@@ -159,13 +159,18 @@ public static class FilterEvaluator
     // ── Free-text search ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Maximum property-nesting depth searched by free-text — MUST stay equal to
-    /// <c>ServerOptions.MaxPropertyFlattenDepth</c> (default 5), the depth to which
-    /// <c>SegmentIndexBuilder</c> flattens string values into the trigram index. A value
-    /// nested deeper than this is not indexed, so it must not be matched here either, or
-    /// cold-tier (index-skipped) and hot-tier (full-scan) queries would diverge.
+    /// Maximum property-nesting depth searched by free-text: the DEFAULT depth to which
+    /// <c>SegmentIndexBuilder</c> flattens string values into the trigram index
+    /// (<see cref="IndexingOptions.DefaultMaxPropertyFlattenDepth"/>). A value nested deeper
+    /// than this is not indexed by default, so it is not matched here either, or cold-tier
+    /// (index-skipped) and hot-tier (full-scan) queries would diverge.
+    ///
+    /// <para>What free text matches does not follow <c>Indexing.MaxPropertyFlattenDepth</c>: a
+    /// server configured to flatten less holds fewer of these values in its index, and asks the
+    /// index no free-text question at all (<c>CompiledFilter.ForIndexDepth</c>) — the rows are
+    /// read, and match exactly as here.</para>
     /// </summary>
-    private const int MaxFlattenDepth = 5;
+    internal const int MaxFlattenDepth = IndexingOptions.DefaultMaxPropertyFlattenDepth;
 
     /// <summary>
     /// Bare free-text: every term must appear (case-insensitive substring) in one of
