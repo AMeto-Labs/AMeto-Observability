@@ -10,6 +10,20 @@ namespace Ameto.Storage;
 /// <c>Ameto.db</c> SQLite database (table <c>retention</c>).
 /// Falls back to <see cref="ServerOptions.Retention"/> defaults on first run.
 /// Thread-safe — all writes serialize through a lock.
+///
+/// <para><b>Holds nothing open.</b> The policy is read once, in the constructor, and written when
+/// an admin changes it, so the store opens a connection for that and closes it — and the
+/// connection is NOT pooled, so closing it closes the file (<see cref="SegmentCountsStore"/> makes
+/// the same choice for the same reason). Pooled, Microsoft.Data.Sqlite parked the open connection
+/// in a process-wide pool keyed by the connection string: four handles on <c>Ameto.db</c>, its
+/// <c>-wal</c> and its <c>-shm</c>, and a mapping of the last, which outlived every <c>using</c>
+/// in this class and the store itself, until the pool pruned the idle connection minutes later
+/// (381 s, measured on 10.0.9), <c>SqliteConnection.ClearPool</c> was called, or the process
+/// ended. A server never notices: it has one data directory and keeps it until it exits. Whatever
+/// builds a store over a directory and then removes the directory does — on Windows the delete
+/// fails with a sharing violation on <c>Ameto.db</c>, and that is how every test that built a
+/// store left its data directory in TEMP. Pooling bought nothing in exchange: three statements at
+/// a start and one write per change of the settings.</para>
 /// </summary>
 public sealed class RetentionStore
 {
@@ -21,9 +35,21 @@ public sealed class RetentionStore
     public RetentionStore(ServerOptions options, ILogger<RetentionStore> logger)
     {
         _logger  = logger;
-        _connStr = $"Data Source={Path.Combine(options.DataDirectory, "Ameto.db")}";
-        InitTable();
-        var loaded = LoadFromDb();
+        _connStr = new SqliteConnectionStringBuilder
+        {
+            DataSource = Path.Combine(options.DataDirectory, "Ameto.db"),
+            Pooling    = false,
+        }.ToString();
+
+        // One connection, and one transaction, for everything the constructor does. Unpooled, each
+        // open is a real open and each close of the last connection a checkpoint; and each commit
+        // is an fsync, so the table and the first policy share one. On a database that holds both
+        // already, every later start, the transaction writes nothing and its commit is free: it
+        // costs the write lock (BEGIN IMMEDIATE, this library's default) for the length of a SELECT.
+        using var conn = OpenConn();
+        using var tx   = conn.BeginTransaction();
+        InitTable(conn, tx);
+        var loaded = LoadFromDb(conn, tx);
         var source = loaded is null ? "configuration" : "database";
         var dto    = loaded ?? new RetentionDto
         {
@@ -48,7 +74,8 @@ public sealed class RetentionStore
                 "Retention windows from the {Source} were outside {Min}…{Max} days and were clamped: {Before} → {After}",
                 source, RetentionMath.MinDays, RetentionMath.MaxDays, dto, clamped);
         _current = clamped;
-        if (loaded is null || changed) SaveToDb(_current);
+        if (loaded is null || changed) SaveToDb(conn, tx, _current);
+        tx.Commit();
     }
 
     /// <summary>Returns the current retention settings DTO.</summary>
@@ -72,7 +99,13 @@ public sealed class RetentionStore
         lock (_lock)
         {
             _current = dto;
-            try { SaveToDb(dto); }
+            try
+            {
+                using var conn = OpenConn();
+                using var tx   = conn.BeginTransaction();
+                SaveToDb(conn, tx, dto);
+                tx.Commit();
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed to persist retention settings");
@@ -82,10 +115,10 @@ public sealed class RetentionStore
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
-    private void InitTable()
+    private static void InitTable(SqliteConnection conn, SqliteTransaction tx)
     {
-        using var conn = OpenConn();
-        using var cmd  = conn.CreateCommand();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS retention (
                 level TEXT PRIMARY KEY,
@@ -95,12 +128,12 @@ public sealed class RetentionStore
         cmd.ExecuteNonQuery();
     }
 
-    private RetentionDto? LoadFromDb()
+    private static RetentionDto? LoadFromDb(SqliteConnection conn, SqliteTransaction tx)
     {
-        using var conn = OpenConn();
-        using var cmd  = conn.CreateCommand();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = "SELECT level, days FROM retention";
-        using var r    = cmd.ExecuteReader();
+        using var r   = cmd.ExecuteReader();
 
         var dict = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         while (r.Read())
@@ -121,7 +154,8 @@ public sealed class RetentionStore
         };
     }
 
-    private void SaveToDb(RetentionDto dto)
+    /// <summary>Writes the eight windows inside <paramref name="tx"/>; the caller commits.</summary>
+    private static void SaveToDb(SqliteConnection conn, SqliteTransaction tx, RetentionDto dto)
     {
         var levels = new[]
         {
@@ -135,8 +169,6 @@ public sealed class RetentionStore
             ("traces",      dto.TracesDays),
         };
 
-        using var conn = OpenConn();
-        using var tx   = conn.BeginTransaction();
         foreach (var (level, days) in levels)
         {
             using var cmd = conn.CreateCommand();
@@ -149,17 +181,25 @@ public sealed class RetentionStore
             cmd.Parameters.AddWithValue("@d", days);
             cmd.ExecuteNonQuery();
         }
-        tx.Commit();
     }
 
     private SqliteConnection OpenConn()
     {
         var conn = new SqliteConnection(_connStr);
-        conn.Open();
-        using var wal = conn.CreateCommand();
-        wal.CommandText = "PRAGMA journal_mode=WAL;";
-        wal.ExecuteNonQuery();
-        return conn;
+        try
+        {
+            conn.Open();
+            using var wal = conn.CreateCommand();
+            wal.CommandText = "PRAGMA journal_mode=WAL;";
+            wal.ExecuteNonQuery();
+            return conn;
+        }
+        catch
+        {
+            // Unpooled, a connection nobody disposes keeps the file open until a finalizer runs.
+            conn.Dispose();
+            throw;
+        }
     }
 }
 
