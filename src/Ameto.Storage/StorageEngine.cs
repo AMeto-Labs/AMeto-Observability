@@ -1148,8 +1148,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// running, and no <see cref="DisposeAsync"/> will ever come for it: it used to read the
     /// directory to its end in an engine nobody held, beside whatever its caller opened next. It
     /// is stopped and waited for as the teardown does it — between two files, within the shutdown
-    /// budget — on the thread the constructor is failing on. Never throws: the constructor's own
-    /// failure is what its caller must hear.
+    /// budget, with an Error for a scan that outlasts it — on the thread the constructor is failing
+    /// on. Never throws: the constructor's own failure is what its caller must hear.
     /// </summary>
     private void StopCatalogScanOfAFailedStart()
     {
@@ -1159,6 +1159,16 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             _catalogLoad.Wait(_shutdownWaitBudget);   // throws for a scan that ended Canceled or faulted: ended is all that is asked
         }
         catch (Exception) { /* however the scan ended */ }
+
+        if (_catalogLoad.IsCompleted) return;
+        try
+        {
+            _logger.LogError(
+                "The log engine failed to start, and the catalog scan of {Dir} it had begun had not ended {Budget}s after " +
+                "it was told to stop. It stops at its next check; until then it may hold a segment open",
+                _segDir, _shutdownWaitBudget.TotalSeconds);
+        }
+        catch (Exception) { /* the line is lost; the constructor's failure is not */ }
     }
 
     /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
@@ -8461,15 +8471,21 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         if (!_catalogLoad.IsCompleted)
         {
             _onWaitingForCatalogScan?.Invoke();
-            // However the scan ends, this does not throw for it; and a wait that cannot even be set up
-            // (out of memory) must not end the teardown here, before the final flush, any more than a
-            // loop that died above may. What the scan did is read off its task below.
-            try { await _catalogLoad.WaitAsync(Until(deadline)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing); }
-            catch (Exception) { /* the teardown goes on */ }
+            // However the scan ends — stopped, failed, or not within the budget — this does not throw
+            // for it: what it did is read off its task below.
+            //
+            // NOT in a try of its own, on purpose. All that can throw here is the wait's own setup
+            // running out of memory, and a catch would not make that road safe: a registration that
+            // fails leaves this method's later finallys unrun until a suspension resumes (see
+            // OwnerTaskMethodBuilder), so going on would reach the writer fence and the two lock
+            // statements below with their exits skipped — a write after the teardown then blocked for
+            // good where it should be refused. It ends the teardown instead, as it does at the
+            // CancelAsync above.
+            await _catalogLoad.WaitAsync(Until(deadline)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             if (!_catalogLoad.IsCompleted)
             {
-                // Nor may the line: a sink that threw on it ended the teardown before its final flush,
-                // the write path never closed and the log and counts.db left open.
+                // The line may not end it, though: a sink that threw on it ended the teardown before
+                // its final flush, the write path never closed and the log and counts.db left open.
                 try
                 {
                     _logger.LogError(

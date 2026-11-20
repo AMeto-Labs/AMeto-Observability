@@ -503,11 +503,12 @@ public sealed class CatalogScanShutdownTests : IDisposable
     }
 
     /// <summary>
-    /// Why the teardown waits for the scan BEFORE its last attempts at the parked deletes, and so
-    /// before its final flush: a segment the scan has open cannot be unlinked on Windows, and those
-    /// attempts are the last this process makes. The delete of a segment the scan is inside is
-    /// parked behind the scan's reader; the teardown waits the scan out of it, and its last attempt
-    /// then removes the file. Waited for any later, the attempt met the reader and the file stayed.
+    /// Why the teardown waits for the scan BEFORE its last attempts at the parked deletes (which is
+    /// what puts the wait before the final flush too: those attempts come first): a segment the
+    /// scan has open cannot be unlinked on Windows, and they are the last this process makes. The
+    /// delete of a segment the scan is inside is parked behind the scan's reader; the teardown
+    /// waits the scan out of it, and its last attempt then removes the file. Waited for any later,
+    /// the attempt met the reader and the file stayed.
     /// </summary>
     [StreamingMergeCrashSafetyTests.WindowsFact]
     public async Task The_last_attempts_at_parked_deletes_come_once_the_scan_has_let_go_of_its_segment()
@@ -552,25 +553,33 @@ public sealed class CatalogScanShutdownTests : IDisposable
         Assert.True(waited, "DisposeAsync returned — or hung — instead of waiting for the scan that had the segment open");
         Assert.False(File.Exists(path!),
             "the teardown made its last attempt at the parked delete while the scan still had the segment open: the file outlived the engine");
+        Assert.Equal(0, engine.PendingSegmentDeleteCount);
         Assert.DoesNotContain(engine.ListSegments(), s => Same(s.FilePath, path!));   // and the scan did not put it back
     }
 
     // ── What may not stop the teardown, or turn a stop into a failure ─────────
 
     /// <summary>
-    /// The scan's own line about its stop is said from inside its unwinding. A sink that throws on
-    /// it used to replace the cancellation: the scan's task faulted, and a store on its way down
-    /// read Degraded. The line is lost; the stop is still a stop.
+    /// The scan says two things from inside its unwinding: at Debug, the failure it drops because
+    /// shutdown had begun, and at Information, that it was stopped. A sink that throws on either
+    /// used to replace the cancellation — the scan's task faulted, and a store on its way down read
+    /// Degraded, with the Error of a scan that failed. Both lines are lost here, to a sink that
+    /// throws on each; the stop is still a stop.
     /// </summary>
     [Fact]
-    public async Task A_stop_whose_line_cannot_be_said_is_still_a_stop()
+    public async Task A_stop_whose_lines_cannot_be_said_is_still_a_stop()
     {
         var (dir, segments) = await StoreAsync(flushes: 2);
-        string at = segments[1];
+        string torn = segments[1];
+        Halve(torn);   // its read fails once shutdown has begun: the failure the scan drops, and says so
+        int thrown = 0;
         var log = new CapturingLogger();
-        log.OnLine = static line =>
+        log.OnLine = line =>
         {
-            if (line.Contains("was stopped by shutdown", StringComparison.Ordinal)) throw new InvalidOperationException("test: the log sink threw");
+            if (!line.Contains("was stopped by shutdown", StringComparison.Ordinal)
+                && !line.Contains("while the engine was shutting down", StringComparison.Ordinal)) return;
+            Interlocked.Increment(ref thrown);
+            throw new InvalidOperationException("test: the log sink threw");
         };
         var hold   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var engine = OpenHeld(dir, hold.Task, log);
@@ -579,7 +588,7 @@ public sealed class CatalogScanShutdownTests : IDisposable
         using var release = new ManualResetEventSlim();
         engine._beforeScanOpensSegment = file =>
         {
-            if (!Same(file, at)) return;
+            if (!Same(file, torn)) return;
             atFile.TrySetResult();
             release.Wait(HangGuard);
         };
@@ -597,10 +606,10 @@ public sealed class CatalogScanShutdownTests : IDisposable
         finally { await LetGoAsync(release, dispose, engine); }
 
         Assert.True(waited, "DisposeAsync returned — or hung — instead of waiting for the scan parked at a file");
-        var lines = log.Snapshot();
-        Assert.Contains(lines, static l => l.Message.Contains("was stopped by shutdown", StringComparison.Ordinal));   // setup: the line was written, and its sink threw
-        Assert.True(engine.CatalogLoaded.IsCanceled, "a sink that threw on the stop's line turned the stop into a scan that failed");
-        Assert.DoesNotContain(lines, static l => l.Level >= MsLogLevel.Error);
+        Assert.Equal(2, Volatile.Read(ref thrown));   // setup: both lines were written, and their sink threw on each
+        Assert.True(engine.CatalogLoaded.IsCanceled, "a sink that threw on one of the stop's lines turned the stop into a scan that failed");
+        Assert.DoesNotContain(log.Snapshot(), static l => l.Level >= MsLogLevel.Error);
+        Assert.True(File.Exists(torn));
     }
 
     /// <summary>
@@ -652,24 +661,25 @@ public sealed class CatalogScanShutdownTests : IDisposable
     }
 
     /// <summary>
-    /// Nor does a wait that cannot even be set up — the registration of the teardown's await on the
-    /// scan, out of memory. It is caught like the awaits of the loops above it: the teardown says
-    /// that the scan has not ended and goes on to its final flush, where it used to end.
+    /// What CAN end the teardown at its wait for the scan is the wait's own registration running
+    /// out of memory — and it is let to. Caught there, the method would go on with its later
+    /// finallys unrun until some await suspended and resumed (the owner builders' remarks): through
+    /// the writer fence and two lock statements, whose exits are among them. With nothing in the
+    /// live tier no final flush comes to put that right, the teardown reports the store closed, and
+    /// a write after it blocks for good where it should be answered. So the failure ends the
+    /// teardown, as it does at the await above it, and nothing is left locked.
     ///
-    /// <para>The seam fails the first suspension of <c>DisposeCoreAsync</c> on a configured task
-    /// awaiter — the wait for the scan is the only one before the final flush. (Should the method's
-    /// very first suspension ever be that wait, the seam is not asked, and the fact waits out its
-    /// short budget and passes for the other reason.)</para>
+    /// <para>The seam fails the teardown's first later suspension on a configured task awaiter,
+    /// which is the wait for the scan. THE ENGINE IS LEFT HALF TORN DOWN — the teardown is claimed,
+    /// a second <c>DisposeAsync</c> returns at once — and what it still holds is closed here.</para>
     /// </summary>
     [Fact]
-    public async Task A_wait_for_the_scan_that_cannot_be_set_up_does_not_end_the_teardown()
+    public async Task An_out_of_memory_at_the_wait_for_the_scan_ends_the_teardown_and_leaves_nothing_locked()
     {
         var (dir, segments) = await StoreAsync(flushes: 2);
         string stuck = segments[1];
-        var log    = new CapturingLogger();
         var hold   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var engine = OpenHeld(dir, hold.Task, log);
-        engine._shutdownWaitBudget = TimeSpan.FromSeconds(2);
+        var engine = OpenHeld(dir, hold.Task, new CapturingLogger());
 
         var atFile = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var release = new ManualResetEventSlim();
@@ -679,32 +689,43 @@ public sealed class CatalogScanShutdownTests : IDisposable
             atFile.TrySetResult();
             release.Wait(HangGuard);
         };
-        int swaps = 0;
-        engine._beforeSwap = () => Interlocked.Increment(ref swaps);
 
-        Task? dispose = null;
         try
         {
             hold.SetResult();
-            await atFile.Task.WaitAsync(HangGuard);
-            Write(engine, 10, LogLevel.Information);
+            await atFile.Task.WaitAsync(HangGuard);   // nothing is written: no final flush would resume the method
 
             int asked = 0;
             OwnerAsync.LaterSuspensionFailsForTest.Value = (stateMachine, awaiter) =>
                 stateMachine.Name.Contains("<DisposeCoreAsync>", StringComparison.Ordinal)
                 && awaiter == typeof(ConfiguredTaskAwaitable.ConfiguredTaskAwaiter)
                 && Interlocked.Increment(ref asked) == 1;
+            Task dispose;
             try { dispose = engine.DisposeAsync().AsTask(); }
             finally { OwnerAsync.LaterSuspensionFailsForTest.Value = null; }
-            await dispose.WaitAsync(TeardownGuard);    // rethrows what the teardown threw
 
-            Assert.False(engine.CatalogLoaded.IsCompleted, "setup: the scan ended while it was parked");
-            Assert.Contains(log.Snapshot(), static l =>
-                l.Level == MsLogLevel.Error && l.Message.Contains("had not ended after", StringComparison.Ordinal));
-            Assert.Equal(1, Volatile.Read(ref swaps));   // the final flush ran
-            Assert.Equal(QueryAvailability.Closed, engine.Availability);
+            var failure = await Record.ExceptionAsync(() => dispose.WaitAsync(TeardownGuard));
+            Assert.Equal(1, Volatile.Read(ref asked));   // setup: the wait for the scan was a later suspension, and the seam failed it
+            Assert.IsType<OutOfMemoryException>(failure);
+
+            // Nothing is left locked: a write is answered — taken, the write path was never closed — and a reader opens.
+            var write = Task.Run(() => engine.TryWrite(new LogEventHeader
+            {
+                TimestampUtcTicks        = DateTime.UtcNow.Ticks,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = engine.TemplatePool.Intern("evt {n}"),
+            }, Props(0)));
+            Assert.True(await write.WaitAsync(HangGuard), "a write after the teardown that failed was refused");
+            await Task.Run(() => engine.OpenHotTierReader().Dispose()).WaitAsync(HangGuard);
         }
-        finally { await LetGoAsync(release, dispose, engine); }
+        finally
+        {
+            release.Set();
+            try { await engine.DisposeAsync(); } catch { /* the teardown's own failure is the fact's, above */ }
+            await Task.WhenAny(engine.CatalogLoaded, Task.Delay(HangGuard));
+            engine.LiveWalForTest?.Dispose();
+            engine.CountsStoreForTest?.Dispose();
+        }
     }
 
     // ── The budget ────────────────────────────────────────────────────────────
@@ -928,41 +949,23 @@ public sealed class CatalogScanShutdownTests : IDisposable
         await Task.WhenAny(engine.CatalogLoaded, Task.Delay(HangGuard));
     }
 
-    /// <summary>"The directory is not empty" (ERROR_DIR_NOT_EMPTY), as an <see cref="Exception.HResult"/>.</summary>
-    private const int DirectoryNotEmpty = unchecked((int)0x80070091);
-
     /// <summary>
-    /// One plain <c>Directory.Delete</c> — what a host, or any teardown, may do the moment
-    /// <c>DisposeAsync</c> has returned — with NO retry for anything a handle of the engine's can
-    /// cause, and no pool clearing.
+    /// One plain <c>Directory.Delete</c>, and the directory gone after it — what a host, or any
+    /// teardown, may do the moment <c>DisposeAsync</c> has returned. No retry and no pool clearing:
+    /// a file the scan still had open fails the delete with a sharing violation naming it (the
+    /// scan's reader shares its file for reading only), and a retry would wait out the very handle
+    /// these facts are here to rule out.
     ///
-    /// <para>A file the scan still had open fails the delete with a sharing violation naming it:
-    /// the scan's reader shares its file for reading only. That fails the fact at once. "The
-    /// directory is not empty" is a different thing, and the one failure waited out here, for two
-    /// seconds: every file WAS deleted, and one of them is still open somewhere with delete sharing
-    /// — which is how a virus scanner reads a file written a moment ago, and how nothing the scan
-    /// opens is opened. The entry goes when that handle closes. (CI's runners scan in real time;
-    /// six of its runs made some four thousand single deletes of fresh directories and left none
-    /// behind, so this is for the day one does.)</para>
+    /// <para>Somebody else's handle that shares as little fails it the same way: a third party
+    /// reading a file written a moment ago. One that shares for delete, as a virus scanner's does,
+    /// does not — the entry is gone at once on this OS, and the runtime does not mind a directory
+    /// that is not yet empty (both measured in review). CI's runners scan in real time, and their
+    /// runs so far have left nothing behind from several hundred bare deletes each; should one
+    /// ever fail here, the message names the file it met.</para>
     /// </summary>
     private static void DeleteAtOnce(string dir)
     {
-        try
-        {
-            try { Directory.Delete(dir, recursive: true); }
-            catch (IOException notEmpty) when (notEmpty.HResult == DirectoryNotEmpty)
-            {
-                long until = Environment.TickCount64 + 2_000;
-                while (Directory.Exists(dir))
-                {
-                    try { Directory.Delete(dir, recursive: true); }
-                    catch (Exception again) when (again is IOException or UnauthorizedAccessException && Environment.TickCount64 < until)
-                    {
-                        Thread.Sleep(20);
-                    }
-                }
-            }
-        }
+        try { Directory.Delete(dir, recursive: true); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             string left = Directory.Exists(dir)
@@ -970,6 +973,7 @@ public sealed class CatalogScanShutdownTests : IDisposable
                 : "nothing";
             Assert.Fail($"The data directory could not be removed the moment DisposeAsync had returned: {ex.Message} Left: {left}");
         }
+        Assert.False(Directory.Exists(dir), $"Directory.Delete returned, and {dir} is still there");
     }
 
     /// <summary>Whether somebody has <paramref name="path"/> open: an open that shares nothing is refused.</summary>
