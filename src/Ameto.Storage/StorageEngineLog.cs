@@ -56,8 +56,10 @@ internal static partial class StorageEngineLog
     /// The catalog scan was STOPPED by shutdown before it had read every segment file — not the
     /// failure above: nothing is wrong with the directory, no restart is owed for it, and the files
     /// it did not reach are read by the next start, as after any stop. Information, once per scan
-    /// stopped on its way — the counterpart of the "Loaded … segments" line of a scan that ran to
-    /// its end; a scan shutdown overtook before it had started says nothing. The store stays
+    /// that met the stop — the counterpart of the "Loaded … segments" line of a scan that ran to
+    /// its end. A scan whose task was cancelled before a thread took it up says nothing (it never
+    /// ran); one that starts in that race, or is run by hand after the engine is gone, says it at
+    /// once, with whatever the catalog holds. The store stays
     /// <see cref="Ameto.Core.QueryAvailability.Loading"/> until its teardown closes it.
     /// </summary>
     [LoggerMessage(Level = LogLevel.Information,

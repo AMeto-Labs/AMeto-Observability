@@ -284,9 +284,9 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// Test hook: called by <see cref="DisposeAsync"/> as it starts waiting for the boot catalog
-    /// scan — only when the scan, told to stop, has not ended yet: it is inside a file. So a test
-    /// can tell "shutdown is waiting for the scan" from "shutdown went on without it" by which
-    /// happens first, with no timer.
+    /// scan — only when the scan, told to stop, has not ended yet (it is inside a file, or its
+    /// task has not been given a thread). So a test can tell "shutdown is waiting for the scan"
+    /// from "shutdown went on without it" by which happens first, with no timer.
     /// </summary>
     internal Action? _onWaitingForCatalogScan;
 
@@ -674,7 +674,10 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <see cref="_catalogScanShort"/>).</item>
     /// <item>FAULTED: the scan failed as a whole, and the catalog is short for good (#94).</item>
     /// <item>CANCELED: shutdown stopped it between two files, or before it began — a scan still
-    /// held by a test included. The catalog is short because the engine is going away, not because
+    /// held by a test included. Nothing but the engine's own end cancels it: the teardown, or a
+    /// constructor that fails after it has started the scan
+    /// (<see cref="StopCatalogScanOfAFailedStart"/>); a cancellation of any other kind is a scan
+    /// that failed, and faults. The catalog is short because the engine is going away, not because
     /// anything is wrong, and nothing that needs a scanned catalog may take this for one: the store
     /// stays <see cref="QueryAvailability.Loading"/> until the teardown closes it
     /// (<see cref="Availability"/>), the merge gate stays shut (<see cref="TryEnterMergeGate"/>), a
@@ -750,7 +753,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// an operator restarts, which a host may be configured to evaluate its rules on
     /// (<c>Ameto:Alerts:EvaluateOnDegradedStore</c>) — a store on its way down is not that store, and
     /// a rule resolved or fired on its half catalog in its last second would be #95 again. The scan's
-    /// task ends Canceled, and only shutdown cancels it (<see cref="_catalogLoad"/>).</para>
+    /// task ends Canceled, and nothing but the engine's own end cancels it (<see cref="_catalogLoad"/>).</para>
     ///
     /// <para>Four volatile reads at most (the task's state is one), no lock, no allocation.</para>
     /// </summary>
@@ -1095,17 +1098,27 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // A block an earlier run half-despilled waits for the scan (RunDespillLoopAsync): wake the loop when it ends.
         _catalogLoad.ContinueWith(static (_, s) => ((StorageEngine)s!).WakeDespill(), this,
             CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        ReplayOrphanedWals();
-        // After the replay, before the first WAL opens: their blocks must be reserved before
-        // anything new is handed one. They are despilled in the background, not here — a long
-        // spill can be gigabytes, and the server takes ingest from second zero.
-        DiscoverSpillFiles();
-        BeforeBootWalOpenForTest.Value?.Invoke();   // the window #131 is about; throwing from it is the crash in it
-        var (bootWal, bootSegId) = OpenWalCore();
-        _write = new WriteState(_write.Hot, bootWal, bootSegId);
-        // The empty and corrupt logs the replay spent: deleted only now, with the boot log — the new
-        // record on disk of the last block handed out — in place (#131; see ReplayOrphanedWal).
-        DeleteLogsSpentBeforeBootWal(bootWal);
+        try
+        {
+            ReplayOrphanedWals();
+            // After the replay, before the first WAL opens: their blocks must be reserved before
+            // anything new is handed one. They are despilled in the background, not here — a long
+            // spill can be gigabytes, and the server takes ingest from second zero.
+            DiscoverSpillFiles();
+            BeforeBootWalOpenForTest.Value?.Invoke();   // the window #131 is about; throwing from it is the crash in it
+            var (bootWal, bootSegId) = OpenWalCore();
+            _write = new WriteState(_write.Hot, bootWal, bootSegId);
+            // The empty and corrupt logs the replay spent: deleted only now, with the boot log — the new
+            // record on disk of the last block handed out — in place (#131; see ReplayOrphanedWal).
+            DeleteLogsSpentBeforeBootWal(bootWal);
+        }
+        catch
+        {
+            // A start that fails here fails with its scan already running, and nobody will dispose
+            // an engine that never came to be: the scan ends with it, here.
+            StopCatalogScanOfAFailedStart();
+            throw;
+        }
 
         // Age-based flush loop
         _flushLoop = RunFlushLoopAsync(_cts.Token);
@@ -1127,6 +1140,25 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // Last: a constructor that throws before here leaves no counts.db handle behind (review of
         // #158, N4). Nothing above reads the store; Open itself never throws.
         _countsStore = SegmentCountsStore.Open(_options.DataDirectory, logger);
+    }
+
+    /// <summary>
+    /// The constructor threw after it had started the catalog scan — the replay of an orphaned log,
+    /// or the open of the boot log, failed. The scan is the one thing of this engine already
+    /// running, and no <see cref="DisposeAsync"/> will ever come for it: it used to read the
+    /// directory to its end in an engine nobody held, beside whatever its caller opened next. It
+    /// is stopped and waited for as the teardown does it — between two files, within the shutdown
+    /// budget — on the thread the constructor is failing on. Never throws: the constructor's own
+    /// failure is what its caller must hear.
+    /// </summary>
+    private void StopCatalogScanOfAFailedStart()
+    {
+        try
+        {
+            _cts.Cancel();
+            _catalogLoad.Wait(_shutdownWaitBudget);   // throws for a scan that ended Canceled or faulted: ended is all that is asked
+        }
+        catch (Exception) { /* however the scan ended */ }
     }
 
     /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
@@ -6575,11 +6607,24 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// The boot scan of a test engine built to hold it (see the constructor's <c>bootScanHeldUntil</c>).
     /// The hold ends with the engine: shutdown cancels the wait, the scan never starts, and this task
     /// ends Canceled like a scan stopped on its way (see <see cref="_catalogLoad"/>).
+    ///
+    /// <para>Canceled for SHUTDOWN alone, as <c>Task.Run</c> keeps it for the constructor's own
+    /// scan. An async method ends Canceled for any cancellation that leaves it — a hold that was
+    /// itself cancelled, one a seam threw out of the scan — and a store whose scan never ran
+    /// would then read Loading for good, a merge Busy for good. Such a scan failed: it faults.</para>
     /// </summary>
     private async Task LoadSegmentCatalogOnceReleasedAsync(Task release)
     {
-        await release.WaitAsync(_shutdown).ConfigureAwait(false);
-        LoadSegmentCatalog();
+        try
+        {
+            await release.WaitAsync(_shutdown).ConfigureAwait(false);
+            LoadSegmentCatalog();
+        }
+        catch (OperationCanceledException ex) when (!_shutdown.IsCancellationRequested)
+        {
+            throw new InvalidOperationException(
+                "The boot catalog scan was cancelled, and not by the engine's shutdown: it did not run to its end", ex);
+        }
     }
 
     /// <summary>
@@ -6640,14 +6685,17 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// The scan itself. <paramref name="stop"/> is the engine's shutdown token, and the scan asks it
-    /// BETWEEN FILES: before the sweep's first manifest and between two of them, before each listed
-    /// segment, and before another attempt at one that would not open. A segment read whole is
-    /// registered as on any other day, and a manifest begun is recovered to its end. It asks once
-    /// more before it acts on a read that FAILED: a failure met while the engine is going down is
-    /// left for the next start to judge, so a scan that is ending renames nothing aside and counts
-    /// nothing against the store. So a shutdown waits for one file at most, not for the thousands a
-    /// large store lists (tens of seconds of scan), and what the scan leaves behind is what a crash
-    /// at the same point would: files the next start reads.
+    /// BETWEEN FILES: before the sweep's first manifest and between two of them, between the sweep
+    /// and the listing of the directory, before each listed segment, and before another attempt at
+    /// one that would not open. A segment read whole is registered as on any other day, and a
+    /// manifest begun is recovered to its end. It asks once more before it acts on a read that
+    /// FAILED: a failure met once shutdown has begun is left for the next start to judge — nothing
+    /// is set aside for it and nothing counted against the store (a file the scan had begun to set
+    /// aside before the stop, it finishes). So a shutdown waits for one unit of the scan at most —
+    /// one segment's read, the listing, or one manifest's recovery, which can be the read of a whole
+    /// merge output — not for the thousands of files a large store lists (tens of seconds of scan),
+    /// and what the scan leaves behind is what a crash at the same point would: files the next
+    /// start reads.
     ///
     /// <para>It used to run on after <see cref="DisposeAsync"/> had returned — opening segments
     /// (a handle and a mapping each, which on Windows keep a file from being deleted), registering
@@ -6667,6 +6715,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // listing and inside this scan's recording window: a source it cannot unlink is parked
         // and one it unlinks is recorded, so the enumeration below skips it either way (#98).
         RecoverInterruptedMerges(stop);
+
+        // And between the sweep and the listing: a stop that came while the sweep was in its last
+        // manifest. Without this the directory was still listed and sorted — a store with no segment
+        // in it then read as scanned to its end — and a listing is not always harmless once the
+        // engine is gone: of a directory its host has removed by then, it is a scan that FAILED.
+        stop.ThrowIfCancellationRequested();
 
         // Sorted, and a key is claimed once. The assignment this replaces was unconditional and
         // ran in Directory.EnumerateFiles order, so a directory already holding two files under
@@ -6781,7 +6835,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
                 // and a failure met once shutdown has begun, which is nobody's verdict. Nothing is
                 // set aside, called unreachable or counted against the store by a scan that is
                 // ending anyway; the next start reads the file and decides.
-                stop.ThrowIfCancellationRequested();
+                if (stop.IsCancellationRequested)
+                {
+                    // Not dropped without a word, though. Guarded: a throw from here would leave as
+                    // the scan failing as a whole — its Error, and a store Degraded on its way down.
+                    if (ex is not OperationCanceledException)
+                    {
+                        try
+                        {
+                            _logger.LogDebug(ex,
+                                "Segment {File} could not be read while the engine was shutting down; the catalog scan " +
+                                "stops here, and the next start reads the file and decides what it is", file);
+                        }
+                        catch (Exception) { /* the line is lost; the stop is not */ }
+                    }
+                    stop.ThrowIfCancellationRequested();
+                }
 
                 // Not unreadable: a delete got there first. Retention runs beside this scan, so a
                 // delete can reach a file between the listing above and the open, unlink it
@@ -8398,11 +8467,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             try { await _catalogLoad.WaitAsync(Until(deadline)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing); }
             catch (Exception) { /* the teardown goes on */ }
             if (!_catalogLoad.IsCompleted)
-                _logger.LogError(
-                    "Shutdown: the boot catalog scan of {Dir} was still running after {Budget}s — it is inside one " +
-                    "file (a read that has not returned, or the recovery of one interrupted merge) and stops when " +
-                    "that ends; until then it may hold that file open. The rest of the teardown goes on without it",
-                    _segDir, _shutdownWaitBudget.TotalSeconds);
+            {
+                // Nor may the line: a sink that threw on it ended the teardown before its final flush,
+                // the write path never closed and the log and counts.db left open.
+                try
+                {
+                    _logger.LogError(
+                        "Shutdown: the boot catalog scan of {Dir} had not ended after {Budget}s. It has been told to stop, " +
+                        "and does at its next check: it is inside one file (a read that has not returned, the recovery of " +
+                        "one interrupted merge), in the listing of the directory, or has not been given a thread yet. " +
+                        "Until it ends it may hold a segment open. The rest of the teardown goes on without it",
+                        _segDir, _shutdownWaitBudget.TotalSeconds);
+                }
+                catch (Exception) { /* the line is lost; the teardown is not */ }
+            }
         }
         // Deferred segment deletes: cancellation ends the retry loop's delay at once, so this
         // waits out at most one pass in progress, never a backoff. Then one last attempt each;
