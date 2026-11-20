@@ -1,5 +1,6 @@
 using System.Security.Claims;
 using Ameto.Server.Auth;
+using Ameto.Testing;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Ameto.Integration.Tests;
@@ -20,10 +21,8 @@ public sealed class AuthRevocationsTests : IDisposable
         _store = new AuthStore(_db, new AuthOptions { AdminPassword = "seeded-for-tests" }, NullLogger<AuthStore>.Instance);
     }
 
-    public void Dispose()
-    {
-        try { Directory.Delete(_dir, recursive: true); } catch { /* SQLite handles may linger */ }
-    }
+    // AuthDatabase pools its connections to Ameto.db, as a server wants; the helper clears the pool.
+    public void Dispose() => TestDataDirectory.Delete(_dir);
 
     private void InsertSession(string id, string userId, DateTimeOffset? revokedAt)
     {

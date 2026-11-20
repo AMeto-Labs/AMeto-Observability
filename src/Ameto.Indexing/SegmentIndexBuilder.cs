@@ -81,7 +81,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// What the previous group measured (distinct terms and trigrams), to pre-size the
     /// accumulators; the builder writes its own counts back when it seals. Optional.
     /// </param>
-    public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5,
+    public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = IndexingOptions.DefaultMaxPropertyFlattenDepth,
                                int estimatedTermsPerEvent = EstimatedBloomTermsPerEvent,
                                IndexBuildHints? hints = null, Microsoft.Extensions.Logging.ILogger? log = null)
     {
@@ -211,14 +211,21 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     // does not — its bloom term is the bucket's name — and it keeps its own account: see
     // AddExists.
     //
-    // Two things that rule does NOT make true, said here so the sentences above are read as
-    // narrowly as they hold. The KEY of such a property: where the header made the bucket,
-    // the walk never sees the key as new and never adds it, so for that input the filter
-    // differs from the reference build's by that one term. Nothing asks the bloom for a
-    // property's name — the gate probes values — so no query can tell. And a term two
-    // SCALARS share: a string that spells another value's type-tagged form ("\0l5" beside
-    // the long 5) is that value's term with a different bloom text, and whichever of the two
-    // is filed second is skipped. That one does cost rows (`P = 5` after a flush), and is open.
+    // One thing that rule does NOT make true, said here so the sentences above are read as
+    // narrowly as they hold: the KEY of such a property. Where the header made the bucket, the
+    // walk never sees the key as new and never adds it, so for that input the filter differs
+    // from the reference build's by that one term. Nothing asks the bloom for a property's
+    // name — the gate probes values — so no query can tell.
+    //
+    // The same meeting happens between two SCALARS. The inverted index files a typed value
+    // under a type-tagged form (`\0l5` for the long 5) and a string under its own bytes, so a
+    // string that begins with NUL can spell a typed value's term exactly, and the two then
+    // share it with different bloom texts. Whichever was filed second used to be skipped, and
+    // `P = 5` found nothing once flushed beside the string "\0l5". Such a string now always
+    // gives the bloom its text and marks its property, and a typed value under a marked
+    // property always gives its own: see MaySpellATypedTerm. The three header strings a client
+    // controls follow the same rule (AddHeaderString); the level and the ids are the server's
+    // own text and never begin with NUL.
 
     private static readonly byte[][] LevelUtf8 = BuildLevelTable();
 
@@ -283,10 +290,23 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 _serviceLen = System.Text.Encoding.UTF8.GetBytes(service, _serviceUtf8);
                 _serviceRef = service;
             }
-            var svc = _serviceUtf8.AsSpan(0, _serviceLen);
-            if (_inverted.AddUtf8(offset, "@service"u8, svc) != IndexAddOutcome.Existing) _bloom.AddUtf8(svc);
-            _bloomPresented++;
+            AddHeaderString(offset, "@service"u8, _serviceUtf8.AsSpan(0, _serviceLen));
         }
+    }
+
+    /// <summary>
+    /// Files one of the header strings a client controls — the service, an exception's type or
+    /// inner type — and gives the bloom its text on first sight, or every time when it may spell
+    /// a typed term (<see cref="MaySpellATypedTerm"/>): a client property named like the bucket
+    /// can file a typed value in it, which would share the term with a different text.
+    /// </summary>
+    private void AddHeaderString(uint offset, ReadOnlySpan<byte> bucket, ReadOnlySpan<byte> value)
+    {
+        int  prop   = _inverted.PropertyId(bucket, out _);
+        bool tagged = MaySpellATypedTerm(value);
+        if (tagged) NoteTaggedSpelling(prop);
+        if (_inverted.AddValue(offset, prop, value) == IndexAddOutcome.NewValue || tagged) _bloom.AddUtf8(value);
+        _bloomPresented++;
     }
 
     private string? _serviceRef;
@@ -350,8 +370,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 if (!type.IsEmpty)
                 {
                     type = WellFormed(type);
-                    if (_inverted.AddUtf8(offset, "@x.type"u8, type) != IndexAddOutcome.Existing) _bloom.AddUtf8(type);
-                    _bloomPresented++;
+                    AddHeaderString(offset, "@x.type"u8, type);
                     TrigramUtf8(offset, type);
                 }
                 // ExceptionInfo.Read keeps an empty message as "" and the object path indexes
@@ -362,8 +381,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 if (!innerType.IsEmpty)
                 {
                     innerType = WellFormed(innerType);
-                    if (_inverted.AddUtf8(offset, "@x.inner.type"u8, innerType) != IndexAddOutcome.Existing) _bloom.AddUtf8(innerType);
-                    _bloomPresented++;
+                    AddHeaderString(offset, "@x.inner.type"u8, innerType);
                 }
             }
             finally
@@ -663,14 +681,20 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             {
                 ReadOnlySpan<byte> v = ReadStr(ref reader);
                 int prop = _inverted.PropertyId(flatKey, out bool newKey);
+                // Marked BEFORE it is filed, as AddHeaderString does: a filed string whose property
+                // is not marked is the one state the rule must never leave behind, and the mark can
+                // throw (it may grow the bitset).
+                bool tagged = MaySpellATypedTerm(v);
+                if (tagged) NoteTaggedSpelling(prop);
                 var r    = _inverted.AddValue(offset, prop, v);          // serialised == plain for strings
                 _bloomPresented += 2;
                 if (newKey) _bloom.AddUtf8(flatKey);
-                // New to the inverted index — or a repeat the bloom has not been given: the
-                // exception marker's own term, met by a client's value for the first time
-                // (see AddExists). The debt is struck off once the text is in the filter.
+                // New to the inverted index — or a repeat the bloom may not have been given: a
+                // string that may spell a typed value's term (see MaySpellATypedTerm), or the
+                // exception marker's own term met by a client's value for the first time (see
+                // AddExists; that debt is struck off once the text is in the filter).
                 bool owed = r == IndexAddOutcome.Existing && prop == _markerOwesBloom && v.SequenceEqual(MarkerValue);
-                FoldValue(offset, v, bloom: owed || r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
+                FoldValue(offset, v, bloom: owed || tagged || r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
                 if (owed) _markerOwesBloom = -1;
                 break;
             }
@@ -707,7 +731,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 var r    = _inverted.AddValue(offset, prop, b ? "\0true"u8 : "\0false"u8);
                 _bloomPresented += 2;
                 if (newKey) _bloom.AddUtf8(flatKey);
-                if (r == IndexAddOutcome.NewValue) _bloom.Add(b ? "TRUE"u8 : "FALSE"u8);   // "True"/"False" folded
+                if (r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop)) _bloom.Add(b ? "TRUE"u8 : "FALSE"u8);   // "True"/"False" folded
                 _trigram.AddFoldedAscii(offset, b ? "TRUE"u8 : "FALSE"u8);
                 break;
             }
@@ -718,7 +742,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 var r    = _inverted.AddValue(offset, prop, "\0null"u8);
                 _bloomPresented += 2;
                 if (newKey) _bloom.AddUtf8(flatKey);
-                if (r == IndexAddOutcome.NewValue) _bloom.Add(ReadOnlySpan<byte>.Empty);   // v?.ToString() ?? "" → ""
+                if (r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop)) _bloom.Add(ReadOnlySpan<byte>.Empty);   // v?.ToString() ?? "" → ""
                 break;
             }
             default:
@@ -758,8 +782,52 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         var r    = _inverted.AddValue(offset, prop, serialised);
         _bloomPresented += 2;
         if (newKey) _bloom.AddUtf8(flatKey);
-        FoldValue(offset, plain, bloom: r == IndexAddOutcome.NewValue, trigram: true);
+        FoldValue(offset, plain, bloom: r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop), trigram: true);
     }
+
+    // ── Strings that may spell a typed term ────────────────────────────────────
+
+    /// <summary>
+    /// Whether a string's bytes may spell a typed value's TERM — the type-tagged form the inverted
+    /// index files a typed value under (<see cref="IndexValueForms.Serialise"/>: <c>\0l5</c>,
+    /// <c>\0d2.5</c>, <c>\0true</c>, <c>\0null</c>) while it files a string as its own bytes.
+    ///
+    /// <para>Every tag begins with NUL, and a value filed without one is filed under its own text
+    /// (a number too large for a long), so no other string can: a term that a string not beginning
+    /// with NUL shares was filed under the same bytes with the same text — by a string, a header
+    /// string or such a number — or by the exception marker, which keeps its own account
+    /// (<see cref="AddExists"/>). A string that does begin with NUL may be a typed value's term
+    /// with the other text, and is handled on both sides. It always gives the bloom its own text,
+    /// and it marks its property (<see cref="NoteTaggedSpelling"/>) so that a typed value under it
+    /// always gives its own. <c>BloomFirstSightTests</c> pins the forms this rests on — the walk's
+    /// own, which production files, and <see cref="IndexValueForms.Serialise"/>'s, which the
+    /// reference build files.</para>
+    ///
+    /// <para>What it costs: one byte read per string. A property that never holds such a string —
+    /// every property of every ordinary client — pays nothing more; one that does gives up the
+    /// first-sight shortcut for its typed values and those strings, which is what every value
+    /// cost before the shortcut existed.</para>
+    /// </summary>
+    private static bool MaySpellATypedTerm(ReadOnlySpan<byte> value) => !value.IsEmpty && value[0] == 0;
+
+    /// <summary>
+    /// One bit per property id, set once a string that may spell a typed term
+    /// (<see cref="MaySpellATypedTerm"/>) has been filed under that property; null until the
+    /// first — which most groups never meet, so they allocate nothing for it.
+    /// </summary>
+    private ulong[]? _taggedSpellings;
+
+    private void NoteTaggedSpelling(int prop)
+    {
+        int word = prop >> 6;
+        if (_taggedSpellings is null || word >= _taggedSpellings.Length)
+            Array.Resize(ref _taggedSpellings, Math.Max(word + 1, (_taggedSpellings?.Length ?? 0) * 2));
+        _taggedSpellings[word] |= 1UL << (prop & 63);
+    }
+
+    /// <summary>Whether a string that may spell a typed term has been filed under <paramref name="prop"/>.</summary>
+    private bool HasTaggedSpelling(int prop) =>
+        _taggedSpellings is { } bits && prop >> 6 < bits.Length && (bits[prop >> 6] & (1UL << (prop & 63))) != 0;
 
     /// <summary>
     /// Case-folds a value once and feeds the bloom (if asked) and the trigram from the same

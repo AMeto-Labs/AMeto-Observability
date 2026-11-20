@@ -1,4 +1,5 @@
 using Ameto.Server.Auth;
+using Ameto.Testing;
 using Microsoft.Extensions.Logging;
 
 namespace Ameto.Integration.Tests;
@@ -39,10 +40,8 @@ public sealed class OAuthIdentityBindingTests : IDisposable
             Lines.Add(formatter(state, exception));
     }
 
-    public void Dispose()
-    {
-        try { Directory.Delete(_dir, recursive: true); } catch { /* WAL handles may linger */ }
-    }
+    // AuthDatabase pools its connections to Ameto.db, as a server wants; the helper clears the pool.
+    public void Dispose() => TestDataDirectory.Delete(_dir);
 
     [Fact]
     public void AnAllowlistedRowAdoptsTheFirstSubjectThatSignsIn()

@@ -3,6 +3,7 @@ using System.Net;
 using Ameto.Alerts;
 using Ameto.Core;
 using Ameto.Replication;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -24,10 +25,9 @@ public sealed class LoopGuardTests : IDisposable
 
     public void Dispose()
     {
-        // The pool keeps Ameto.db open after the stores are gone; on Windows the delete then fails and the
-        // directory stays in TEMP for ever.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        try { Directory.Delete(_dir, recursive: true); } catch { }
+        // The pool keeps Ameto.db open after the alert stores are gone; on Windows the delete then fails and
+        // the directory stays in TEMP for ever. The helper clears it, and fails the fact if the directory stays.
+        TestDataDirectory.Delete(_dir);
     }
 
     /// <summary>A logger that throws an <see cref="OutOfMemoryException"/> from the lines a predicate picks.</summary>
