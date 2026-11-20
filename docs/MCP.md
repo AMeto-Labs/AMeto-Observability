@@ -125,7 +125,7 @@ listed among the profile's services.
 | `logs_search` | Events matching a filter, grouped by message template. |
 | `logs_aggregate` | A table: `select count(*) where @l = 'Error' group by @service`. |
 | `logs_context` | One event in full, the events of its service just before and after it, and the events of its trace. |
-| `logs_fields` | The properties found in recent events: how often, which type, sample values, whether hidden — `= only` for a field hidden in every service, `= only, no token` for one that some service shows as stored (see [Tokens](#tokens)). Ends with a filter-syntax reference. |
+| `logs_fields` | The properties found in recent events: how often, which type, sample values, whether hidden — `= only` for a field hidden in every service the profile reads, `= only, no token` for one that some of them show as stored (see [Tokens](#tokens)). Ends with a filter-syntax reference. |
 
 A built-in tool can be switched off for the whole server (Settings → AI / MCP → Tools, or
 `disabledTools` in `PUT /api/mcp/settings`). It is then offered to no profile, whatever the
@@ -288,6 +288,13 @@ A rule names a property and what happens to its value.
 - A rule on a property that holds an object or a list hides the whole value under one token,
   and everything under it: with a rule on `Buyer`, a filter or a `group by` on `Buyer.Name` is
   one on a hidden field.
+- "Under it" is by the dots of the path as it is spelled, whether a dot stands between an object
+  and its property or inside one name. An OTLP attribute is one property with dots in its name —
+  `client.address`, `user.id` — and a filter spells it as it spells a property of an object, so a
+  rule reads both the same way: a rule on `client` covers the object `client` and the attributes
+  `client.address` and `client.id` alike. That goes for `keep` as for the others.
+- `keepLast4` cuts the value at its own path. What is spelled under that path is hidden whole —
+  there are no last four characters of an object.
 - The elements of a list are named by the list's own path: `Items.Sku` is the `Sku` of every
   item, whichever way a filter spells the position — `Items[0].Sku`, `Items.0.Sku`,
   `Items[' 0'].Sku`. What counts as a position is asked of the query engine itself, so the
@@ -363,9 +370,11 @@ field that shows its values as stored — `Attempt = 'h:…'` — it would find 
 open there, and the next `logs_context`, a `sum` with a `count` beside it, or a run of
 `Attempt > n` would read it. So a token may stand only against:
 
-- a property hidden whole in every service: a `hash` or `remove` rule that holds for every service
-  names it (or a path above it), or the profile is in Strict mode and no rule shows it.
-  `logs_fields` marks such a property `= only`;
+- a property hidden whole in every service the profile reads: in each of them a `hash` or a
+  `remove` decides it (on the property or on a path above it), or the profile is in Strict mode
+  and no rule shows it. A profile of one service is judged by that service's rules; a profile
+  that reads every service needs a rule that holds for every service. `logs_fields` marks such a
+  property `= only`;
 - for a value a detector hides whole wherever an equality can find it — a card number, an IIN,
   an email address — any property no `keep` or `keepLast4` rule names, in any service: the
   detector hides it there as well. An equality compares texts without regard to case, and a text
@@ -377,10 +386,17 @@ open there, and the next `logs_context`, a `sum` with a `count` beside it, or a 
   number gone.
 
 Anything else is refused with a sentence that says so, before anything is read: a property no rule
-hides, one a rule hides in some services only (`= only, no token` in `logs_fields`), one a `keep`
-or a `keepLast4` shows somewhere — the last four characters are the whole of a short value — and a
-built-in field (`@service = 'h:…'`, `@x.type = 'h:…'`), which no hidden value is kept in and every
-answer shows as it is.
+hides, one a rule hides in only some of the services the profile reads (`= only, no token` in
+`logs_fields`), one a `keep` or a `keepLast4` shows in any of them — the last four characters are
+the whole of a short value — and a built-in field (`@service = 'h:…'`, `@x.type = 'h:…'`), which no
+hidden value is kept in and every answer shows as it is.
+
+A path is judged in every way the engine can read it. `Items.0.Sku` is the first element of a
+list (which the rules name `Items.Sku`) or the property `Sku` of a property named `0`, and
+`client.id` an object's property or one name: a token is compared only if the value is hidden in
+all of them, and a filter is held to "equality only" if it is hidden in any. (A path with more
+than six segments that read as positions is not read out every way: it counts as hidden, and
+takes no token.)
 
 The events a token finds are shown as any answer shows them. An open field that happens to hold
 the same value is shown as stored, not as the token: shown as the token, it would say which open
@@ -399,10 +415,10 @@ only — against a token, or against a value the person already has. Anything el
 `contains`, `startsWith`, `<`, `length()`, `regexMatch()`, a comparison with another field) is
 refused, and so is an aggregate other than a count: `min(CardNumber)` is a card number.
 
-A field is hidden by every road to it: under a rule on its parent, in any service a rule names,
-through a list position however it is spelled. And nothing reads a hidden value through its
-parent — the functions that could (`toJson()`, `elementAt()`, `keys()`, `values()`,
-`fromJson()`) are not among those a filter here is built from.
+A field is hidden by every road to it: under a rule on its parent or on the first part of its
+name, in any service a rule names, through a list position however it is spelled. And nothing
+reads a hidden value through its parent — the functions that could (`toJson()`, `elementAt()`,
+`keys()`, `values()`, `fromJson()`) are not among those a filter here is built from.
 
 ### Aggregates
 
@@ -448,7 +464,9 @@ parent — the functions that could (`toJson()`, `elementAt()`, `keys()`, `value
 - **The shape of a hidden value can be asked about.** `has(Recipients[2])` says whether a hidden
   list has a third element, `has(Limits['a@example.com'])` whether a hidden map has that key, and
   `Customer = Payer` whether two objects are equal, hidden fields and all. Each is one yes or no,
-  of the same kind as a guessed equality.
+  of the same kind as a guessed equality. So is what a refusal tells: a token compared with a
+  field no rule hides is let through only when its value is a card number, an IIN or an email
+  address, so whether a value hidden by a rule has one of those shapes can be told.
 - **Built-in fields are never hidden**: the timestamp, level, service, trace and span ids, event
   references.
 

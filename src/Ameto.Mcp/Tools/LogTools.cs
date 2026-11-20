@@ -172,7 +172,7 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
                 out var from, out var to, out string? windowNote, out string? error))
             return ToolResult.Refused(RefusalKind.Input, error!);
 
-        var prepared = FilterGuard.Prepare(call.Str("filter"), call.Policy, store.Vault);
+        var prepared = FilterGuard.Prepare(call.Str("filter"), call.Policy, store.Vault, call.Profile.Services);
         if (prepared.Error is not null) return ToolResult.Refused(prepared.Kind, prepared.Error, call.Str("filter"));
 
         string? service = call.Str("service");
@@ -224,14 +224,14 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         var (bound, reference, bindError) = PublishedToolBinder.Bind(tool, call.Args);
         if (bindError is not null) return ToolResult.Refused(RefusalKind.Input, bindError);
 
-        var prepared = FilterGuard.Prepare(bound, call.Policy, store.Vault);
+        var prepared = FilterGuard.Prepare(bound, call.Policy, store.Vault, call.Profile.Services);
         if (prepared.Error is not null) return ToolResult.Refused(prepared.Kind, prepared.Error, bound);
 
         // An argument is a value, bound in as a quoted literal — and this is where that is
         // checked rather than trusted: the filter with the arguments in it has to be the filter
         // the tool's author wrote, shape for shape. If quoting ever let a value through as more
         // than a value, the two would differ, and the call would stop here.
-        var written = FilterGuard.Prepare(reference, call.Policy, store.Vault);
+        var written = FilterGuard.Prepare(reference, call.Policy, store.Vault, call.Profile.Services);
         if (written.Error is not null || !string.Equals(FilterGuard.Shape(written.Node), FilterGuard.Shape(prepared.Node), StringComparison.Ordinal))
             return ToolResult.Refused(RefusalKind.Input,
                 $"These arguments would change the filter of {tool.Name} itself, not only the values in it. The call was not run.", bound);
@@ -707,10 +707,10 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
                     info.Count.ToString(CultureInfo.InvariantCulture),
                     string.Join('|', info.Types),
                     // "= only": tested for equality only, and a token may be compared with it. A
-                    // field some service shows as stored is tested the same way, but a token
-                    // compared with it would find its value there in the open.
+                    // field that some service this profile reads shows as stored is tested the
+                    // same way, but a token compared with it would find its value there in the open.
                     !policy.HidesField(info.Stored) ? ""
-                        : policy.HidesEverywhere(info.Stored) ? "= only" : "= only, no token",
+                        : policy.HidesEverywhere(info.Stored, call.Profile.Services) ? "= only" : "= only, no token",
                     string.Join(", ", info.Examples),
                 ]);
             sb.Append('\n');

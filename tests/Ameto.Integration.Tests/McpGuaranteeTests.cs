@@ -793,6 +793,108 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
         static string Body(string answer) => answer[(answer.IndexOf('\n') + 1)..];
     }
 
+    /// <summary>
+    /// The fourth review's hole. An OTLP attribute is ONE property with dots in its name, and a
+    /// rule on the first part of that name — "hide netpeer.*" — was read one way by the guard
+    /// and another by the answer: the guard took <c>netpeer.id</c> for a field under a hidden
+    /// one and let a token meet it, <c>logs_fields</c> marked it "= only", and the answer wrote
+    /// the attribute out as stored. One call, and the token was read.
+    /// </summary>
+    [Fact]
+    public async Task ARuleOnTheFirstPartOfADottedName_HidesTheAttribute_InTheAnswerAsInTheGuard()
+    {
+        var admin = await host.AdminAsync();
+        await Rule(admin, new { field = "netpeer", action = "hash" });
+        await Rule(admin, new { field = "MemberRef", action = "hash" });
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin,
+            new(service, "Joined {Who}")  { Properties = { ["Who"] = "member", ["MemberRef"] = "C-77-0412" } },
+            new(service, "Dialled {Who}") { Properties = { ["Who"] = "caller", ["netpeer.id"] = "C-77-0412", ["netpeer.port"] = 8443 } });
+        var (_, key) = await McpTesting.CreateProfileAsync(admin, new { name = "dotted names", services = new[] { service } });
+        await using var client = await McpTesting.ConnectAsync(host, key);
+
+        var (member, _) = await Call(client, "logs_search", ("filter", "has(MemberRef)"));
+        string token = McpTesting.Token.Match(member).Value;
+        Assert.NotEmpty(token);
+
+        // The attribute is hidden wherever it is shown: its text and the number beside it…
+        var (all, _) = await Call(client, "logs_search");
+        Assert.Contains("2 events", all);
+        Assert.DoesNotContain("C-77-0412", all);
+        Assert.Matches(@"caller\s+h:[0-9a-f]{12}\s+h:[0-9a-f]{12}", all);
+        var (fields, _) = await Call(client, "logs_fields");
+        Assert.DoesNotContain("C-77-0412", fields);
+        Assert.Matches(@"netpeer\.id\s+1\s+string\s+= only\s+h:[0-9a-f]{12}", fields);
+
+        // …so the token finds it and the answer shows the token, by either spelling of the name.
+        foreach (string name in (string[])["netpeer.id", "['netpeer.id']"])
+        {
+            var (found, isError) = await Call(client, "logs_search", ("filter", $"{name} = '{token}'"));
+            Assert.False(isError, found);
+            Assert.Contains("1 event", found);
+            Assert.Contains("caller", found);
+            Assert.Contains(token, found);
+            Assert.DoesNotContain("C-77-0412", found);
+        }
+
+        // And what may not be asked of a hidden field may not be asked of this one.
+        foreach (var (tool, argument, text) in ((string, string, string)[])
+                 [
+                     ("logs_search",    "filter", "netpeer.id like 'C-7%'"),
+                     ("logs_search",    "filter", "netpeer.port > 8000"),
+                     ("logs_aggregate", "query",  "select max(netpeer.port)"),
+                 ])
+        {
+            var (answer, isError) = await Call(client, tool, (argument, text));
+            Assert.True(isError, answer);
+            Assert.Contains("hidden field", answer);
+        }
+        var (grouped, groupedError) = await Call(client, "logs_aggregate", ("query", "select count(*) group by netpeer.id"));
+        Assert.False(groupedError, grouped);
+        Assert.DoesNotContain("C-77-0412", grouped);
+        Assert.Contains(token, grouped);
+    }
+
+    /// <summary>
+    /// A rule for one service hides the field in that service only: a token is compared with it
+    /// by a profile that reads that service alone, and by no profile that reads more — to which
+    /// <c>logs_fields</c> says so.
+    /// </summary>
+    [Fact]
+    public async Task ATokenUnderARuleOfOneService_IsComparedByAProfileOfThatService()
+    {
+        var admin = await host.AdminAsync();
+        string service = McpTesting.NewService(), other = McpTesting.NewService();
+        await Rule(admin, new { field = "TenantRef", action = "hash", services = new[] { service } });
+        await McpTesting.IngestAsync(admin,
+            new(service, "Billed {Who}") { Properties = { ["Who"] = "one", ["TenantRef"] = "T-778899" } },
+            new(service, "Billed {Who}") { Properties = { ["Who"] = "two", ["TenantRef"] = "T-778899" } },
+            new(other,   "Billed {Who}") { Properties = { ["Who"] = "elsewhere", ["TenantRef"] = "T-778899" } });
+        var (_, ownKey)  = await McpTesting.CreateProfileAsync(admin, new { name = "reads one service", services = new[] { service } });
+        var (_, wideKey) = await McpTesting.CreateProfileAsync(admin, new { name = "reads two services", services = new[] { service, other } });
+        await using var own  = await McpTesting.ConnectAsync(host, ownKey);
+        await using var wide = await McpTesting.ConnectAsync(host, wideKey);
+
+        var (search, _) = await Call(own, "logs_search");
+        Assert.DoesNotContain("T-778899", search);
+        string token = McpTesting.Token.Match(search).Value;
+        Assert.NotEmpty(token);
+
+        var (found, foundError) = await Call(own, "logs_search", ("filter", $"TenantRef = '{token}'"));
+        Assert.False(foundError, found);
+        Assert.Contains("2 events", found);
+        Assert.DoesNotContain("T-778899", found);
+        var (ownFields, _) = await Call(own, "logs_fields");
+        Assert.Matches(@"TenantRef\s+2\s+string\s+= only\s+h:[0-9a-f]{12}", ownFields);
+
+        // The wider profile is shown the field as stored in the other service: there the token would be read.
+        var (refused, refusedError) = await Call(wide, "logs_search", ("filter", $"TenantRef = '{token}'"));
+        Assert.True(refusedError, refused);
+        Assert.Contains("shows its values as they are stored", refused);
+        var (wideFields, _) = await Call(wide, "logs_fields");
+        Assert.Matches(@"TenantRef\s+3\s+string\s+= only, no token", wideFields);
+    }
+
     [Fact]
     public async Task ThePreview_SaysWhichStoredPropertyEachSentOneIs()
     {

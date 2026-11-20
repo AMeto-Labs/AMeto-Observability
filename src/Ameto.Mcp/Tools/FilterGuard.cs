@@ -80,8 +80,12 @@ internal static class FilterGuard
 
     // ── Search filters ────────────────────────────────────────────────────────
 
-    /// <summary>Parses and judges a search filter, and resolves its tokens. An empty filter is ready as it is.</summary>
-    public static Prepared Prepare(string? filter, MaskingPolicy policy, TokenVault vault)
+    /// <summary>
+    /// Parses and judges a search filter, and resolves its tokens. An empty filter is ready as it is.
+    /// <paramref name="services"/> are the services the asking profile reads — null or empty for
+    /// all of them: a token is compared only where its value is hidden in every one of those.
+    /// </summary>
+    public static Prepared Prepare(string? filter, MaskingPolicy policy, TokenVault vault, IReadOnlyList<string>? services = null)
     {
         if (string.IsNullOrWhiteSpace(filter)) return Prepared.Nothing;
         filter = filter.Trim();
@@ -112,7 +116,7 @@ internal static class FilterGuard
         }
 
         if (root is MatchAllNode) return Prepared.Nothing;
-        var judged = Judged(root, policy, vault);
+        var judged = Judged(root, policy, vault, services);
         if (judged.Node is not { } ready) return judged;
 
         // Counted on the tree, where a 'not' can be counted exactly: the parentheses of the
@@ -137,9 +141,9 @@ internal static class FilterGuard
     /// Whatever the tree holds that the guard was not taught is refused — which is what the
     /// tests hold every node type of the language to.
     /// </summary>
-    internal static Prepared Judged(FilterNode root, MaskingPolicy policy, TokenVault vault)
+    internal static Prepared Judged(FilterNode root, MaskingPolicy policy, TokenVault vault, IReadOnlyList<string>? services = null)
     {
-        var judge = new Judge(policy, vault);
+        var judge = new Judge(policy, vault, services);
         return judge.Visit(root) is { } ready ? new Prepared(ready, null) : judge.Refusal!;
     }
 
@@ -251,7 +255,7 @@ internal static class FilterGuard
             if (properties.Add(property)) firstOfProperty.Add(aggregate);
         }
 
-        var where = Prepare(asWritten.FilterText, policy, vault);
+        var where = Prepare(asWritten.FilterText, policy, vault, profile.Services);
         if (where.Error is not null) return Refused(where.Error, where.Kind);
 
         var counted = leftOut ?? new MaskStats();
@@ -350,7 +354,7 @@ internal static class FilterGuard
     /// what an AI's filter may be built from, and each entry is here because it is known which
     /// values it reads — the value at its path, or the elements of a list there, and nothing else.
     /// </summary>
-    private sealed class Judge(MaskingPolicy policy, TokenVault vault)
+    private sealed class Judge(MaskingPolicy policy, TokenVault vault, IReadOnlyList<string>? services)
     {
         public Prepared? Refusal { get; private set; }
 
@@ -468,11 +472,11 @@ internal static class FilterGuard
                     "run the search that produced it again."));
                 return false;
             }
-            // Only where the value is hidden whatever event it is read in. Elsewhere the token
-            // would find the events where it lies in the open, and every answer about them —
-            // the next call, a sum with a count beside it, an ordering of the same field — would
-            // read it there (TokenMayMeet).
-            if (!policy.TokenMayMeet(RulePath(property), entry.Text, entry.IsNumber))
+            // Only where the value is hidden whatever event of this profile's it is read in.
+            // Elsewhere the token would find the events where it lies in the open, and every
+            // answer about them — the next call, a sum with a count beside it, an ordering of
+            // the same field — would read it there (TokenMayMeet).
+            if (!policy.TokenMayMeet(RulePath(property), entry.Text, entry.IsNumber, services))
             {
                 Refuse(Prepared.Hidden(TokenInTheOpen(written!, property)));
                 return false;
@@ -542,7 +546,7 @@ internal static class FilterGuard
     /// <summary>A token compared with a field that shows its values as stored somewhere (see MaskingPolicy.TokenMayMeet).</summary>
     private static string TokenInTheOpen(object token, string property) =>
         $"{token} is a token for a hidden value, and {PropertyPath.ToDisplay(property)} shows its values as they are stored — whole or in part, " +
-        "in some service at least: compared with it, the token would find the value in the open. Compare a token with a property " +
+        "in some service this profile reads: compared with it, the token would find the value in the open. Compare a token with a property " +
         "logs_fields marks \"= only\" (not \"= only, no token\"), or — for a card number, an IIN or an email address a detector hid — " +
         "with the unmarked property it was found in.";
 

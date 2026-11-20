@@ -443,6 +443,241 @@ public sealed class McpFilterGuardTests
             Assert.Contains("shows its values as they are stored", FilterGuard.Prepare($"{field} = '{age}'", strict, vault).Error);
     }
 
+    // ── The answer and the guard read a path the same way ─────────────────────
+
+    /// <summary>
+    /// A rule on a path covers whatever is spelled under it, whether a dot stands between an
+    /// object and its property or inside one name. The fourth review found the two apart: under
+    /// a rule on <c>client</c> the OTLP attribute named <c>client.id</c> — one property, with a
+    /// dot in its name — went out as stored, while a filter on it was judged as one on a hidden
+    /// field, and a token compared with it read its value in one call.
+    /// </summary>
+    [Fact]
+    public void ARuleOnAPath_CoversWhateverIsSpelledUnderIt()
+    {
+        var vault  = new TokenVault();
+        var policy = Policy(McpMaskingMode.Standard, vault,
+            Rule("client", MaskAction.Hash), Rule("A.B", MaskAction.Hash), Rule("Card", MaskAction.KeepLast4),
+            Rule("Session", MaskAction.Remove), Rule("region", MaskAction.Hash, "payments-api"));
+
+        var cells = Cells(policy.Mask(Event("x", new()
+        {
+            ["client.id"]     = "C-77-0412",                                                   // an OTLP attribute: one name
+            ["client"]        = new Dictionary<string, object?> { ["id"] = "C-77-0412" },      // an object and its property
+            ["A"]             = new Dictionary<string, object?> { ["B.C"] = "V-31337", ["Open"] = "seen" },
+            ["Card"]          = "4111111111111111",
+            ["Card.Pan"]      = "4111111111111111",
+            ["Session.Token"] = "s3cr3t",
+            ["region.code"]   = "north",
+        }), new MaskStats()));
+
+        Assert.Matches("^h:[0-9a-f]{12}$", cells["client.id"]);
+        Assert.Matches("^h:[0-9a-f]{12}$", cells["client"]);
+        Assert.Matches("""^\{"B\.C":"h:[0-9a-f]{12}","Open":"seen"\}$""", cells["A"]);
+        Assert.Equal("****1111", cells["Card"]);                    // the value at the rule's own path: its last four
+        Assert.Matches("^h:[0-9a-f]{12}$", cells["Card.Pan"]);      // under it: hidden whole, as Card: { Pan } is
+        Assert.False(cells.ContainsKey("Session.Token"));
+        Assert.Matches("^h:[0-9a-f]{12}$", cells["region.code"]);
+
+        // In a service the rule does not name, the attribute is as open as the object would be.
+        Assert.Equal("north", Cells(policy.Mask(Event("x", new() { ["region.code"] = "north" }, service: "support"), new MaskStats()))["region.code"]);
+
+        // The guard says of the path what the answer does with it — and a table shows no more.
+        Assert.True(policy.HidesField("client.id") && policy.HidesEverywhere("client.id"));
+        Assert.True(policy.HidesField("region.code") && !policy.HidesEverywhere("region.code"));
+        Assert.Matches("^h:[0-9a-f]{12}$", policy.MaskGroupKey("Card.Pan", "4111111111111111", new MaskStats())!);
+        Assert.Equal("****1111", policy.MaskGroupKey("Card", "4111111111111111", new MaskStats()));
+
+        // A keep is a rule like any other: in Strict it shows what is spelled under it, to the
+        // answer and to the guard alike — not hidden in one and free to order in the other.
+        var strict = Policy(McpMaskingMode.Strict, vault, Rule("client", MaskAction.Keep));
+        var kept = Cells(strict.Mask(Event("x", new() { ["client.id"] = "C-77-0412", ["other.id"] = "C-77-0412" }), new MaskStats()));
+        Assert.Equal("C-77-0412", kept["client.id"]);
+        Assert.Matches("^h:[0-9a-f]{12}$", kept["other.id"]);
+        Assert.True(strict.KeepsEverywhere("client.id") && !strict.HidesField("client.id"));
+        Assert.True(strict.HidesField("other.id"));
+    }
+
+    /// <summary>
+    /// A token is compared where its value is hidden in every event the asking profile can be
+    /// shown — which, for a profile of some services, is a question about those services' rules.
+    /// </summary>
+    [Fact]
+    public void AToken_IsJudgedByTheServicesItsProfileReads()
+    {
+        var vault  = new TokenVault();
+        var policy = Policy(McpMaskingMode.Standard, vault,
+            Rule("TenantNo", MaskAction.Hash, "payments-api"), Rule("Contact", MaskAction.Keep, "support"));
+        var cells = Cells(policy.Mask(Event("x", new() { ["TenantNo"] = "T-778899", ["Pan"] = "4111111111111111" }), new MaskStats()));
+        string tenant = cells["TenantNo"], card = cells["Pan"];
+
+        string[] payments = ["payments-api"], both = ["payments-api", "support"], support = ["Support"];
+
+        // Hidden in the one service this profile reads: the question is answered there.
+        Assert.Null(FilterGuard.Prepare($"TenantNo = '{tenant}'", policy, vault, payments).Error);
+        Assert.True(policy.HidesEverywhere("TenantNo", payments));
+        // Open in another service the profile reads, or in one it might: refused.
+        foreach (string[]? reads in (string[]?[])[both, support, null, []])
+        {
+            Assert.Contains("shows its values as they are stored", FilterGuard.Prepare($"TenantNo = '{tenant}'", policy, vault, reads).Error);
+            Assert.False(policy.HidesEverywhere("TenantNo", reads));
+        }
+
+        // A keep of a service the profile does not read shows it nothing: the detector hides the card there.
+        Assert.Null(FilterGuard.Prepare($"Contact = '{card}'", policy, vault, payments).Error);
+        foreach (string[]? reads in (string[]?[])[both, support, null])
+            Assert.Contains("shows its values as they are stored", FilterGuard.Prepare($"Contact = '{card}'", policy, vault, reads).Error);
+
+        // The same through a table's where-clause, which carries the profile.
+        Assert.Null(FilterGuard.PrepareAggregation($"select count(*) where TenantNo = '{tenant}'", policy, vault, Payments).Error);
+        Assert.Contains("shows its values as they are stored",
+            FilterGuard.PrepareAggregation($"select count(*) where TenantNo = '{tenant}'", policy, vault, Payments with { Services = [] }).Error);
+    }
+
+    /// <summary>
+    /// The fourth review's oracle, held as a property over modes × rules × spellings of a path ×
+    /// the shapes a value is stored in × services × profiles: what the guard lets a QUESTION do
+    /// never goes past what the answer does with the VALUE.
+    /// <list type="bullet">
+    /// <item>A filter may order or match a field only if every value the engine reads there is
+    /// one the answer shows as stored.</item>
+    /// <item>An aggregate takes every value of a field, and a table shows a key whole or by its
+    /// last four characters, only where a search shows as much.</item>
+    /// <item>A token is compared with a field only if no event it can find shows anything of the
+    /// value there — not the value, not its last four characters.</item>
+    /// </list>
+    /// The engine reads <c>client.id</c> as an object's property or as one name with a dot in
+    /// it, a segment that reads as a number as a position in a list or as a name; the answer
+    /// judges each by the path it walked. The guard has to be right for all of them at once.
+    /// </summary>
+    [Fact]
+    public void WhatTheGuardAllows_TheAnswerShows_HoweverAPathIsSpelledAndStored()
+    {
+        const string a = "payments-api", b = "support";
+
+        // A text and a number no detector knows. Shown: the value itself. Cut: what keepLast4
+        // leaves of it — for the text its last four letters, which no token can hold; for the
+        // number the mark itself, since a token is made of digits too.
+        (object Value, string Shown, string Cut)[] secrets = [("ZQ-77-KWXY", "ZQ-77-KWXY", "KWXY"), (7391562, "7391562", "****1562")];
+
+        static Dictionary<string, object?> Map(string key, object? value) => new() { [key] = value };
+
+        // The secret, once in each event, at a place some spelling below reaches.
+        static Dictionary<string, object?>[] Shapes(object secret) =>
+        [
+            Map("client.id", secret),                                                           // one name with a dot
+            Map("client", Map("id", secret)),                                                   // an object and its property
+            Map("L", new List<object?> { Map("F", secret) }),                                   // a list of objects
+            Map("L.F", secret),
+            Map("L", Map("0", Map("F", secret))),                                               // a map whose key reads as a position
+            Map("L.0.F", secret),
+            Map("A", Map("B.C", secret)),                                                       // a dot in a name inside an object
+            Map("A", Map("B", Map("C", secret))),
+            Map("A.B.C", secret),
+            Map("A.B", Map("C", secret)),
+            Map("A", new List<object?> { Map("B", Map("1", Map("C", secret))) }),               // a list, then a map keyed by a number
+            Map("A", Map("0", Map("B", new List<object?> { "x", Map("C", secret) }))),          // the other way round
+        ];
+        string[] spellings =
+        [
+            "client.id", "['client.id']", "client['id']",
+            "L.F", "['L.F']", "L[0].F", "L.0.F", "L[' 0'].F", "L['0'].F", "['L.0.F']",
+            "A.B.C", "A['B.C']", "['A.B.C']", "['A.B'].C", "A.B['C']",
+            "A[0].B.1.C", "A.0.B.1.C", "A.0.B['1'].C", "A['0'].B[1].C",
+        ];
+        McpMaskRule[][] ruleSets =
+        [
+            [],
+            [Rule("client", MaskAction.Hash)],
+            [Rule("client", MaskAction.Hash, a)],
+            [Rule("client.id", MaskAction.Hash)],
+            [Rule("client", MaskAction.Keep)],
+            [Rule("client", MaskAction.KeepLast4)],
+            [Rule("client.id", MaskAction.KeepLast4)],
+            [Rule("client", MaskAction.Remove)],
+            [Rule("id", MaskAction.Hash)],
+            [Rule("client", MaskAction.Hash), Rule("client.id", MaskAction.Keep, b)],
+            [Rule("client", MaskAction.Keep, a), Rule("client.id", MaskAction.KeepLast4, b)],
+            [Rule("*ient*", MaskAction.Hash)],
+            [Rule("L", MaskAction.Hash)],
+            [Rule("L.F", MaskAction.Hash)],
+            [Rule("L.0.F", MaskAction.Hash)],
+            [Rule("L", MaskAction.Keep), Rule("L.F", MaskAction.Hash, a)],
+            [Rule("F", MaskAction.KeepLast4)],
+            [Rule("A.B", MaskAction.Hash)],
+            [Rule("A.B.C", MaskAction.Hash)],
+            [Rule("A", MaskAction.Keep)],
+            [Rule("A.B", MaskAction.Keep, a)],
+            [Rule("A.B.1.C", MaskAction.Hash)],
+            [Rule("A.B.C", MaskAction.Hash), Rule("A.0.B.1.C", MaskAction.Hash)],               // both ends, not the middle
+            [Rule("C", MaskAction.Remove)],
+        ];
+        McpProfile[] profiles =
+        [
+            Payments with { Services = [] }, Payments, Payments with { Services = [b] }, Payments with { Services = [a, b] },
+        ];
+
+        int read = 0, compared = 0, found = 0;
+        foreach (var (secret, whole, cut) in secrets)
+        {
+            foreach (var mode in (McpMaskingMode[])[McpMaskingMode.Standard, McpMaskingMode.Strict])
+            {
+                for (int set = 0; set < ruleSets.Length; set++)
+                {
+                    var vault  = new TokenVault();
+                    var policy = Policy(mode, vault, [.. ruleSets[set], Rule("AccountRef", MaskAction.Hash)]);
+                    string token = Cells(policy.Mask(Event("x", new() { ["AccountRef"] = secret }), new MaskStats()))["AccountRef"];
+
+                    var events = (from shape in Shapes(secret) from service in (string[])[a, b] select Event("x", shape, service)).ToList();
+                    var shown  = events.ConvertAll(e => string.Join('\n', policy.Mask(e, new MaskStats()).Properties.Select(static p => $"{p.Key}={p.Value}")));
+
+                    foreach (string spelling in spellings)
+                    {
+                        string path  = ((CompareNode)FilterParser.Parse($"{spelling} = 'x'")).Property;
+                        string named = FilterGuard.RulePath(path);
+                        bool hidden  = FilterGuard.IsHidden(policy, path), kept = policy.KeepsEverywhere(named);
+                        string key   = policy.MaskGroupKey(named, whole, new MaskStats())!;
+
+                        for (int i = 0; i < events.Count; i++)
+                        {
+                            if (FilterEvaluator.ReadProperty(events[i], path) is not { } value || !value.Equals(secret)) continue;
+                            read++;
+                            string at = $"{mode}, rules #{set}, {spelling}, in {events[i].ServiceName}: {shown[i]}";
+                            bool open = shown[i].Contains(whole);
+                            Assert.True(hidden || open, $"a filter may read what the answer hides — {at}");
+                            Assert.True(!kept || open, $"kept for an aggregate, hidden in the answer — {at}");
+                            Assert.True(open || !key.Contains(whole), $"a table's key shows what the answer hides — {at}");
+                            Assert.True(open || shown[i].Contains(cut) || !key.Contains(cut), $"a table's key shows the last four the answer hides — {at}");
+                        }
+
+                        foreach (var profile in profiles)
+                        {
+                            foreach (string filter in (string[])[$"{spelling} = '{token}'", $"{spelling} in ['{token}', 'x']"])
+                            {
+                                var prepared = FilterGuard.Prepare(filter, policy, vault, profile.Services);
+                                if (prepared.Error is not null) continue;
+                                compared++;
+                                var compiled = CompiledFilter.Compile(FilterGuard.Compose(prepared.Node, profile));
+                                for (int i = 0; i < events.Count; i++)
+                                {
+                                    if (!compiled.Matches(events[i])) continue;
+                                    found++;
+                                    Assert.False(shown[i].Contains(whole) || shown[i].Contains(cut),
+                                        $"a token read its value — {mode}, rules #{set}, {filter}, profile of [{string.Join(", ", profile.Services)}], in {events[i].ServiceName}: {shown[i]}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Not an empty promise: the engine reads the value by these paths, and tokens do find it.
+        Assert.True(read > 4_000, $"the engine read the value {read} times");
+        Assert.True(compared > 1_000, $"{compared} comparisons with a token were let through");
+        Assert.True(found > 1_000, $"a token found its value {found} times");
+    }
+
     [Fact]
     public void AnAggregate_TakesNoValueASearchWouldHide()
     {

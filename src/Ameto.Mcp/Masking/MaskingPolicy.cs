@@ -160,6 +160,13 @@ public sealed class MaskingPolicy
     private const int MaxDepth = 24;
 
     private readonly Rule[]        _rules;
+
+    /// <summary>
+    /// The services the rules tell apart: each one some rule is limited to, and null for every
+    /// service no rule names. An event of any service is judged as one of these is, so asking
+    /// about each of them is asking about every service there is or will be.
+    /// </summary>
+    private readonly string?[]     _serviceKinds;
     private readonly MaskDetectors _detectors;
     private readonly byte[]        _secret;
     private readonly TokenVault    _vault;
@@ -186,40 +193,169 @@ public sealed class MaskingPolicy
                 MaskAction.Keep      => Decision.Keep,
                 _                    => Decision.Hash,
             }))];
+        _serviceKinds = [null, .. _rules.SelectMany(static r => r.Services).Distinct(StringComparer.OrdinalIgnoreCase)];
     }
 
     // ── Decisions ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// What the rules say about a property path (<c>Customer.Iin</c>). With
-    /// <paramref name="anyService"/> the service scope of a rule is ignored: the question is then
-    /// "could this field be hidden in any event", which is what a filter or an aggregation over
-    /// several services has to be judged by.
+    /// What the rules do to the value at a path in an event of one service: the most protective
+    /// rule in scope that names the path or a path above it.
+    ///
+    /// <para><b>This is the one definition.</b> The answer asks it of every value it writes
+    /// (<see cref="Cell"/>, <see cref="WriteJson"/>), and everything that judges a QUESTION — a
+    /// filter's field, a table's key, a token's comparison — asks it again, for every way the
+    /// path can be read and every kind of service (<see cref="Judge"/>). They were two
+    /// definitions once, and a value walked between them.</para>
+    ///
+    /// <para><b>"Above" is by the dots of the path as it is spelled</b>, whether a dot stands
+    /// between an object and its property or inside one name. A rule on <c>client</c> covers
+    /// the object <c>client</c>, <c>client.id</c> under it, and a property NAMED
+    /// <c>client.id</c> — which is how OTLP stores every attribute, what a filter spells the
+    /// same way, and what the engine reads either way. The answer used to look above only
+    /// where it had walked down through an object: under a rule on <c>client</c> the attribute
+    /// <c>client.id</c> went out as stored, while a filter on it was judged as one on a hidden
+    /// field — and a token compared with it found its value in the open (the fourth review).</para>
+    ///
+    /// <para><b>A rule from above hides or keeps; it does not cut.</b> <c>keepLast4</c> is about
+    /// the value at its own path. Of an object there are no last four characters, so the object
+    /// is hashed whole, and so is everything spelled under the rule's path: one answer for
+    /// <c>Card: { Pan }</c> and for a property named <c>Card.Pan</c>, and the same for a table
+    /// grouped by <c>Card.Pan</c> — which once showed the last four characters of what a search
+    /// hid whole.</para>
+    ///
+    /// <para>Of several rules as protective as each other the nearest decides: the one on the
+    /// path itself before one above it. Its id is what the count of a rule's own hits is kept
+    /// under.</para>
     /// </summary>
-    internal Decision Decide(ReadOnlySpan<char> path, string? service, bool anyService = false) =>
-        Decide(path, service, anyService, out _);
-
-    /// <summary>
-    /// The same, and which rule it was: the first of the most protective ones that match, by
-    /// its id — what the count of a rule's own hits is kept under.
-    /// </summary>
-    internal Decision Decide(ReadOnlySpan<char> path, string? service, bool anyService, out string? ruleId)
+    internal Decision Decide(ReadOnlySpan<char> path, string? service, out string? ruleId)
     {
         Decision best = Decision.None;
         ruleId = null;
-        int lastDot = path.LastIndexOf('.');
-        ReadOnlySpan<char> leaf = lastDot < 0 ? default : path[(lastDot + 1)..];
-        foreach (var rule in _rules)
+        for (ReadOnlySpan<char> at = path; ; )
         {
-            if (rule.Decision <= best) continue;
-            if (!anyService && rule.Services.Length > 0 && !InScope(rule.Services, service)) continue;
-            if (Glob(rule.Pattern, path) || (rule.LeafToo && lastDot >= 0 && Glob(rule.Pattern, leaf)))
+            bool above  = at.Length < path.Length;
+            int lastDot = at.LastIndexOf('.');
+            ReadOnlySpan<char> leaf = lastDot < 0 ? default : at[(lastDot + 1)..];
+            foreach (var rule in _rules)
             {
-                best   = rule.Decision;
-                ruleId = rule.Id;
+                Decision does = above && rule.Decision == Decision.KeepLast4 ? Decision.Hash : rule.Decision;
+                if (does <= best) continue;
+                if (rule.Services.Length > 0 && !InScope(rule.Services, service)) continue;
+                if (Glob(rule.Pattern, at) || (rule.LeafToo && lastDot >= 0 && Glob(rule.Pattern, leaf)))
+                {
+                    best   = does;
+                    ruleId = rule.Id;
+                }
+            }
+            if (lastDot < 0) return best;
+            at = at[..lastDot];
+        }
+    }
+
+    /// <summary>
+    /// What the rules do to the value at a path over everything a question can be about: every
+    /// way the path can be read (<see cref="Readings"/>) and every kind of service.
+    /// </summary>
+    /// <param name="Hides">
+    /// The most protective thing done to it anywhere — cut, hashed or removed by a rule, or hashed
+    /// by Strict mode. <see cref="Decision.None"/> when it leaves as stored wherever it is read.
+    /// </param>
+    /// <param name="RuleId">The rule that does it, when a rule does.</param>
+    /// <param name="KeptEverywhere">A <c>keep</c> decides it in every reading and every service: it is sent as stored wherever it is read.</param>
+    /// <param name="HiddenWholeEverywhere">Hashed or removed, in every reading and every service.</param>
+    /// <param name="ShownSomewhere">Somewhere a rule shows it: whole (<c>keep</c>), or its last four characters (<c>keepLast4</c>).</param>
+    /// <param name="Unread">The path can be read more ways than are tried: everything above is then the answer on the safe side.</param>
+    private readonly record struct Verdict(
+        Decision Hides, string? RuleId, bool KeptEverywhere, bool HiddenWholeEverywhere, bool ShownSomewhere, bool Unread = false);
+
+    /// <summary>
+    /// Asks <see cref="Decide"/> about every reading of <paramref name="path"/> in every kind of
+    /// service among <paramref name="services"/> — the services a profile reads; null or empty
+    /// for all of them, which the rules tell apart only as far as <see cref="_serviceKinds"/>.
+    ///
+    /// <para>A question is not tied to one event, so nothing here is "the" decision: what
+    /// restricts a filter is the most protective one (<see cref="Verdict.Hides"/>), what lets an
+    /// aggregate take every value is a keep that holds throughout, and what lets a token be
+    /// compared is a hash or a remove that holds throughout.</para>
+    /// </summary>
+    private Verdict Judge(string path, IReadOnlyList<string>? services = null)
+    {
+        if (Readings(path) is not { } readings)
+            return new Verdict(Decision.Hash, null, KeptEverywhere: false, HiddenWholeEverywhere: false, ShownSomewhere: true, Unread: true);
+
+        IReadOnlyList<string?> kinds = _serviceKinds;
+        if (services is { Count: > 0 }) kinds = services;
+        bool strict = Mode == McpMaskingMode.Strict;
+        Decision worst = Decision.None;
+        string? ruleId = null;
+        bool allKept = true, allHiddenWhole = true, shown = false;
+        foreach (string reading in readings)
+        {
+            foreach (string? service in kinds)
+            {
+                Decision d = Decide(reading, service, out string? rule);
+                // What no rule names, Strict hashes: as much a part of what an answer does to
+                // the value as a rule is (Loose, LooseNumber).
+                if (d == Decision.None && strict) { d = Decision.Hash; rule = null; }
+
+                if (d > Decision.Keep && (d > worst || (d == worst && ruleId is null && rule is not null))) { worst = d; ruleId = rule; }
+                if (d != Decision.Keep) allKept = false;
+                if (d is Decision.Keep or Decision.KeepLast4) shown = true;
+                if (d is not (Decision.Hash or Decision.Remove)) allHiddenWhole = false;
             }
         }
-        return best;
+        return new Verdict(worst, ruleId, allKept, allHiddenWhole, shown);
+    }
+
+    /// <summary>More segments that read as positions than this, and a path is not read out every way (see <see cref="Readings"/>).</summary>
+    private const int MaxPositions = 6;
+
+    /// <summary>
+    /// The paths the answer may judge the value at <paramref name="path"/> by.
+    ///
+    /// <para>The rules name a list's elements by the list's own path — <c>Items.Sku</c> — and
+    /// the answer judges them so. A filter's path carries the position: <c>Items.0.Sku</c>. But
+    /// a segment that reads as a position is one only where it meets a list; where it meets an
+    /// object it is the name of a property (<c>"0"</c>), and the answer judges
+    /// <c>Items.0.Sku</c>. Nothing in the path says which, and a path may hold several such
+    /// segments, so each is taken both ways: 2^k readings for k of them.</para>
+    ///
+    /// <para>"Reads as a position" is the engine's own test, asked of the engine's own function
+    /// (<see cref="PropertyPath.TryReadPosition"/>). A copy of the rule kept here — "a run of
+    /// digits" — was narrower than what the engine accepts, and <c>Items[' 0'].Sku</c> walked
+    /// between the two. The first segment is always a property's name. A dot inside a name
+    /// splits the name here into more segments than it is, which only adds readings: none the
+    /// engine has is left out.</para>
+    ///
+    /// <para>Null when the path holds more such segments than <see cref="MaxPositions"/>.</para>
+    /// </summary>
+    private static List<string>? Readings(string path)
+    {
+        string[] segments = path.Split('.');
+        List<int>? positions = null;
+        for (int i = 1; i < segments.Length; i++)
+            if (PropertyPath.TryReadPosition(segments[i], out _)) (positions ??= []).Add(i);
+
+        if (positions is null) return [path];
+        if (positions.Count > MaxPositions) return null;
+
+        var readings = new List<string>(1 << positions.Count);
+        var sb = new StringBuilder(path.Length);
+        for (int dropped = 0; dropped < 1 << positions.Count; dropped++)
+        {
+            sb.Clear();
+            bool any = false;
+            for (int i = 0, next = 0; i < segments.Length; i++)
+            {
+                if (next < positions.Count && positions[next] == i && (dropped & (1 << next++)) != 0) continue;
+                if (any) sb.Append('.');
+                sb.Append(segments[i]);
+                any = true;
+            }
+            readings.Add(sb.ToString());
+        }
+        return readings;
     }
 
     /// <summary>
@@ -228,11 +364,11 @@ public sealed class MaskingPolicy
     /// simply not on the allow-list. A filter may test such a field for equality only, and an
     /// aggregation may only count it.
     ///
-    /// <para>A filter is not tied to one service or to one spelling of a path, so this is the
-    /// widest reading of the rules, not the reading an event of one service gets:</para>
+    /// <para>A filter is not tied to one service or to one reading of a path, so this is the
+    /// widest reading of the rules, not the one an event gets (see <see cref="Judge"/>):</para>
     /// <list type="bullet">
-    /// <item>A rule on a path hides everything under it. <c>Buyer</c> → hash sends the whole
-    /// object as one token, so <c>Buyer.Name</c> is as hidden as <c>Buyer</c> is.</item>
+    /// <item>A rule on a path hides everything spelled under it. <c>Buyer</c> → hash sends the
+    /// whole object as one token, so <c>Buyer.Name</c> is as hidden as <c>Buyer</c> is.</item>
     /// <item>A rule for one service counts for every service: the field is hidden somewhere.</item>
     /// <item>A <c>keep</c> for one service counts for none: the field is still hidden in the
     /// others, and a question about it is a question about those too.</item>
@@ -240,154 +376,43 @@ public sealed class MaskingPolicy
     /// The path is a property path as a filter spells it; a built-in field (<c>@mt</c>) is the
     /// caller's to tell apart — none of them is ever hidden.
     /// </summary>
-    public bool HidesField(string path) => HiddenAnywhere(path, out _, out _) != Decision.None;
+    public bool HidesField(string path) => Judge(path).Hides != Decision.None;
 
-    /// <summary>
-    /// What is done, somewhere, to the value at a path: the most protective decision any rule of
-    /// any service takes on the path or on anything above it — or, in Strict with no such rule,
-    /// a hash unless a <c>keep</c> that holds in every service covers it.
-    /// </summary>
-    private Decision HiddenAnywhere(ReadOnlySpan<char> path, out string? ruleId, out bool keptEverywhere)
-    {
-        Decision best = OnPathOrAbove(path, out ruleId, out keptEverywhere);
-
-        // `Items.0.Sku` is `Items[0].Sku` to the engine wherever Items is a list, and the rules
-        // name a list's elements by the list's own path — `Items.Sku`. A path with a segment
-        // the engine can read as a position is therefore judged both ways, and has to pass both.
-        if (WithoutPositions(path) is { } elements)
-        {
-            Decision other = OnPathOrAbove(elements, out string? otherRule, out bool otherKept);
-            keptEverywhere &= otherKept;
-            if (other > best) { best = other; ruleId = otherRule; }
-        }
-
-        if (best != Decision.None) return best;
-        return Mode == McpMaskingMode.Strict && !keptEverywhere ? Decision.Hash : Decision.None;
-    }
-
-    /// <summary>The most protective rule on a path or on any path above it — Buyer.Name, then Buyer.</summary>
-    private Decision OnPathOrAbove(ReadOnlySpan<char> path, out string? ruleId, out bool keptEverywhere)
-    {
-        Decision best = Decision.None;
-        keptEverywhere = false;
-        ruleId = null;
-        for (ReadOnlySpan<char> at = path; ; )
-        {
-            int lastDot = at.LastIndexOf('.');
-            ReadOnlySpan<char> leaf = lastDot < 0 ? default : at[(lastDot + 1)..];
-            foreach (var rule in _rules)
-            {
-                if (!Glob(rule.Pattern, at) && !(rule.LeafToo && lastDot >= 0 && Glob(rule.Pattern, leaf))) continue;
-                if (rule.Decision == Decision.Keep) keptEverywhere |= rule.Services.Length == 0;
-                else if (rule.Decision > best) { best = rule.Decision; ruleId = rule.Id; }
-            }
-            if (lastDot < 0) return best;
-            at = at[..lastDot];
-        }
-    }
-
-    /// <summary>
-    /// The path with every segment the engine can read as a list position taken out — every one
-    /// after the first, which is always a property's name — or null when it has none:
-    /// <c>Items.0.Sku</c> → <c>Items.Sku</c>.
-    ///
-    /// <para>"Can read as a position" is the engine's own test, asked of the engine's own
-    /// function (<see cref="PropertyPath.TryReadPosition"/>). A copy of the rule kept here —
-    /// "a run of digits" — was narrower than what the engine accepts, and <c>Items[' 0'].Sku</c>
-    /// walked between the two.</para>
-    /// </summary>
-    private static string? WithoutPositions(ReadOnlySpan<char> path)
-    {
-        StringBuilder? sb = null;
-        int start = 0, kept = 0;
-        for (int i = 0; i <= path.Length; i++)
-        {
-            if (i < path.Length && path[i] != '.') continue;
-            ReadOnlySpan<char> segment = path[start..i];
-            bool position = start > 0 && PropertyPath.TryReadPosition(segment, out _);
-            if (position) sb ??= new StringBuilder(path.Length).Append(path[..(start - 1)]);
-            else if (sb is not null) { if (kept > 0) sb.Append('.'); sb.Append(segment); }
-            if (!position) kept++;
-            start = i + 1;
-        }
-        return sb?.ToString();
-    }
-
-    /// <summary>True when a rule that holds in every service keeps the field as it is stored.</summary>
-    public bool KeepsEverywhere(string path)
-    {
-        HiddenAnywhere(path, out _, out bool kept);
-        return kept;
-    }
+    /// <summary>True when a rule keeps the field as it is stored in every service, however the path is read.</summary>
+    public bool KeepsEverywhere(string path) => Judge(path).KeptEverywhere;
 
     /// <summary>
     /// Whether a token for <paramref name="text"/> may be compared with the field at
-    /// <paramref name="path"/> — the question a filter asks with <c>Field = 'h:…'</c>.
+    /// <paramref name="path"/> — the question a filter asks with <c>Field = 'h:…'</c> — by a
+    /// profile that reads <paramref name="services"/> (null or empty: every service).
     ///
     /// <para>A token is a question about where a hidden value is, and the events it finds are
     /// shown, read again and added up by every call after it. Compared with a field that shows
-    /// its values as they are stored — in any service, whole or the last four characters — it
-    /// would find the value lying in the open: <c>sum(Attempt) / count(Attempt) where Attempt =
-    /// 'h:…'</c> is the value, and so is the next <c>logs_context</c> of an event it found. So a
-    /// token may meet only a field whose every value is hidden wherever it is read (see
-    /// <see cref="HidesEverywhere"/>), or — for a value a detector hides whole by its shape, a
-    /// card number, an address — any field no <c>keep</c> or <c>keepLast4</c> rule shows,
-    /// because there the value is hidden whatever field it is in.</para>
+    /// its values as they are stored — in any service the profile reads, in any reading of the
+    /// path, whole or the last four characters — it would find the value lying in the open:
+    /// <c>sum(Attempt) / count(Attempt) where Attempt = 'h:…'</c> is the value, and so is the
+    /// next <c>logs_context</c> of an event it found. So a token may meet only a field whose
+    /// every value is hidden whole wherever the profile can read it
+    /// (<see cref="HidesEverywhere"/>), or — for a value a detector hides whole by its shape, a
+    /// card number, an address — any field no <c>keep</c> or <c>keepLast4</c> rule shows there,
+    /// because the value is then hidden whatever field it is in.</para>
     /// </summary>
-    public bool TokenMayMeet(string path, string text, bool isNumber)
+    public bool TokenMayMeet(string path, string text, bool isNumber, IReadOnlyList<string>? services = null)
     {
-        bool hidden = HiddenEverywhere(path, out bool shownSomewhere);
-        return hidden || (!shownSomewhere && DetectorsHide(text, isNumber));
+        Verdict field = Judge(path, services);
+        return field.HiddenWholeEverywhere || (!field.ShownSomewhere && DetectorsHide(text, isNumber));
     }
 
     /// <summary>
-    /// True when the field's values are hidden whole in every event of every service: a
-    /// <c>hash</c> or <c>remove</c> that holds in every service names it (or a path above it), or
-    /// the mode is Strict and no rule of any service shows it. A rule limited to some services
-    /// leaves the field open in the others; a <c>keep</c> shows it as stored, and a
+    /// True when the field's values are hidden whole in every event a profile that reads
+    /// <paramref name="services"/> can be shown: in each of those services — in every service,
+    /// when the profile reads them all — a <c>hash</c> or a <c>remove</c> decides the path,
+    /// however it is read, or the mode is Strict and no rule shows it. A rule limited to other
+    /// services leaves the field open in these; a <c>keep</c> shows it as stored, and a
     /// <c>keepLast4</c> its last four characters — the whole of a short value.
     /// </summary>
-    public bool HidesEverywhere(string path) => HiddenEverywhere(path, out _);
-
-    /// <summary>
-    /// <see cref="HidesEverywhere"/>, and whether any rule shows the field, whole or in part, in
-    /// some service: a <c>keep</c> or a <c>keepLast4</c> on it or on a path above it.
-    /// </summary>
-    private bool HiddenEverywhere(string path, out bool shownSomewhere)
-    {
-        bool hiddenByRule = OnPathOrAboveEverywhere(path, out shownSomewhere);
-        if (WithoutPositions(path) is { } elements)
-        {
-            hiddenByRule |= OnPathOrAboveEverywhere(elements, out bool elementShown);
-            shownSomewhere |= elementShown;
-        }
-        return hiddenByRule || (Mode == McpMaskingMode.Strict && !shownSomewhere);
-    }
-
-    /// <summary>
-    /// Whether a hash or a remove of every service names the path or a path above it, and
-    /// whether a keep or a keepLast4 of any service names one of them.
-    /// </summary>
-    private bool OnPathOrAboveEverywhere(ReadOnlySpan<char> path, out bool shownSomewhere)
-    {
-        bool hidden = false;
-        shownSomewhere = false;
-        for (ReadOnlySpan<char> at = path; ; )
-        {
-            int lastDot = at.LastIndexOf('.');
-            ReadOnlySpan<char> leaf = lastDot < 0 ? default : at[(lastDot + 1)..];
-            foreach (var rule in _rules)
-            {
-                if (!Glob(rule.Pattern, at) && !(rule.LeafToo && lastDot >= 0 && Glob(rule.Pattern, leaf))) continue;
-                if (rule.Decision is Decision.Keep or Decision.KeepLast4) shownSomewhere = true;
-                // The most protective rule wins in every event, so a hash or a remove of every
-                // service hides the field whole whatever a service shows of it besides.
-                else if (rule.Services.Length == 0) hidden = true;
-            }
-            if (lastDot < 0) return hidden;
-            at = at[..lastDot];
-        }
-    }
+    public bool HidesEverywhere(string path, IReadOnlyList<string>? services = null) =>
+        Judge(path, services).HiddenWholeEverywhere;
 
     /// <summary>
     /// True when the detectors hide this value WHOLE wherever an equality could find it — as
@@ -539,15 +564,22 @@ public sealed class MaskingPolicy
 
         // A row of a table is not an event of one service, so the key is judged as a filter's
         // field is: by what is done to it anywhere, under any path above it.
-        Decision decision = HiddenAnywhere(path, out string? rule, out bool kept);
+        Verdict field = Judge(path);
+        if (field.Unread)
+        {
+            // More readings than are tried: hidden, and not as any rule's or Strict mode's doing.
+            stats.Add(MaskReason.Detector, MaskStats.TooDeep);
+            return TokenOfText(value, isNumber: false, remember: false);
+        }
+        string? rule = field.RuleId;
         MaskReason reason = rule is null ? MaskReason.Strict : MaskReason.Rule;
-        switch (decision)
+        switch (field.Hides)
         {
             case Decision.Remove:    stats.Add(reason, path, rule); return "(hidden)";
             case Decision.KeepLast4: stats.Add(reason, path, rule); return LastFour(value);
             case Decision.Hash:      stats.Add(reason, path, rule); return TokenOfText(value, isNumber: false);
         }
-        return kept ? value : MaskText(value, stats);
+        return field.KeptEverywhere ? value : MaskText(value, stats);
     }
 
     /// <summary>The largest whole number a double holds exactly: past it, digits are not the value's own.</summary>
@@ -575,8 +607,7 @@ public sealed class MaskingPolicy
 
         long whole  = (long)value;
         string text = whole.ToString(CultureInfo.InvariantCulture);
-        HiddenAnywhere(path, out _, out bool kept);
-        if (kept) return text;
+        if (KeepsEverywhere(path)) return text;
 
         if (SensitiveValueDetectors.IsSensitiveNumber(whole, _detectors, out var kind))
         {
@@ -704,7 +735,7 @@ public sealed class MaskingPolicy
     /// <summary>The value of one top-level property as cell text; null when a rule removes it.</summary>
     private string? Cell(ref MessagePackReader r, string path, in Ctx c)
     {
-        Decision decision = Decide(path, c.Service, anyService: false, out string? rule);
+        Decision decision = Decide(path, c.Service, out string? rule);
         switch (decision)
         {
             case Decision.Remove:    r.Skip(); c.Stats.Add(MaskReason.Rule, path, rule); return null;
@@ -760,7 +791,7 @@ public sealed class MaskingPolicy
                 {
                     string key   = ReadKey(ref r);
                     string child = string.Concat(path, ".", key);
-                    Decision d   = Decide(child, c.Service, anyService: false, out string? rule);
+                    Decision d   = Decide(child, c.Service, out string? rule);
                     if (d == Decision.Remove) { r.Skip(); c.Stats.Add(MaskReason.Rule, child, rule); continue; }
 
                     w.WritePropertyName(Name(key, c.Stats));
