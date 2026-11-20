@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Storage;
+using Ameto.Testing;
 using MessagePack;
 using Xunit;
 using Xunit.Abstractions;
@@ -84,7 +85,10 @@ public sealed class CountsSummaryProbe
         }
         finally
         {
-            try { Directory.Delete(root, true); } catch { }
+            // Two stores of 180 000 events each. Not a bare delete under an empty catch: the reopened
+            // engines scan their catalogs on a task their dispose does not wait for, and a fact that
+            // ends early — a failed assertion — meets that scan with one segment still open.
+            TestDataDirectory.Delete(root);
         }
     }
 
@@ -122,7 +126,7 @@ public sealed class CountsSummaryProbe
         }
         finally
         {
-            try { Directory.Delete(dir, true); } catch { }
+            TestDataDirectory.Delete(dir);
         }
     }
 

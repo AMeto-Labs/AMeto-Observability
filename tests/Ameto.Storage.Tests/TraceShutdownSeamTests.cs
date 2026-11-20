@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 
@@ -43,8 +44,28 @@ public sealed class TraceShutdownSeamTests : IDisposable
     public void Dispose()
     {
         foreach (var e in _engines)
+        {
             try { e.Dispose(); } catch { /* a test may have left one frozen on purpose */ }
-        try { Directory.Delete(_root, recursive: true); } catch { /* best-effort */ }
+            ReleaseWhatAFrozenEngineKeeps(e);
+        }
+        TestDataDirectory.Delete(_root);
+    }
+
+    /// <summary>
+    /// A teardown that runs out of its budget frees nothing — the lock, the index and the span WAL
+    /// stay as they are under whatever is still running — and the server leaves them to the exit of
+    /// the process. The fact that drives an engine there on purpose leaves one for the rest of THIS
+    /// process, and on Windows its mapped <c>spans.wal</c> (8 MB) with it: nothing could delete the
+    /// directory, and every run of the suite left one in TEMP. Once nothing is inside the engine
+    /// any more the log is closed here, which is all the directory was held by.
+    /// </summary>
+    private static void ReleaseWhatAFrozenEngineKeeps(TraceStorageEngine e)
+    {
+        if (e.ResourcesFreedForTest) return;
+
+        static bool Empty(TraceStorageEngine e) => e.HeavyPhasesInFlight == 0 && e.ActiveReadersForTest == 0;
+        SpinWait.SpinUntil(() => Empty(e), HangGuard);
+        if (Empty(e)) e.WalForTest.Dispose();   // otherwise left: unmapping it under a running phase is the fault the freeze prevents
     }
 
     private TraceStorageEngine NewEngine(out string dir)

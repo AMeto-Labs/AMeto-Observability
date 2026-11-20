@@ -11,6 +11,7 @@ using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Server;
 using Ameto.Storage;
+using Ameto.Testing;
 using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 using EventId  = Microsoft.Extensions.Logging.EventId;
 
@@ -542,7 +543,7 @@ public sealed class LogStoreUnavailableTests
         public string Data   => System.IO.Path.Combine(Path, "data");
         public string Alerts => System.IO.Path.Combine(Path, "alerts");
         public TempDir() { Directory.CreateDirectory(Data); Directory.CreateDirectory(Alerts); }
-        public void Dispose() { try { Directory.Delete(Path, recursive: true); } catch { /* best effort */ } }
+        public void Dispose() => TestDataDirectory.Delete(Path);   // clears the pool the alert stores' connections to Ameto.db are parked in
     }
 
     private sealed class NoopProtector : ISecretProtector

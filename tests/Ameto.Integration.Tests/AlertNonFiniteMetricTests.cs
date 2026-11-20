@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Alerts;
 using Ameto.Metrics;
+using Ameto.Testing;
 using Ameto.Tracing;
 
 namespace Ameto.Integration.Tests;
@@ -304,7 +305,7 @@ public sealed class AlertNonFiniteMetricTests
         public async ValueTask DisposeAsync()
         {
             await Evaluator.DisposeAsync();
-            try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+            TestDataDirectory.Delete(_dir);   // clears the pool the alert stores' connections to Ameto.db are parked in
         }
     }
 

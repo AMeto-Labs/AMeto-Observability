@@ -19,6 +19,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Removes a test's data directory, and fails the test when something still holds a file in it;
+         QuerySegmentFixtures.DeleteDataDirectory is this. -->
+    <Compile Include="..\Shared\TestDataDirectory.cs" Link="Shared\TestDataDirectory.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Query\Ameto.Query.csproj" />
     <!-- Both arrive transitively through Ameto.Query; named here because this suite now writes

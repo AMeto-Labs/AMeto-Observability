@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Core;
+using Ameto.Testing;
 
 namespace Ameto.Storage.Tests;
 
@@ -16,13 +17,9 @@ public sealed class RetentionStoreBoundsTests : IDisposable
 
     public RetentionStoreBoundsTests() => Directory.CreateDirectory(_dir);
 
-    public void Dispose()
-    {
-        // The pool keeps Ameto.db open after the store is gone, and on Windows the delete then fails and
-        // the directory stays in TEMP for ever (see QuerySegmentFixtures.DeleteDataDirectory).
-        SqliteConnection.ClearAllPools();
-        try { Directory.Delete(_dir, true); } catch { }
-    }
+    // The store holds nothing open. The connections these facts open themselves, to seed and to
+    // read the table behind its back, are pooled, and the helper clears the pool before it deletes.
+    public void Dispose() => TestDataDirectory.Delete(_dir);
 
     private RetentionStore Store(ServerOptions? options = null)
         => new(options ?? new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance);

@@ -9,6 +9,7 @@ using Ameto.Core;
 using Ameto.Ingestion;
 using Ameto.Server.Auth;
 using Ameto.Storage;
+using Ameto.Testing;
 
 namespace Ameto.Integration.Tests;
 
@@ -373,11 +374,14 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
         // second caller, so there is nothing to wait on.
         WaitForDataDirectoryWriters();
 
-        if (Directory.Exists(_tempDir))
-        {
-            try { Directory.Delete(_tempDir, recursive: true); }
-            catch { /* best-effort cleanup */ }
-        }
+        // Not a bare Directory.Delete under an empty catch, which is what left one Ameto-tests-*
+        // directory in TEMP for every host this factory ever started (88 in one run of the suite).
+        // The host's auth and alert stores open Ameto.db through Microsoft.Data.Sqlite's connection
+        // pool, and the pool keeps the file open after the host is gone: right for a server, which
+        // has one data directory until it exits, and for a test the one handle nothing closes. The
+        // helper clears the pool, retries past a handle that is about to close, and fails the class
+        // if the directory is still there.
+        TestDataDirectory.Delete(_tempDir);
     }
 
     private void WaitForDataDirectoryWriters()
