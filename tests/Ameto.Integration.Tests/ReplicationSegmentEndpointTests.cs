@@ -11,6 +11,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
 using Ameto.Storage;
+using Ameto.Testing;
 
 namespace Ameto.Integration.Tests;
 
@@ -635,12 +636,13 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
         {
             // The dispose used to stand inside the try, below a write and a read that can both
             // throw — without it the delete below cannot succeed at all, the engine's
-            // write-ahead log still being mapped. Necessary is not sufficient, though: a run
-            // has left this directory behind even with the dispose in place, so the failure is
-            // now SAID rather than swallowed, and a leftover has a line to be found by.
+            // write-ahead log still being mapped. Necessary was not sufficient: every run left
+            // this directory behind with the dispose in place, holding Ameto.db, which
+            // RetentionStore kept open in the SQLite connection pool until it stopped pooling.
+            // The failure was SAID then, on a console no `dotnet test -v minimal` shows; now it
+            // fails the test.
             engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            try { Directory.Delete(dir, true); }
-            catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir} — {ex.Message}"); }
+            TestDataDirectory.Delete(dir);
         }
     }
 
@@ -726,9 +728,7 @@ public sealed class ReplicationWebAppFactory : WebApplicationFactory<Program>
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        if (disposing && Directory.Exists(_tempDir))
-        {
-            try { Directory.Delete(_tempDir, recursive: true); } catch { }
-        }
+        // The host's stores pool their connection to Ameto.db; see AmetoWebAppFactory.Dispose.
+        if (disposing) TestDataDirectory.Delete(_tempDir);
     }
 }

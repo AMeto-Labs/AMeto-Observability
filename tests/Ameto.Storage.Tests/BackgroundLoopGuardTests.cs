@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Ingestion;
 using Ameto.Tracing.Storage;
@@ -25,13 +26,7 @@ public sealed class BackgroundLoopGuardTests : IDisposable
 
     public BackgroundLoopGuardTests() => Directory.CreateDirectory(_dir);
 
-    public void Dispose()
-    {
-        // The pool keeps the retention store's Ameto.db open after the engine is gone; on Windows the
-        // delete then fails and the directory stays in TEMP for ever.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-        try { Directory.Delete(_dir, recursive: true); } catch { }
-    }
+    public void Dispose() => TestDataDirectory.Delete(_dir);
 
     private string Sub(string name)
     {

@@ -96,7 +96,8 @@ public sealed class ExceptionExistsFieldTests
     [InlineData("@x.exists = 'TRUE'")]
     [InlineData("@x.exists != false")]
     [InlineData("@x.exists <> false")]
-    [InlineData("@x.exists != 'no'")]         // a bool reads any text but "true" as false
+    [InlineData("@x.exists != 'false'")]      // a bool equals the text of one, in any case
+    [InlineData("@x.exists != 'FALSE'")]
     [InlineData("@x.exists in [true]")]
     [InlineData("@x.exists in ['true', 'TRUE']")]
     [InlineData("true = @x.exists")]
@@ -126,7 +127,8 @@ public sealed class ExceptionExistsFieldTests
     [InlineData("@x.exists != true")]
     [InlineData("@x.exists <> true")]
     [InlineData("@x.exists = 'false'")]
-    [InlineData("@x.exists = 'no'")]
+    [InlineData("@x.exists = 'no'")]          // no bool's text: equals no bool…
+    [InlineData("@x.exists != 'no'")]         // …so != holds for every event
     [InlineData("@x.exists = 1")]
     [InlineData("@x.exists in [false]")]
     [InlineData("@x.exists in [true, false]")]

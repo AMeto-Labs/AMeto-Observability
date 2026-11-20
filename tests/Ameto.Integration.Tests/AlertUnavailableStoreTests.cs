@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Alerts;
 using Ameto.Core;
 using Ameto.Metrics;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 using LogLevel = Microsoft.Extensions.Logging.LogLevel;
@@ -60,7 +61,7 @@ public sealed class AlertUnavailableStoreTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         await _evaluator.DisposeAsync();
-        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+        TestDataDirectory.Delete(_dir);   // clears the pool the alert stores' connections to Ameto.db are parked in
     }
 
     // ── The closed store ──────────────────────────────────────────────────────────────────────

@@ -84,6 +84,7 @@ jobs:
       # whose real-time scanning slows file creation) and no Ameto thread waiting on anything. The
       # test takes 41 s on a developer box and fitted inside the 11-13 minute Storage run before.
       - name: Test (Debug)
+        id: tests
         shell: pwsh
         run: |
           dotnet test -c Debug --nologo -v minimal --blame-hang-timeout 15m --blame-hang-dump-type mini 2>&1 | Tee-Object -FilePath test-output.txt
@@ -122,6 +123,68 @@ jobs:
             exit 1
           }
           Write-Host "no skipped tests across $($summaries.Count) test projects"
+
+      # WHAT THE SUITE LEFT IN TEMP. Every test that builds an engine, a store or a host does it over
+      # a directory under TEMP and deletes it in teardown, and for months most of those deletes failed
+      # in silence, on Windows only: one green run left 885 ameto-* directories (101 MB), and a
+      # developer machine held 36 472 of them (5.4 GB) before anyone looked. Here TEMP starts empty
+      # and leaves with the runner, so the same failure could not be seen at all. A green run is
+      # expected to leave nothing; this step says what a run did leave, by prefix (the prefix names
+      # the test class) with the files one of each still holds (the files name the handle).
+      #
+      # IT RUNS AFTER A RED RUN TOO, which is when it is needed most. A class fixture whose teardown
+      # cannot delete its directory fails the run with every test Passed and ONE line in the log:
+      # "[Test Class Cleanup Failure (X)] Ameto.Testing.TestDataDirectoryLeftBehindException", the
+      # type and no message (xunit 2.9.3 at -v minimal, measured). This step is where that directory
+      # and its files are named. A test that fails for its own reasons may leave its directory as
+      # well, so after a red run the finding is a notice rather than a warning.
+      #
+      # A WARNING, NOT A FAILURE, AND WHAT WOULD CHANGE THAT. Tests that delete through
+      # TestDataDirectory.Delete (tests/Shared) retry a delete a closing handle blocks, and fail by
+      # themselves if the directory stays. About two hundred older teardowns are still a bare
+      # Directory.Delete under an empty catch: nothing holds their files any more, but one handle is
+      # still about to close when they run — the boot catalog scan of an engine, a task its
+      # DisposeAsync does not wait for — and on a two-core runner a delete can meet it. Until the
+      # engine joins that scan, a hard gate here would be red now and then on a suite that passed. So
+      # this step names what it finds, and failing on a green run's leftovers is a small change the
+      # day it has stayed quiet.
+      #
+      # IT NEVER FAILS THE JOB ITSELF: it reports, the tests decide. GitHub runs pwsh with
+      # $ErrorActionPreference = 'stop', under which one entry it cannot list would end the step;
+      # hence continue-on-error, and no listing error is fatal. And it sees what is named ameto-*
+      # only: a test that puts its files under another name (tracesum-*, secretprotector*) is
+      # outside it.
+      - name: Report what the suite left in TEMP
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $temp = [System.IO.Path]::GetTempPath()
+          $left = @(Get-ChildItem -LiteralPath $temp -Filter 'ameto-*' -ErrorAction SilentlyContinue)
+          if ($left.Count -eq 0) { Write-Host "nothing named ameto-* is left in $temp"; exit 0 }
+
+          $groups = $left | Group-Object { $_.Name -replace '[-_]?[0-9a-fA-F]{8,}.*$', '' } | Sort-Object Count -Descending
+          foreach ($g in $groups) {
+            $sample = $g.Group[0]
+            if ($sample.PSIsContainer) {
+              $files  = @(Get-ChildItem -LiteralPath $sample.FullName -Recurse -File -ErrorAction SilentlyContinue |
+                          ForEach-Object { $_.FullName.Substring($sample.FullName.Length + 1) })
+              $inside = if ($files.Count -eq 0) { 'empty' } else { ($files | Select-Object -First 5) -join ', ' }
+            } else {
+              $inside = "a file, $($sample.Length) bytes"
+            }
+            Write-Host ("{0,4} x {1}  ({2}: {3})" -f $g.Count, $g.Name, $sample.Name, $inside)
+          }
+          $names = ($groups | ForEach-Object { "$($_.Count) x $($_.Name)" }) -join ', '
+          if ($env:TESTS_OUTCOME -eq 'success') {
+            Write-Host "::warning::A green test run left $($left.Count) ameto-* entries in TEMP: $names. A teardown's delete failed and said nothing; see tests/Shared/TestDataDirectory.cs."
+          } else {
+            Write-Host "::notice::The test run (outcome: $($env:TESTS_OUTCOME)) left $($left.Count) ameto-* entries in TEMP: $names. A test that failed may leave its directory; a 'Test Class Cleanup Failure ... TestDataDirectoryLeftBehindException' in the test log is one of these, and the lines above name its files."
+          }
+          exit 0
 
       # THE HANG'S EVIDENCE LEAVES WITH THE RUNNER unless it is uploaded. A hang in a class fixture's
       # teardown (a WebApplicationFactory host stopping after its last test) happens after every test

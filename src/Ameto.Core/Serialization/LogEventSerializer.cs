@@ -771,14 +771,14 @@ public static class LogEventSerializer
     /// </summary>
     /// <returns>True when the key was present; <paramref name="value"/> is then its decoded value.</returns>
     public static bool TryReadProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out object? value)
-        => Probe(map, key, ProbeWant.Decode, out value, out _, default, out _, out _, out _);
+        => Probe(map, key, ProbeWant.Decode, out value, out _, default, out _, out _, out _, out _, out _);
 
     /// <summary>
     /// Presence of a key WITHOUT decoding its value — used where only "is there anything
     /// under this name" matters, so a nested subtree is never built just to be discarded.
     /// </summary>
     public static bool HasProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out bool isNil)
-        => Probe(map, key, ProbeWant.Presence, out _, out isNil, default, out _, out _, out _);
+        => Probe(map, key, ProbeWant.Presence, out _, out isNil, default, out _, out _, out _, out _, out _);
 
     /// <summary>
     /// A string-valued property decoded straight into the CALLER'S buffer — no string, no box,
@@ -807,7 +807,7 @@ public static class LogEventSerializer
     public static bool TryReadPropertyText(
         ReadOnlyMemory<byte> map, ReadOnlySpan<char> key,
         Span<char> destination, out int charsWritten, out bool keyPresent)
-        => Probe(map, key, ProbeWant.Text, out _, out _, destination, out charsWritten, out _, out keyPresent);
+        => Probe(map, key, ProbeWant.Text, out _, out _, destination, out charsWritten, out _, out _, out _, out keyPresent);
 
     /// <summary>
     /// A numeric property as a <see cref="double"/> without the box <see cref="TryReadProperty"/>
@@ -817,7 +817,18 @@ public static class LogEventSerializer
     /// <param name="keyPresent">As for <see cref="TryReadPropertyText"/>.</param>
     public static bool TryReadPropertyNumber(
         ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out double number, out bool keyPresent)
-        => Probe(map, key, ProbeWant.Number, out _, out _, default, out _, out number, out keyPresent);
+        => Probe(map, key, ProbeWant.Number, out _, out _, default, out _, out number, out _, out _, out keyPresent);
+
+    /// <summary>
+    /// <see cref="TryReadPropertyNumber(ReadOnlyMemory{byte}, ReadOnlySpan{char}, out double, out bool)"/>,
+    /// and the number as it was written: an integer EXACTLY in <paramref name="integer"/>, with
+    /// <paramref name="isInteger"/> set — a msgpack integer past 2^53, which the double rounds, is
+    /// still the integer it was — and a float in <paramref name="number"/> alone. Still no box.
+    /// </summary>
+    public static bool TryReadPropertyNumber(
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key,
+        out double number, out Int128 integer, out bool isInteger, out bool keyPresent)
+        => Probe(map, key, ProbeWant.Number, out _, out _, default, out _, out number, out integer, out isInteger, out keyPresent);
 
     /// <summary>What the caller wants out of the one walk below.</summary>
     private enum ProbeWant : byte
@@ -835,12 +846,14 @@ public static class LogEventSerializer
     private static bool Probe(
         ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, ProbeWant want,
         out object? value, out bool isNil,
-        Span<char> destination, out int charsWritten, out double number, out bool keyPresent)
+        Span<char> destination, out int charsWritten, out double number, out Int128 integer, out bool isInteger, out bool keyPresent)
     {
         value        = null;
         isNil        = false;
         charsWritten = 0;
         number       = 0;
+        integer      = 0;
+        isInteger    = false;
         keyPresent   = false;
         if (map.IsEmpty) return false;
 
@@ -931,9 +944,16 @@ public static class LogEventSerializer
                                 if (hit.NextCode == MessagePackCode.UInt64)
                                 {
                                     ulong u = hit.ReadUInt64();
-                                    number = u <= (ulong)long.MaxValue ? (long)u : u;
+                                    number  = u <= (ulong)long.MaxValue ? (long)u : u;
+                                    integer = u;
                                 }
-                                else number = hit.ReadInt64();
+                                else
+                                {
+                                    long l  = hit.ReadInt64();
+                                    number  = l;
+                                    integer = l;
+                                }
+                                isInteger = true;
                                 return true;
 
                             case MessagePackType.Float:

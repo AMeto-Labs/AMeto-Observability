@@ -320,6 +320,40 @@ public sealed class UnboxedPropertyTextTests
         Assert.False(present);
     }
 
+    /// <summary>
+    /// The number as it was written: an integer exactly — 2^53 + 1 and uint64.MaxValue, which a
+    /// double rounds, included — and a float as a double alone.
+    /// </summary>
+    [Fact]
+    public void Integers_are_read_exactly_without_a_box()
+    {
+        var ev = Event(static (ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(4);
+            w.Write("odd");   w.Write(9007199254740993L);
+            w.Write("max");   w.Write(ulong.MaxValue);
+            w.Write("neg");   w.Write(long.MinValue);
+            w.Write("ratio"); w.Write(0.1 + 0.2);
+        });
+
+        Assert.True(LogEventSerializer.TryReadPropertyNumber(ev.RawProperties, "odd", out double d, out Int128 i, out bool isInteger, out bool present));
+        Assert.True(isInteger && present);
+        Assert.Equal((Int128)9007199254740993L, i);
+        Assert.Equal(9007199254740992d, d);               // the double rounds it…
+
+        Assert.True(LogEventSerializer.TryReadPropertyNumber(ev.RawProperties, "max", out _, out i, out isInteger, out _));
+        Assert.True(isInteger);
+        Assert.Equal((Int128)ulong.MaxValue, i);           // …the integer does not
+
+        Assert.True(LogEventSerializer.TryReadPropertyNumber(ev.RawProperties, "neg", out _, out i, out isInteger, out _));
+        Assert.Equal((Int128)long.MinValue, i);
+
+        Assert.True(LogEventSerializer.TryReadPropertyNumber(ev.RawProperties, "ratio", out d, out _, out isInteger, out _));
+        Assert.False(isInteger);
+        Assert.Equal(0.1 + 0.2, d);
+        Assert.False(ev.PropertiesMaterialised);
+    }
+
     [Fact]
     public void A_text_predicate_allocates_nothing_per_event()
     {

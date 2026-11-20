@@ -26,6 +26,8 @@
     <!-- The metric label pool's reset interval is measured on TimeProvider timestamps
          (MetricLabelPoolResetTests); MetricTestClock moves wall time only. -->
     <Compile Include="..\Shared\ManualTimeProvider.cs" Link="Shared\ManualTimeProvider.cs" />
+    <!-- Removes a test's data directory, and fails the test when something still holds a file in it. -->
+    <Compile Include="..\Shared\TestDataDirectory.cs" Link="Shared\TestDataDirectory.cs" />
   </ItemGroup>
 
   <ItemGroup>

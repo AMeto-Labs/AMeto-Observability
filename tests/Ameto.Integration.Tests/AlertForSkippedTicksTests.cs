@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Alerts;
 using Ameto.Core;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 
@@ -38,7 +39,7 @@ public sealed class AlertForSkippedTicksTests : IAsyncLifetime
 
     public Task DisposeAsync()
     {
-        try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+        TestDataDirectory.Delete(_dir);   // clears the pool the alert stores' connections to Ameto.db are parked in
         return Task.CompletedTask;
     }
 

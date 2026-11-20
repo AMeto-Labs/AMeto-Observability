@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Alerts;
 using Ameto.Core;
+using Ameto.Testing;
 
 namespace Ameto.Integration.Tests;
 
@@ -16,7 +17,9 @@ public sealed class AlertRuleStoreTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-alerts-" + Guid.NewGuid().ToString("N"));
 
     public AlertRuleStoreTests() => Directory.CreateDirectory(_dir);
-    public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
+    // The store pools its connections to Ameto.db, and so do the ones these facts open to look
+    // behind it; the helper clears the pool.
+    public void Dispose() => TestDataDirectory.Delete(_dir);
 
     /// <summary>Identity protector — keeps the test independent of the AES key file.</summary>
     private sealed class NoopProtector : ISecretProtector

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Ameto.Alerts;
+using Ameto.Testing;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
 
@@ -244,7 +245,7 @@ public sealed class AlertShutdownTests
         {
             await _hosted.StopAsync(CancellationToken.None);
             await _hosted.DisposeAsync();
-            try { Directory.Delete(_dir, recursive: true); } catch { /* best effort */ }
+            TestDataDirectory.Delete(_dir);   // clears the pool the alert stores' connections to Ameto.db are parked in
         }
     }
 

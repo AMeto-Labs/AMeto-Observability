@@ -31,17 +31,23 @@ public sealed class CompiledFilter : IPreparedFilter
 
     private readonly HeaderPredicate? _headerPredicate;
 
-    private CompiledFilter(string? expression, FilterNode root)
+    // How deep an index this filter's hints may rely on (see ForIndexDepth), and the one
+    // shallower copy of it a server asks for, made on first use.
+    private readonly int     _indexDepth;
+    private CompiledFilter?  _atShallowerDepth;
+
+    private CompiledFilter(string? expression, FilterNode root, int indexDepth)
     {
-        Expression     = expression;
         // First, before anything below recurses over the tree: a long `and` / `or` chain
         // arrives from the parser as deep as it is long. See ChainBalancer.
         root           = ChainBalancer.Balance(root);
         root           = RewriteTimeCompares(root);
+        Expression     = expression;
         _root          = root;
-        _trigramHints  = BuildTrigramHints(root);
-        _invertedHints = BuildInvertedHints(root);
-        _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
+        _indexDepth    = Math.Min(indexDepth, FullIndexDepth);
+        _trigramHints  = BuildTrigramHints(root, _indexDepth);
+        _invertedHints = BuildInvertedHints(root, _indexDepth);
+        _hasHint       = TryExtract(root, _indexDepth, out _hintProperty, out _hintValue);
         _headerPredicate = Filtering.HeaderPredicate.TryBuild(root);
 
         long? min = null, max = null;
@@ -50,8 +56,66 @@ public sealed class CompiledFilter : IPreparedFilter
         MaxTimestampTicks = max;
     }
 
+    /// <summary>
+    /// <paramref name="source"/> with its hints worked out again for a shallower index: the tree,
+    /// the header predicate and the time bounds are the source's own — none depends on the depth.
+    /// </summary>
+    private CompiledFilter(CompiledFilter source, int indexDepth)
+    {
+        Expression     = source.Expression;
+        _root          = source._root;
+        _indexDepth    = indexDepth;
+        _trigramHints  = BuildTrigramHints(_root, indexDepth);
+        _invertedHints = BuildInvertedHints(_root, indexDepth);
+        _hasHint       = TryExtract(_root, indexDepth, out _hintProperty, out _hintValue);
+        _headerPredicate  = source._headerPredicate;
+        MinTimestampTicks = source.MinTimestampTicks;
+        MaxTimestampTicks = source.MaxTimestampTicks;
+    }
+
     public static CompiledFilter Compile(string? expression) =>
-        new(expression, FilterParser.Parse(expression));
+        new(expression, FilterParser.Parse(expression), FullIndexDepth);
+
+    /// <summary>
+    /// <see cref="Compile(string?)"/> for an index flattened <paramref name="indexDepth"/> deep —
+    /// the same filter <see cref="ForIndexDepth"/> would give, compiled once instead of twice.
+    /// What a server whose depth is not the default compiles a request's filter with.
+    /// </summary>
+    internal static CompiledFilter Compile(string? expression, int indexDepth) =>
+        new(expression, FilterParser.Parse(expression), indexDepth);
+
+    /// <summary>
+    /// This filter as asked of an index that flattened nested properties only
+    /// <paramref name="depth"/> map levels below the top (<c>Indexing.MaxPropertyFlattenDepth</c>,
+    /// which <c>SegmentIndexBuilder</c> stops at): the same predicate — <see cref="Matches"/> and
+    /// everything else about the filter are unchanged — with only the hints such an index holds
+    /// the values for.
+    ///
+    /// <para>A hint on a user property path with more levels than that, a substring hint on one,
+    /// and free text (which <see cref="FilterEvaluator"/> searches <see cref="FullIndexDepth"/>
+    /// deep whatever the index holds) are left out: the bloom and the trigram index are keyless,
+    /// so the absence of a value the builder never walked down to reads as proof that no row
+    /// holds it, and the group was dropped with the row in it. Without the hint the rows are read
+    /// instead. Header fields are filed at any depth and keep their hints.</para>
+    ///
+    /// <para>At <see cref="FullIndexDepth"/> or deeper this is the filter itself — every hint it
+    /// gives asks for no more than that. Below it, a copy is made the first time and kept on this
+    /// filter, so a filter that is asked again (the live tail's prepared filter, once per poll)
+    /// pays for it once; a request's own filter is compiled at the server's depth to begin with
+    /// (<see cref="Compile(string?, int)"/>). Never adds a hint this filter does not give.</para>
+    /// </summary>
+    internal CompiledFilter ForIndexDepth(int depth)
+    {
+        if (depth >= _indexDepth) return this;
+
+        var kept = Volatile.Read(ref _atShallowerDepth);
+        if (kept is not null && kept._indexDepth == depth) return kept;
+
+        // A race makes two equal copies and keeps the last; either answers the same.
+        var made = new CompiledFilter(this, depth);
+        Volatile.Write(ref _atShallowerDepth, made);
+        return made;
+    }
 
     /// <inheritdoc/>
     public string? Expression { get; }
@@ -213,7 +277,17 @@ public sealed class CompiledFilter : IPreparedFilter
     ///
     /// <para>A predicate on a field the bloom never saw (the exception message or stack,
     /// <c>@t</c>, <c>@id</c>) must not be offered here: the bloom would answer "no" for a
-    /// value it was never given and the whole segment would be dropped.</para>
+    /// value it was never given and the whole segment would be dropped. Nor may a value the
+    /// bloom was never given for that field: the empty string of a header field
+    /// (<see cref="IsUnfiledHeaderValue"/>).</para>
+    ///
+    /// <para><paramref name="propertyName"/> is the inverted bucket the phase-2
+    /// <c>MightContain</c> asks for the value — or EMPTY for a field the bloom holds and no
+    /// bucket does, the message template: its hint is the bloom's alone to answer. A bucket
+    /// named after the filter's own spelling of it (<c>Message</c>, <c>@mt</c>) is a CLIENT
+    /// property's wherever one goes by that name, and it answered for the template: known
+    /// bucket, no such value, the group dropped with the row in it. No hint key is ever empty
+    /// otherwise — <see cref="TryIndexKey"/> refuses an empty property name.</para>
     /// </summary>
     public bool TryGetIndexHint(out string propertyName, out object? value)
     {
@@ -222,7 +296,7 @@ public sealed class CompiledFilter : IPreparedFilter
         return _hasHint;
     }
 
-    private static bool TryExtract(FilterNode node, out string prop, out object? val)
+    private static bool TryExtract(FilterNode node, int indexDepth, out string prop, out object? val)
     {
         prop = string.Empty;
         val  = null;
@@ -230,13 +304,14 @@ public sealed class CompiledFilter : IPreparedFilter
         switch (node)
         {
             case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is not null:
-                if (!TryBloomHintKey(cmp.Property, out prop)) { prop = string.Empty; return false; }
+                if (IsUnfiledHeaderValue(cmp.Property, cmp.Value)
+                    || !TryBloomHintKey(cmp.Property, indexDepth, out prop)) { prop = string.Empty; return false; }
                 val = cmp.Value;
                 return true;
 
             // The hint the CompareNode it replaced would have given, in the index's spelling.
             case TraceIdCompareNode { Op: CompareOp.Eq } tid:
-                if (!TryBloomHintKey(tid.Property, out prop)) { prop = string.Empty; return false; }
+                if (!TryBloomHintKey(tid.Property, indexDepth, out prop)) { prop = string.Empty; return false; }
                 val = tid.Canonical;
                 return true;
 
@@ -245,14 +320,15 @@ public sealed class CompiledFilter : IPreparedFilter
                 val  = lvl.Level.ToSeqString();
                 return true;
 
-            case InNode inNode when inNode.Values.Length == 1 && inNode.Values[0] is not null:
-                if (!TryBloomHintKey(inNode.Property, out prop)) { prop = string.Empty; return false; }
-                val = inNode.Values[0];
+            case InNode inNode when inNode.Values.Length == 1 && inNode.Values[0] is { } only:
+                if (IsUnfiledHeaderValue(inNode.Property, only)
+                    || !TryBloomHintKey(inNode.Property, indexDepth, out prop)) { prop = string.Empty; return false; }
+                val = only;
                 return true;
 
             case AndNode and:
-                if (TryExtract(and.Left, out prop, out val))  return true;
-                if (TryExtract(and.Right, out prop, out val)) return true;
+                if (TryExtract(and.Left, indexDepth, out prop, out val))  return true;
+                if (TryExtract(and.Right, indexDepth, out prop, out val)) return true;
                 return false;
 
             default:
@@ -397,12 +473,15 @@ public sealed class CompiledFilter : IPreparedFilter
     // ── Filter name → index key ───────────────────────────────────────────────
 
     /// <summary>
-    /// Deepest property path the segment index flattens (mirrors
-    /// <c>ServerOptions.MaxPropertyFlattenDepth</c> and
-    /// <c>FilterEvaluator.MaxFlattenDepth</c>): a flat key may carry at most this many
-    /// separators, so a path with more segments than that reaches no bucket.
+    /// The deepest index a hint ever relies on: <c>SegmentIndexBuilder</c>'s default flatten
+    /// depth, five map levels below the top. A user property path is hinted only while it has at
+    /// most that many levels below its first segment (six segments, array subscripts not
+    /// counted), and free text — which <see cref="FilterEvaluator"/> searches exactly this deep —
+    /// relies on all of them. Filters are compiled for an index this deep; a server configured to
+    /// flatten less asks through <see cref="ForIndexDepth"/>, and one configured to flatten more
+    /// holds more than any hint asks for.
     /// </summary>
-    private const int MaxIndexedPathSegments = 6;
+    internal const int FullIndexDepth = IndexingOptions.DefaultMaxPropertyFlattenDepth;
 
     /// <summary>
     /// Translates a filter-side property name into the inverted-index bucket that holds it,
@@ -413,12 +492,13 @@ public sealed class CompiledFilter : IPreparedFilter
     /// <c>@x</c>, <c>Exception</c>, <c>@x.type</c> and <c>Exception.Type</c> all land on the
     /// bucket the builder wrote (<c>@x.type</c>) instead of on their own spelling. User
     /// property paths already share the evaluator's separator with the index, and only need
-    /// their array subscripts removed.</para>
+    /// their array subscripts removed — and must lie within the depth the index was flattened
+    /// to (<see cref="TryFlattenedKey"/>).</para>
     ///
     /// <para>Returning false means "emit no hint": the segment gets scanned, which is
     /// slower and correct. Emitting a key the index does not have is neither.</para>
     /// </summary>
-    private static bool TryIndexKey(string property, out string indexKey)
+    private static bool TryIndexKey(string property, int indexDepth, out string indexKey)
     {
         if (BuiltinFields.TryResolve(property, out var field))
         {
@@ -427,32 +507,68 @@ public sealed class CompiledFilter : IPreparedFilter
             return key is not null;
         }
 
-        indexKey = PropertyPath.StripIndexSegments(property);
-        if (indexKey.Length == 0 || PropertyPath.SegmentCount(indexKey) > MaxIndexedPathSegments)
+        return TryFlattenedKey(property, indexDepth, out indexKey);
+    }
+
+    /// <summary>
+    /// Same mapping for the bloom gate, which is keyless: what matters is whether the
+    /// field's VALUE was ever handed to the filter. The returned key is only used for the
+    /// inverted <c>MightContain</c> that follows, and is EMPTY for the field the bloom holds and
+    /// no bucket does — the message template (see <see cref="TryGetIndexHint"/>).
+    /// </summary>
+    private static bool TryBloomHintKey(string property, int indexDepth, out string key)
+    {
+        if (BuiltinFields.TryResolve(property, out var field))
         {
-            indexKey = string.Empty;
+            if (!BuiltinFields.IsBloomIndexed(field)) { key = string.Empty; return false; }
+            key = BuiltinFields.InvertedKey(field) ?? string.Empty;
+            return true;
+        }
+
+        // A user property's value is bloomed exactly when the property is indexed at all.
+        return TryIndexKey(property, indexDepth, out key);
+    }
+
+    /// <summary>
+    /// The bucket a USER property path is filed under, when an index flattened to
+    /// <paramref name="indexDepth"/> files it at all: the path without its array subscripts —
+    /// <c>SegmentIndexBuilder</c> files every element of an array under the bare key, and an
+    /// array adds no level — with at most <paramref name="indexDepth"/> map levels below its
+    /// first segment, the deepest the builder walks down to. Deeper, the builder skips the map
+    /// unread: no bucket, no bloom text, no trigram holds its values. Also asked by the
+    /// substring hints (<see cref="IsTrigramCovered"/>), which rely on the same walk.
+    /// </summary>
+    private static bool TryFlattenedKey(string property, int indexDepth, out string key)
+    {
+        key = PropertyPath.StripIndexSegments(property);
+        if (key.Length == 0 || PropertyPath.SegmentCount(key) - 1 > indexDepth)
+        {
+            key = string.Empty;
             return false;
         }
         return true;
     }
 
     /// <summary>
-    /// Same mapping for the bloom gate, which is keyless: what matters is whether the
-    /// field's VALUE was ever handed to the filter. The returned key is only used for the
-    /// inverted <c>MightContain</c> that follows.
+    /// True for the one literal no header field is ever filed under: the empty string, on a
+    /// built-in field. <c>SegmentIndexBuilder</c> files the template, the service and the
+    /// exception types only when they are not empty, and a level, a trace id or a span id never
+    /// is — so no header bucket holds the empty value, and the bloom holds the empty text only
+    /// where some PROPERTY in the group happened to give it (a nil, an empty string). The scan,
+    /// meanwhile, matches <c>@mt = ''</c> against an event that has no template — the filter the
+    /// client's "find all like this" builds for one — and <c>@x.type = ''</c> and
+    /// <c>@x.inner.type = ''</c> against an exception whose type is empty. So such a predicate
+    /// gives no hint and is answered by reading the rows; another conjunct of the filter still
+    /// narrows them. A user property's empty string IS filed, and keeps its hint.
+    ///
+    /// <para>The rule is the builder's, not the scan's, so it covers every built-in alike —
+    /// including those no event can match with <c>''</c> (an event logged without a service
+    /// carries none, not an empty one): those read their rows to find nothing, which costs
+    /// time on a filter nobody means, where a rule per field would cost rows the day an ingest
+    /// path starts handing one of them an empty value.</para>
     /// </summary>
-    private static bool TryBloomHintKey(string property, out string key)
-    {
-        if (BuiltinFields.TryResolve(property, out var field))
-        {
-            if (!BuiltinFields.IsBloomIndexed(field)) { key = string.Empty; return false; }
-            key = BuiltinFields.InvertedKey(field) ?? property;
-            return true;
-        }
-
-        // A user property's value is bloomed exactly when the property is indexed at all.
-        return TryIndexKey(property, out key);
-    }
+    private static bool IsUnfiledHeaderValue(string property, object value) =>
+        value is string { Length: 0 } && BuiltinFields.TryResolve(property, out _);
 
     /// <summary>
     /// Returns text tokens suitable for trigram index lookup (from Contains / Like nodes).
@@ -530,14 +646,14 @@ public sealed class CompiledFilter : IPreparedFilter
         return rest.Count == 0 ? Array.Empty<(string, object?)>() : rest;
     }
 
-    private static IReadOnlyList<(string, object?)> BuildInvertedHints(FilterNode root)
+    private static IReadOnlyList<(string, object?)> BuildInvertedHints(FilterNode root, int indexDepth)
     {
         var list = new List<(string, object?)>(4);
-        CollectInvertedHints(root, list);
+        CollectInvertedHints(root, indexDepth, list);
         return list.Count == 0 ? Array.Empty<(string, object?)>() : list;
     }
 
-    private static void CollectInvertedHints(FilterNode node, List<(string, object?)> out_)
+    private static void CollectInvertedHints(FilterNode node, int indexDepth, List<(string, object?)> out_)
     {
         // Asked first, because the node kinds it reads are ones the switch below gives no hint
         // for (has / isDefined) or the wrong one (`@x.exists = …`, whose field has no value
@@ -554,21 +670,24 @@ public sealed class CompiledFilter : IPreparedFilter
             // as null and matches, but the index only files events that carried an explicit
             // nil, so the posting list is a subset of the matches. `A = B` is not hinted
             // either — its right side is read off the event, so there is no value to look up.
+            // Nor is a header field's empty string, which no bucket holds (IsUnfiledHeaderValue).
             case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is not null:
-                if (TryIndexKey(cmp.Property, out string cmpKey)) out_.Add((cmpKey, cmp.Value));
+                if (!IsUnfiledHeaderValue(cmp.Property, cmp.Value) && TryIndexKey(cmp.Property, indexDepth, out string cmpKey))
+                    out_.Add((cmpKey, cmp.Value));
                 break;
             case TraceIdCompareNode { Op: CompareOp.Eq } tid:
-                if (TryIndexKey(tid.Property, out string tidKey)) out_.Add((tidKey, tid.Canonical));
+                if (TryIndexKey(tid.Property, indexDepth, out string tidKey)) out_.Add((tidKey, tid.Canonical));
                 break;
             case LevelNode lvl:
                 out_.Add((ClefFields.Level, lvl.Level.ToSeqString()));
                 break;
-            case InNode inNode when inNode.Values.Length == 1 && inNode.Values[0] is not null:
-                if (TryIndexKey(inNode.Property, out string inKey)) out_.Add((inKey, inNode.Values[0]));
+            case InNode inNode when inNode.Values.Length == 1 && inNode.Values[0] is { } only:
+                if (!IsUnfiledHeaderValue(inNode.Property, only) && TryIndexKey(inNode.Property, indexDepth, out string inKey))
+                    out_.Add((inKey, only));
                 break;
             case AndNode and:
-                CollectInvertedHints(and.Left,  out_);
-                CollectInvertedHints(and.Right, out_);
+                CollectInvertedHints(and.Left,  indexDepth, out_);
+                CollectInvertedHints(and.Right, indexDepth, out_);
                 break;
             // Deliberately skip OrNode — OR is too broad for intersection
         }
@@ -629,10 +748,10 @@ public sealed class CompiledFilter : IPreparedFilter
         }
     }
 
-    private static IReadOnlyList<(string, string)> BuildTrigramHints(FilterNode root)
+    private static IReadOnlyList<(string, string)> BuildTrigramHints(FilterNode root, int indexDepth)
     {
         var list = new List<(string, string)>(4);
-        CollectTrigram(root, list);
+        CollectTrigram(root, indexDepth, list);
         return list.Count == 0 ? Array.Empty<(string, string)>() : list;
     }
 
@@ -648,10 +767,16 @@ public sealed class CompiledFilter : IPreparedFilter
     /// events were hot and zero the moment the segment flushed. Same shape as the seed
     /// defect, different index.</para>
     ///
-    /// <para>User properties are covered: the builder trigrams every scalar it flattens.</para>
+    /// <para>User properties are covered as far down as the builder flattens them, which is
+    /// as far as it trigrams them: every scalar it walks to, and nothing below. The trigram
+    /// index is global text, so a hint on a deeper path — <c>contains(a.b.c.d.e.f.g, …)</c> on a
+    /// seven-level value — looked up text no group holds and dropped every one, while
+    /// <see cref="TryIndexKey"/> had capped the equality on the same path all along.</para>
     /// </summary>
-    private static bool IsTrigramCovered(string property) =>
-        !BuiltinFields.TryResolve(property, out var field) || BuiltinFields.IsTrigramIndexed(field);
+    private static bool IsTrigramCovered(string property, int indexDepth) =>
+        BuiltinFields.TryResolve(property, out var field)
+            ? BuiltinFields.IsTrigramIndexed(field)
+            : TryFlattenedKey(property, indexDepth, out _);
 
     /// <summary>
     /// Both SQL wildcards, so a LIKE pattern is cut into the literal runs the event text
@@ -662,34 +787,36 @@ public sealed class CompiledFilter : IPreparedFilter
     /// </summary>
     private static readonly char[] LikeWildcards = ['%', '_'];
 
-    private static void CollectTrigram(FilterNode node, List<(string, string)> out_)
+    private static void CollectTrigram(FilterNode node, int indexDepth, List<(string, string)> out_)
     {
         switch (node)
         {
-            case ContainsNode ct when ct.Text.Length >= 3 && IsTrigramCovered(ct.Property):
+            case ContainsNode ct when ct.Text.Length >= 3 && IsTrigramCovered(ct.Property, indexDepth):
                 out_.Add((ct.Property, ct.Text));
                 break;
 
-            case StartsWithNode sw when sw.Prefix.Length >= 3 && IsTrigramCovered(sw.Property):
+            case StartsWithNode sw when sw.Prefix.Length >= 3 && IsTrigramCovered(sw.Property, indexDepth):
                 out_.Add((sw.Property, sw.Prefix));
                 break;
 
-            case LikeNode like when IsTrigramCovered(like.Property):
+            case LikeNode like when IsTrigramCovered(like.Property, indexDepth):
                 // Extract every non-wildcard run long enough for the trigram index
                 foreach (var p in like.Pattern.Split(LikeWildcards))
                     if (p.Length >= 3) out_.Add((like.Property, p));
                 break;
 
-            case FreeTextNode ft:
-                // Each 3+ char term narrows candidate blocks via the trigram index
-                // (property is ignored by LookupTrigram — the index is global text).
+            // Each 3+ char term narrows candidate blocks via the trigram index (property is
+            // ignored by LookupTrigram — the index is global text). Only from an index that
+            // trigrammed every level free text searches: FilterEvaluator matches a term in a
+            // string FullIndexDepth levels down, and an index flattened less never held it.
+            case FreeTextNode ft when indexDepth >= FilterEvaluator.MaxFlattenDepth:
                 foreach (var term in ft.Terms)
                     if (term.Length >= 3) out_.Add((string.Empty, term));
                 break;
 
             case AndNode and:
-                CollectTrigram(and.Left,  out_);
-                CollectTrigram(and.Right, out_);
+                CollectTrigram(and.Left,  indexDepth, out_);
+                CollectTrigram(and.Right, indexDepth, out_);
                 break;
 
             // Deliberately skip OrNode — the consumer intersects every hint as a
