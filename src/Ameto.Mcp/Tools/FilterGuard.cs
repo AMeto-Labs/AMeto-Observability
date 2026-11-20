@@ -247,10 +247,10 @@ internal static class FilterGuard
         foreach (var aggregate in asWritten.Aggregates)
         {
             if (aggregate.Property is not { } property || aggregate.Kind == AggregateKind.Count) continue;
-            if (IsHidden(policy, property))
+            if (IsHidden(policy, property, profile.Services))
                 return Refused($"{PropertyPath.ToDisplay(property)} is a hidden field: it can be counted, not summed, averaged or ranged.",
                                RefusalKind.Masking);
-            if (!BuiltinFields.TryResolve(property, out _) && policy.KeepsEverywhere(RulePath(property)))
+            if (!BuiltinFields.TryResolve(property, out _) && policy.KeepsEverywhere(RulePath(property), profile.Services))
                 (kept ??= new HashSet<AggregateSpec>(ReferenceEqualityComparer.Instance)).Add(aggregate);
             if (properties.Add(property)) firstOfProperty.Add(aggregate);
         }
@@ -333,18 +333,45 @@ internal static class FilterGuard
         return TryNumber(text, out object? number) && TryWriteNumber(sb, number!) ? sb.ToString() : null;
     }
 
-    /// <summary>True when a path names a field whose value never leaves as stored. A built-in field is never one.</summary>
-    public static bool IsHidden(MaskingPolicy policy, string encodedPath) =>
-        !BuiltinFields.TryResolve(encodedPath, out _) && policy.HidesField(RulePath(encodedPath));
+    /// <summary>
+    /// True when a path names a field whose value never leaves as stored in some event a profile
+    /// that reads <paramref name="services"/> can be shown (null or empty: every service). A
+    /// built-in field is never one.
+    /// </summary>
+    public static bool IsHidden(MaskingPolicy policy, string encodedPath, IReadOnlyList<string>? services = null) =>
+        !BuiltinFields.TryResolve(encodedPath, out _) && policy.HidesField(RulePath(encodedPath), services);
 
     /// <summary>
-    /// A path as a rule spells it: names joined by dots, with the positions written as
-    /// subscripts (<c>Items[0]</c>) left out. A position written any other way — <c>Items.0</c>,
+    /// A path as the rules know it — which is the path the answer judges a value by: the names
+    /// walked down to the value, each put under the one before it by the answer's own function
+    /// (<see cref="MaskingPolicy.Under"/>), with the positions written as subscripts
+    /// (<c>Items[0]</c>) left out. A position written any other way — <c>Items.0</c>,
     /// <c>Items[' 0']</c> — is still in it, and is the masking policy's to recognise: it asks
     /// the engine's own question of every segment (<see cref="PropertyPath.TryReadPosition"/>).
+    ///
+    /// <para>It was made of <see cref="PropertyPath.ToDisplay"/> once, which writes a path for a
+    /// person to read and puts a dot only after something it has already written: a first name
+    /// that is empty went, and its dot with it. <c>[''].Pin</c> was judged as <c>Pin</c>, the
+    /// answer judged the value as <c>.Pin</c>, and under a rule on <c>*.Pin</c> a filter and a
+    /// table read what the answer hid (the fifth review). Every name keeps its place here,
+    /// the empty one too.</para>
+    ///
+    /// <para>A path of one segment is a property's name as it is stored, whatever it begins
+    /// with: the engine looks that name up as it is.</para>
     /// </summary>
-    internal static string RulePath(string encodedPath) =>
-        PropertyPath.ToDisplay(PropertyPath.StripIndexSegments(encodedPath));
+    internal static string RulePath(string encodedPath)
+    {
+        if (!PropertyPath.IsNested(encodedPath)) return encodedPath;
+
+        string? path = null;
+        foreach (var segment in encodedPath.AsSpan().Split(PropertyPath.Separator))
+        {
+            var name = encodedPath.AsSpan(segment);
+            if (PropertyPath.IsIndexSegment(name)) continue;
+            path = path is null ? name.ToString() : MaskingPolicy.Under(path, name);
+        }
+        return path ?? "";
+    }
 
     // ── Judging a tree ────────────────────────────────────────────────────────
 
@@ -434,8 +461,8 @@ internal static class FilterGuard
             {
                 // Two fields compared with each other: whether they are equal is something about
                 // both values, so neither may be a hidden one.
-                if (IsHidden(policy, compare.Property)) return Refuse(Prepared.Hidden(HiddenField(compare.Property)));
-                if (IsHidden(policy, right))            return Refuse(Prepared.Hidden(HiddenField(right)));
+                if (IsHidden(policy, compare.Property, services)) return Refuse(Prepared.Hidden(HiddenField(compare.Property)));
+                if (IsHidden(policy, right, services))            return Refuse(Prepared.Hidden(HiddenField(right)));
                 return compare;
             }
 
@@ -448,7 +475,7 @@ internal static class FilterGuard
                 if (BuiltinFields.TryResolve(compare.Property, out _)) return Refuse(Prepared.Hidden(TokenOnBuiltIn(compare.Value!, compare.Property)));
                 return Operand(compare.Value, compare.Property, out object? value) ? new CompareNode(compare.Property, compare.Op, value) : null;
             }
-            if (!equality && IsHidden(policy, compare.Property)) return Refuse(Prepared.Hidden(HiddenField(compare.Property)));
+            if (!equality && IsHidden(policy, compare.Property, services)) return Refuse(Prepared.Hidden(HiddenField(compare.Property)));
             return compare;
         }
 
@@ -456,7 +483,7 @@ internal static class FilterGuard
         private bool Reads(string property, object? operand)
         {
             if (IsToken(operand, out _)) { Refuse(Prepared.Hidden(TokenMisplaced(operand!))); return false; }
-            if (IsHidden(policy, property)) { Refuse(Prepared.Hidden(HiddenField(property))); return false; }
+            if (IsHidden(policy, property, services)) { Refuse(Prepared.Hidden(HiddenField(property))); return false; }
             return true;
         }
 

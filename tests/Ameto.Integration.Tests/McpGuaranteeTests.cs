@@ -893,6 +893,141 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
         Assert.Contains("shows its values as they are stored", refused);
         var (wideFields, _) = await Call(wide, "logs_fields");
         Assert.Matches(@"TenantRef\s+3\s+string\s+= only, no token", wideFields);
+
+        // A profile that reads the other service alone is shown the field as stored in every
+        // event it has — so to it the field is not a hidden one: it may match it and group by
+        // it, and logs_fields marks nothing. The rule is another service's, and nothing to it.
+        var (_, otherKey) = await McpTesting.CreateProfileAsync(admin, new { name = "reads the other service", services = new[] { other } });
+        await using var elsewhere = await McpTesting.ConnectAsync(host, otherKey);
+        var (matched, matchedError) = await Call(elsewhere, "logs_search", ("filter", "TenantRef like 'T-77%'"));
+        Assert.False(matchedError, matched);
+        Assert.Contains("1 event", matched);
+        Assert.Contains("T-778899", matched);
+        var (grouped, groupedError) = await Call(elsewhere, "logs_aggregate", ("query", "select count(*) group by TenantRef"));
+        Assert.False(groupedError, grouped);
+        Assert.Contains("T-778899", grouped);
+        var (otherFields, _) = await Call(elsewhere, "logs_fields");
+        Assert.Matches(@"TenantRef\s+1\s+string\s+T-778899", otherFields);
+
+        // The profile of the rule's own service is held to equality, as before — and its table shows tokens.
+        var (held, heldError) = await Call(own, "logs_search", ("filter", "TenantRef like 'T-77%'"));
+        Assert.True(heldError, held);
+        Assert.Contains("hidden field", held);
+        var (ownGrouped, _) = await Call(own, "logs_aggregate", ("query", "select count(*) group by TenantRef"));
+        Assert.DoesNotContain("T-778899", ownGrouped);
+        Assert.Contains(token, ownGrouped);
+    }
+
+    /// <summary>
+    /// The fifth review's hole. A property under an empty name is <c>.DoorPin</c> to the answer,
+    /// which a rule on <c>*.DoorPin</c> hides — and was <c>DoorPin</c> to the guard, which that
+    /// rule does not name: a pattern matched the hidden value, and a table gave the values out
+    /// as its keys.
+    /// </summary>
+    [Fact]
+    public async Task APropertyUnderAnEmptyName_IsHiddenFromAFilterAndATable_AsItIsInTheAnswer()
+    {
+        var admin = await host.AdminAsync();
+        await Rule(admin, new { field = "*.DoorPin", action = "hash" });
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin,
+            new(service, "Entered {Who}") { Properties = { ["Who"] = "first",  [""] = new Dictionary<string, object?> { ["DoorPin"] = "pin-QZKW-7316" } } },
+            new(service, "Entered {Who}") { Properties = { ["Who"] = "second", [""] = new Dictionary<string, object?> { ["DoorPin"] = "pin-XVBN-0425" } } });
+        var (_, key) = await McpTesting.CreateProfileAsync(admin, new { name = "empty name", services = new[] { service } });
+        await using var client = await McpTesting.ConnectAsync(host, key);
+
+        var (all, _) = await Call(client, "logs_search");
+        Assert.Contains("2 events", all);
+        Assert.DoesNotContain("QZKW", all);
+        Assert.DoesNotContain("XVBN", all);
+        var (first, _) = await Call(client, "logs_search", ("filter", "Who = 'first'"));
+        string token = McpTesting.Token.Match(first).Value;
+        Assert.NotEmpty(token);
+
+        // What may not be asked of a hidden field may not be asked of this one, however it is spelled.
+        foreach (var (tool, argument, text) in ((string, string, string)[])
+                 [
+                     ("logs_search",    "filter", "[''].DoorPin like 'pin-QZ%'"),
+                     ("logs_search",    "filter", "['']['DoorPin'] > 'pin-Q'"),
+                     ("logs_search",    "filter", "startsWith(['.DoorPin'], 'pin-QZ')"),
+                     ("logs_aggregate", "query",  "select max([''].DoorPin)"),
+                 ])
+        {
+            var (answer, isError) = await Call(client, tool, (argument, text));
+            Assert.True(isError, answer);
+            Assert.Contains("hidden field", answer);
+        }
+
+        // A table's keys are the tokens a search shows…
+        var (grouped, groupedError) = await Call(client, "logs_aggregate", ("query", "select count(*) group by [''].DoorPin"));
+        Assert.False(groupedError, grouped);
+        Assert.DoesNotContain("QZKW", grouped);
+        Assert.DoesNotContain("XVBN", grouped);
+        Assert.Contains(token, grouped);
+
+        // …and a token is at home there: it finds its event, and the answer shows the token.
+        var (found, foundError) = await Call(client, "logs_search", ("filter", $"[''].DoorPin = '{token}'"));
+        Assert.False(foundError, found);
+        Assert.Contains("1 event", found);
+        Assert.Contains("first", found);
+        Assert.DoesNotContain("QZKW", found);
+    }
+
+    /// <summary>
+    /// A <c>keep</c> vouches for the value at its own path. Written on <c>giftcard</c> for the
+    /// property that holds a card's brand, it lets the attributes under that name through Strict
+    /// mode — and does not send <c>shop.giftcard.number</c> as stored: the detectors look
+    /// through it as they do through a property no rule names (the fifth review).
+    /// </summary>
+    [Fact]
+    public async Task AKeepOnAName_DoesNotVouchForACardNumberUnderIt()
+    {
+        var admin = await host.AdminAsync();
+        await Rule(admin, new { field = "giftcard", action = "keep" });
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin, new McpTesting.Event(service, "Sold at {Till}")
+        {
+            Properties =
+            {
+                ["Till"]                 = "till-QW",
+                ["GiftCard"]             = "VISA-GOLD",              // the rule's own path
+                ["shop.giftcard.number"] = "4111111111111111",       // under it, by the middle of a name
+                ["shop.giftcard.holder"] = "ZX HOLDER",
+                ["shop.method"]          = "4111111111111111",       // no rule at all
+            },
+        });
+        var (_, standard) = await McpTesting.CreateProfileAsync(admin, new { name = "keep above, standard", services = new[] { service } });
+        var (_, strict)   = await McpTesting.CreateProfileAsync(admin, new { name = "keep above, strict", services = new[] { service }, maskingMode = "strict" });
+
+        foreach (var (key, isStrict) in ((string, bool)[])[(standard, false), (strict, true)])
+        {
+            await using var client = await McpTesting.ConnectAsync(host, key);
+
+            var (search, _) = await Call(client, "logs_search");
+            Assert.Contains("1 event", search);
+            Assert.DoesNotContain("4111111111111111", search);
+            Assert.Contains("VISA-GOLD", search);                                    // as stored
+            Assert.Contains("ZX HOLDER", search);                                    // let through, in Strict too
+            Assert.Equal(isStrict, !search.Contains("till-QW"));                     // what no rule names, Strict hides
+
+            // The card is one token wherever a detector, or Strict mode, hid it — and a table shows no more.
+            var (table, tableError) = await Call(client, "logs_aggregate", ("query", "select count(*) group by shop.giftcard.number"));
+            Assert.False(tableError, table);
+            Assert.DoesNotContain("4111111111111111", table);
+            string token = McpTesting.Token.Match(table).Value;
+            Assert.NotEmpty(token);
+            Assert.Contains(token, search);
+
+            // Under the keep the field is one a filter may order and match, as a property no rule names is…
+            var (matched, matchedError) = await Call(client, "logs_search", ("filter", "shop.giftcard.holder like 'ZX%'"));
+            Assert.False(matchedError, matched);
+            Assert.Contains("1 event", matched);
+            // …and the card's token is compared there: the detector hides the card in that field too.
+            var (found, foundError) = await Call(client, "logs_search", ("filter", $"shop.giftcard.number = '{token}'"));
+            Assert.False(foundError, found);
+            Assert.Contains("1 event", found);
+            Assert.DoesNotContain("4111111111111111", found);
+        }
     }
 
     [Fact]

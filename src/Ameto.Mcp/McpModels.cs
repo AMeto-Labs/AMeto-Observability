@@ -14,7 +14,10 @@ public enum McpMaskingMode
 {
     /// <summary>It goes out as stored, after the value detectors have looked through it.</summary>
     Standard = 0,
-    /// <summary>It is hashed. Only fields with a <see cref="MaskAction.Keep"/> rule go out as stored.</summary>
+    /// <summary>
+    /// It is hashed. A <see cref="MaskAction.Keep"/> rule is the way out: the field it names goes
+    /// out as stored, and what is under that field goes past the value detectors instead.
+    /// </summary>
     Strict = 1,
 }
 
@@ -27,7 +30,11 @@ public enum MaskAction
     Remove = 1,
     /// <summary>Show the last four characters, hide the rest.</summary>
     KeepLast4 = 2,
-    /// <summary>Send the value as stored, detectors included: the allow-list of <see cref="McpMaskingMode.Strict"/>.</summary>
+    /// <summary>
+    /// Send the value at the rule's own path as stored — the detectors leave it alone. What is
+    /// spelled under that path is let through <see cref="McpMaskingMode.Strict"/> and still looked
+    /// through by the detectors. The allow-list of Strict mode.
+    /// </summary>
     Keep = 3,
 }
 

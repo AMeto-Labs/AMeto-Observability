@@ -363,9 +363,9 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
         {
             var cells = new string?[header.Count];
             for (int k = 0; k < row.Key.Length; k++)
-                cells[k] = GroupKey(query.Keys[k].Property, row.Key[k], policy, stats) is { } key ? EventTable.Cell(key) : null;
+                cells[k] = GroupKey(query.Keys[k].Property, row.Key[k], policy, stats, call.Profile.Services) is { } key ? EventTable.Cell(key) : null;
             for (int v = 0; v < row.Values.Length; v++)
-                cells[row.Key.Length + v] = Cell(query.Aggregates[v], row.Values[v], policy, stats);
+                cells[row.Key.Length + v] = Cell(query.Aggregates[v], row.Values[v], policy, stats, call.Profile.Services);
             rows.Add(cells);
         }
 
@@ -402,11 +402,14 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
     /// <summary>
     /// One number of a table. A count is a count; any other aggregate is made of the values
     /// themselves — a maximum is one of them — so it goes past the detectors like a value does.
+    /// A table is made of the events the calling profile reads, and its cells are judged by the
+    /// rules of those services (<paramref name="services"/>), as its where-clause is.
     /// </summary>
-    private static string? Cell(AggregateSpec aggregate, double? value, MaskingPolicy policy, MaskStats stats) =>
+    private static string? Cell(
+        AggregateSpec aggregate, double? value, MaskingPolicy policy, MaskStats stats, IReadOnlyList<string> services) =>
         value is not { } number ? null
         : aggregate.Kind == AggregateKind.Count || aggregate.Property is null ? Number(number)
-        : policy.MaskNumber(FilterGuard.RulePath(aggregate.Property), number, stats);
+        : policy.MaskNumber(FilterGuard.RulePath(aggregate.Property), number, stats, services);
 
     /// <summary>Runs an aggregation whose where-clause already carries the profile's scope (see <see cref="FilterGuard"/>).</summary>
     private async Task<AggregationResult> RunAggregationAsync(
@@ -419,11 +422,11 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
     /// an exception's message, its stack) and go past the detectors as they do in a search.
     /// Everything else is a property, whatever its name begins with, and the rules judge it.
     /// </summary>
-    private static string? GroupKey(string encoded, string? value, MaskingPolicy policy, MaskStats stats)
+    private static string? GroupKey(string encoded, string? value, MaskingPolicy policy, MaskStats stats, IReadOnlyList<string> services)
     {
         if (value is null) return null;
         if (!BuiltinFields.TryResolve(encoded, out var field))
-            return policy.MaskGroupKey(FilterGuard.RulePath(encoded), value, stats);
+            return policy.MaskGroupKey(FilterGuard.RulePath(encoded), value, stats, services);
         return field is BuiltinField.MessageTemplate or BuiltinField.ExceptionMessage
                      or BuiltinField.ExceptionStack or BuiltinField.InnerExceptionMessage
             ? policy.MaskText(value, stats)
@@ -707,9 +710,11 @@ internal sealed class LogTools(IQueryExecutor executor, StorageEngine storage, M
                     info.Count.ToString(CultureInfo.InvariantCulture),
                     string.Join('|', info.Types),
                     // "= only": tested for equality only, and a token may be compared with it. A
-                    // field that some service this profile reads shows as stored is tested the
-                    // same way, but a token compared with it would find its value there in the open.
-                    !policy.HidesField(info.Stored) ? ""
+                    // field that only some of the services this profile reads hide is tested the
+                    // same way, but a token compared with it would find its value in the open in
+                    // the others. A field hidden only in services the profile does not read is,
+                    // to this profile, not a hidden one.
+                    !policy.HidesField(info.Stored, call.Profile.Services) ? ""
                         : policy.HidesEverywhere(info.Stored, call.Profile.Services) ? "= only" : "= only, no token",
                     string.Join(", ", info.Examples),
                 ]);

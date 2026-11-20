@@ -151,8 +151,28 @@ public sealed class MaskedEvent
 /// </summary>
 public sealed class MaskingPolicy
 {
-    /// <summary>Ordered so that the more protective of two matching rules is the greater.</summary>
-    internal enum Decision : byte { None = 0, Keep = 1, KeepLast4 = 2, Hash = 3, Remove = 4 }
+    /// <summary>
+    /// What the rules do to a value. Ordered so that of two matching rules the greater decides:
+    /// the more protective of two that hide, and of two <c>keep</c>s the one on the path itself.
+    /// </summary>
+    internal enum Decision : byte
+    {
+        /// <summary>No rule names the path or a path above it: the mode decides — the detectors in Standard, a hash in Strict.</summary>
+        None = 0,
+
+        /// <summary>
+        /// A <c>keep</c> on a path above: Strict mode does not hide the value, and the detectors
+        /// look through it as they do through a value no rule names in Standard mode.
+        /// </summary>
+        Open = 1,
+
+        /// <summary>A <c>keep</c> on the path itself: sent as stored, the detectors leave it alone.</summary>
+        Keep = 2,
+
+        KeepLast4 = 3,
+        Hash      = 4,
+        Remove    = 5,
+    }
 
     private sealed record Rule(string Id, string Pattern, bool LeafToo, string[] Services, Decision Decision);
 
@@ -217,12 +237,23 @@ public sealed class MaskingPolicy
     /// <c>client.id</c> went out as stored, while a filter on it was judged as one on a hidden
     /// field — and a token compared with it found its value in the open (the fourth review).</para>
     ///
-    /// <para><b>A rule from above hides or keeps; it does not cut.</b> <c>keepLast4</c> is about
-    /// the value at its own path. Of an object there are no last four characters, so the object
-    /// is hashed whole, and so is everything spelled under the rule's path: one answer for
-    /// <c>Card: { Pan }</c> and for a property named <c>Card.Pan</c>, and the same for a table
-    /// grouped by <c>Card.Pan</c> — which once showed the last four characters of what a search
-    /// hid whole.</para>
+    /// <para><b>A rule from above hides, or lets through; it does not cut, and it does not
+    /// vouch.</b> <c>keepLast4</c> and <c>keep</c> are about the value at their own path.</para>
+    /// <list type="bullet">
+    /// <item>Of an object there are no last four characters, so under a <c>keepLast4</c> the
+    /// object is hashed whole, and so is everything spelled under the rule's path: one answer
+    /// for <c>Card: { Pan }</c> and for a property named <c>Card.Pan</c>, and the same for a
+    /// table grouped by <c>Card.Pan</c> — which once showed the last four characters of what a
+    /// search hid whole.</item>
+    /// <item>A <c>keep</c> says of the value at its path that it is safe as stored. Of what is
+    /// spelled under that path it says only that Strict mode is not to hide it
+    /// (<see cref="Decision.Open"/>): the detectors go on looking through it. A <c>keep</c> on
+    /// <c>card</c>, written for the property that holds a card's brand, sent
+    /// <c>payment.card.number</c> as stored otherwise — and since a pattern without a dot is
+    /// tried against the last segment at every level, any part of a dotted name would do (the
+    /// fifth review). To send what is under a path as stored, a rule names it:
+    /// <c>payment.card.number</c>, or <c>payment.*</c>.</item>
+    /// </list>
     ///
     /// <para>Of several rules as protective as each other the nearest decides: the one on the
     /// path itself before one above it. Its id is what the count of a rule's own hits is kept
@@ -239,7 +270,12 @@ public sealed class MaskingPolicy
             ReadOnlySpan<char> leaf = lastDot < 0 ? default : at[(lastDot + 1)..];
             foreach (var rule in _rules)
             {
-                Decision does = above && rule.Decision == Decision.KeepLast4 ? Decision.Hash : rule.Decision;
+                Decision does = !above ? rule.Decision : rule.Decision switch
+                {
+                    Decision.KeepLast4 => Decision.Hash,
+                    Decision.Keep      => Decision.Open,
+                    _                  => rule.Decision,
+                };
                 if (does <= best) continue;
                 if (rule.Services.Length > 0 && !InScope(rule.Services, service)) continue;
                 if (Glob(rule.Pattern, at) || (rule.LeafToo && lastDot >= 0 && Glob(rule.Pattern, leaf)))
@@ -254,20 +290,46 @@ public sealed class MaskingPolicy
     }
 
     /// <summary>
+    /// The path of the property <paramref name="name"/> under <paramref name="path"/>: the two
+    /// with a dot between them, whatever either holds — an empty name keeps its dot.
+    ///
+    /// <para>The one spelling of "under". The answer makes a path of it as it walks down an
+    /// object, and a question's path is made of the same call, name by name
+    /// (<c>FilterGuard.RulePath</c>): the two were spelled apart once, and a property under an
+    /// empty name was <c>.Pin</c> to the answer and <c>Pin</c> to the guard.</para>
+    /// </summary>
+    internal static string Under(string path, ReadOnlySpan<char> name) => string.Concat(path.AsSpan(), ".", name);
+
+    /// <summary>
     /// What the rules do to the value at a path over everything a question can be about: every
     /// way the path can be read (<see cref="Readings"/>) and every kind of service.
     /// </summary>
     /// <param name="Hides">
     /// The most protective thing done to it anywhere — cut, hashed or removed by a rule, or hashed
-    /// by Strict mode. <see cref="Decision.None"/> when it leaves as stored wherever it is read.
+    /// by Strict mode. <see cref="Decision.None"/> when no rule and no mode hides it wherever it
+    /// is read: it is the detectors' to look through, or a <c>keep</c>'s to send as stored.
     /// </param>
     /// <param name="RuleId">The rule that does it, when a rule does.</param>
-    /// <param name="KeptEverywhere">A <c>keep</c> decides it in every reading and every service: it is sent as stored wherever it is read.</param>
+    /// <param name="KeptEverywhere">
+    /// A <c>keep</c> on the path itself decides it in every reading and every service: it is sent
+    /// as stored wherever it is read. Not so under a <c>keep</c> on a path above
+    /// (<see cref="Decision.Open"/>), where a detector may still hide it.
+    /// </param>
     /// <param name="HiddenWholeEverywhere">Hashed or removed, in every reading and every service.</param>
-    /// <param name="ShownSomewhere">Somewhere a rule shows it: whole (<c>keep</c>), or its last four characters (<c>keepLast4</c>).</param>
+    /// <param name="ShownSomewhere">
+    /// Somewhere a rule shows it whatever it is: whole (a <c>keep</c> on the path itself), or its
+    /// last four characters (<c>keepLast4</c>). A value let through from above is not shown in
+    /// this sense — what a detector knows is hidden there as it is in a field no rule names.
+    /// </param>
+    /// <param name="LooseSomewhere">
+    /// Somewhere it is the detectors' to decide: no rule names it in Standard mode, or a
+    /// <c>keep</c> above it let it through. What they find in it is hidden there, whatever a rule
+    /// shows of it elsewhere.
+    /// </param>
     /// <param name="Unread">The path can be read more ways than are tried: everything above is then the answer on the safe side.</param>
     private readonly record struct Verdict(
-        Decision Hides, string? RuleId, bool KeptEverywhere, bool HiddenWholeEverywhere, bool ShownSomewhere, bool Unread = false);
+        Decision Hides, string? RuleId, bool KeptEverywhere, bool HiddenWholeEverywhere, bool ShownSomewhere,
+        bool LooseSomewhere = false, bool Unread = false);
 
     /// <summary>
     /// Asks <see cref="Decide"/> about every reading of <paramref name="path"/> in every kind of
@@ -282,30 +344,33 @@ public sealed class MaskingPolicy
     private Verdict Judge(string path, IReadOnlyList<string>? services = null)
     {
         if (Readings(path) is not { } readings)
-            return new Verdict(Decision.Hash, null, KeptEverywhere: false, HiddenWholeEverywhere: false, ShownSomewhere: true, Unread: true);
+            return new Verdict(Decision.Hash, null, KeptEverywhere: false, HiddenWholeEverywhere: false, ShownSomewhere: true,
+                               LooseSomewhere: true, Unread: true);
 
         IReadOnlyList<string?> kinds = _serviceKinds;
         if (services is { Count: > 0 }) kinds = services;
         bool strict = Mode == McpMaskingMode.Strict;
         Decision worst = Decision.None;
         string? ruleId = null;
-        bool allKept = true, allHiddenWhole = true, shown = false;
+        bool allKept = true, allHiddenWhole = true, shown = false, loose = false;
         foreach (string reading in readings)
         {
             foreach (string? service in kinds)
             {
                 Decision d = Decide(reading, service, out string? rule);
                 // What no rule names, Strict hashes: as much a part of what an answer does to
-                // the value as a rule is (Loose, LooseNumber).
+                // the value as a rule is (Loose, LooseNumber). What a keep above has let through
+                // it does not: that stays Open, a field like any in Standard mode.
                 if (d == Decision.None && strict) { d = Decision.Hash; rule = null; }
 
                 if (d > Decision.Keep && (d > worst || (d == worst && ruleId is null && rule is not null))) { worst = d; ruleId = rule; }
                 if (d != Decision.Keep) allKept = false;
                 if (d is Decision.Keep or Decision.KeepLast4) shown = true;
                 if (d is not (Decision.Hash or Decision.Remove)) allHiddenWhole = false;
+                if (d is Decision.None or Decision.Open) loose = true;
             }
         }
-        return new Verdict(worst, ruleId, allKept, allHiddenWhole, shown);
+        return new Verdict(worst, ruleId, allKept, allHiddenWhole, shown, loose);
     }
 
     /// <summary>More segments that read as positions than this, and a path is not read out every way (see <see cref="Readings"/>).</summary>
@@ -369,17 +434,28 @@ public sealed class MaskingPolicy
     /// <list type="bullet">
     /// <item>A rule on a path hides everything spelled under it. <c>Buyer</c> → hash sends the
     /// whole object as one token, so <c>Buyer.Name</c> is as hidden as <c>Buyer</c> is.</item>
-    /// <item>A rule for one service counts for every service: the field is hidden somewhere.</item>
+    /// <item>A rule for one service counts for every service the question reaches: the field
+    /// is hidden somewhere.</item>
     /// <item>A <c>keep</c> for one service counts for none: the field is still hidden in the
     /// others, and a question about it is a question about those too.</item>
     /// </list>
+    /// <para>The services a question reaches are the ones its profile reads
+    /// (<paramref name="services"/>; null or empty for every service): the profile's scope is
+    /// part of every filter that runs. A rule for a service the profile does not read hides
+    /// nothing it can be shown, and restricts nothing it may ask — as it decides nothing about a
+    /// token (<see cref="TokenMayMeet"/>).</para>
+    ///
     /// The path is a property path as a filter spells it; a built-in field (<c>@mt</c>) is the
     /// caller's to tell apart — none of them is ever hidden.
     /// </summary>
-    public bool HidesField(string path) => Judge(path).Hides != Decision.None;
+    public bool HidesField(string path, IReadOnlyList<string>? services = null) => Judge(path, services).Hides != Decision.None;
 
-    /// <summary>True when a rule keeps the field as it is stored in every service, however the path is read.</summary>
-    public bool KeepsEverywhere(string path) => Judge(path).KeptEverywhere;
+    /// <summary>
+    /// True when a <c>keep</c> on the path itself sends the field as it is stored in every
+    /// service, however the path is read. A <c>keep</c> on a path above it does not make it so:
+    /// what a detector knows is still hidden there.
+    /// </summary>
+    public bool KeepsEverywhere(string path, IReadOnlyList<string>? services = null) => Judge(path, services).KeptEverywhere;
 
     /// <summary>
     /// Whether a token for <paramref name="text"/> may be compared with the field at
@@ -558,13 +634,13 @@ public sealed class MaskingPolicy
     /// caller's to know, from the engine's own table; guessing it from an at sign here would
     /// send a property called <c>@anything</c> past every rule.
     /// </summary>
-    public string? MaskGroupKey(string path, string? value, MaskStats stats)
+    public string? MaskGroupKey(string path, string? value, MaskStats stats, IReadOnlyList<string>? services = null)
     {
         if (value is null) return null;
 
         // A row of a table is not an event of one service, so the key is judged as a filter's
-        // field is: by what is done to it anywhere, under any path above it.
-        Verdict field = Judge(path);
+        // field is: by what is done to it in any service the profile reads, under any path above it.
+        Verdict field = Judge(path, services);
         if (field.Unread)
         {
             // More readings than are tried: hidden, and not as any rule's or Strict mode's doing.
@@ -576,10 +652,27 @@ public sealed class MaskingPolicy
         switch (field.Hides)
         {
             case Decision.Remove:    stats.Add(reason, path, rule); return "(hidden)";
-            case Decision.KeepLast4: stats.Add(reason, path, rule); return LastFour(value);
             case Decision.Hash:      stats.Add(reason, path, rule); return TokenOfText(value, isNumber: false);
+            case Decision.KeepLast4:
+                stats.Add(reason, path, rule);
+                // Its last four characters, where every event the row can be made of shows as
+                // much. Where one of them leaves the value to the detectors — a service the rule
+                // does not name, another reading of the path — and they find something in it, a
+                // search there shows less than that: `group by Pan`, under a keepLast4 for one
+                // service, gave the last four digits of the cards of all the others.
+                return field.LooseSomewhere && DetectorsFindIn(value) ? TokenOfText(value, isNumber: false) : LastFour(value);
         }
         return field.KeptEverywhere ? value : MaskText(value, stats);
+    }
+
+    /// <summary>Whether the detectors would hide anything of the text. A text they cannot get through counts: it is not known to be clean.</summary>
+    private bool DetectorsFindIn(string text)
+    {
+        if (_detectors == MaskDetectors.None || text.Length == 0) return false;
+        var hits = new List<SensitiveValueDetectors.Hit>(1);
+        try { SensitiveValueDetectors.Find(text, _detectors, hits); }
+        catch (RegexMatchTimeoutException) { return true; }
+        return hits.Count > 0;
     }
 
     /// <summary>The largest whole number a double holds exactly: past it, digits are not the value's own.</summary>
@@ -592,7 +685,7 @@ public sealed class MaskingPolicy
     /// past the same detectors a value does in a search, as a number and as the digits it is
     /// written with. A field that a rule keeps in every service is sent as it is.
     /// </summary>
-    public string MaskNumber(string path, double value, MaskStats stats)
+    public string MaskNumber(string path, double value, MaskStats stats, IReadOnlyList<string>? services = null)
     {
         if (value != Math.Floor(value) || double.IsInfinity(value))
             return value.ToString("0.###", CultureInfo.InvariantCulture);
@@ -607,7 +700,7 @@ public sealed class MaskingPolicy
 
         long whole  = (long)value;
         string text = whole.ToString(CultureInfo.InvariantCulture);
-        if (KeepsEverywhere(path)) return text;
+        if (KeepsEverywhere(path, services)) return text;
 
         if (SensitiveValueDetectors.IsSensitiveNumber(whole, _detectors, out var kind))
         {
@@ -743,16 +836,15 @@ public sealed class MaskingPolicy
             case Decision.KeepLast4: return Cut(ref r, path, in c, rule);
         }
 
-        bool keep = decision == Decision.Keep;
+        // Not hidden by a rule: kept, let through from above, or named by none.
         switch (r.NextMessagePackType)
         {
             case MessagePackType.String:
-                string s = r.ReadString() ?? "";
-                return keep ? s : Loose(s, path, in c);
+                return Loose(r.ReadString() ?? "", path, decision, in c);
 
             case MessagePackType.Integer:
             case MessagePackType.Float:
-                return LooseNumber(ref r, path, keep, in c, out _);
+                return LooseNumber(ref r, path, decision, in c, out _);
 
             case MessagePackType.Boolean: return r.ReadBoolean() ? "true" : "false";
             case MessagePackType.Nil:     r.ReadNil(); return "null";
@@ -762,7 +854,7 @@ public sealed class MaskingPolicy
             {
                 var buffer = new ArrayBufferWriter<byte>(256);
                 using (var w = new Utf8JsonWriter(buffer, JsonOptions))
-                    WriteJson(w, ref r, path, keep, in c, depth: 1);
+                    WriteJson(w, ref r, path, decision, in c, depth: 1);
                 return Encoding.UTF8.GetString(buffer.WrittenSpan);
             }
 
@@ -778,8 +870,15 @@ public sealed class MaskingPolicy
         SkipValidation = true,
     };
 
-    /// <summary>A nested value as compact JSON, each property under it judged by its own path.</summary>
-    private void WriteJson(Utf8JsonWriter w, ref MessagePackReader r, string path, bool keep, in Ctx c, int depth)
+    /// <summary>
+    /// A nested value as compact JSON, each property under it judged by its own path.
+    /// <paramref name="decision"/> is what <see cref="Decide"/> said of <paramref name="path"/>,
+    /// when it hid nothing: kept, let through from above, or named by no rule. It is the value's
+    /// own and the elements' of a list at that path — the rules name those by the list's path —
+    /// and nobody else's: a property under the path is asked about again, by its own path, and
+    /// what stands above it is <see cref="Decide"/>'s to find, not the walk's to carry down.
+    /// </summary>
+    private void WriteJson(Utf8JsonWriter w, ref MessagePackReader r, string path, Decision decision, in Ctx c, int depth)
     {
         switch (r.NextMessagePackType)
         {
@@ -790,7 +889,7 @@ public sealed class MaskingPolicy
                 for (int i = 0; i < count; i++)
                 {
                     string key   = ReadKey(ref r);
-                    string child = string.Concat(path, ".", key);
+                    string child = Under(path, key);
                     Decision d   = Decide(child, c.Service, out string? rule);
                     if (d == Decision.Remove) { r.Skip(); c.Stats.Add(MaskReason.Rule, child, rule); continue; }
 
@@ -798,7 +897,7 @@ public sealed class MaskingPolicy
                     if (r.TryReadNil())            w.WriteNullValue();
                     else if (d == Decision.Hash)   w.WriteStringValue(Hashed(ref r, child, in c, MaskReason.Rule, rule));
                     else if (d == Decision.KeepLast4) w.WriteStringValue(Cut(ref r, child, in c, rule));
-                    else WriteJson(w, ref r, child, keep || d == Decision.Keep, in c, depth + 1);
+                    else WriteJson(w, ref r, child, d, in c, depth + 1);
                 }
                 w.WriteEndObject();
                 break;
@@ -808,7 +907,7 @@ public sealed class MaskingPolicy
             {
                 int count = r.ReadArrayHeader();
                 w.WriteStartArray();
-                for (int i = 0; i < count; i++) WriteJson(w, ref r, path, keep, in c, depth + 1);
+                for (int i = 0; i < count; i++) WriteJson(w, ref r, path, decision, in c, depth + 1);
                 w.WriteEndArray();
                 break;
             }
@@ -820,13 +919,12 @@ public sealed class MaskingPolicy
                 break;
 
             case MessagePackType.String:
-                string s = r.ReadString() ?? "";
-                w.WriteStringValue(keep ? s : Loose(s, path, in c));
+                w.WriteStringValue(Loose(r.ReadString() ?? "", path, decision, in c));
                 break;
 
             case MessagePackType.Integer:
             case MessagePackType.Float:
-                string text = LooseNumber(ref r, path, keep, in c, out bool hidden);
+                string text = LooseNumber(ref r, path, decision, in c, out bool hidden);
                 if (hidden || !double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out double d0) || !double.IsFinite(d0))
                     w.WriteStringValue(text);
                 else
@@ -839,25 +937,32 @@ public sealed class MaskingPolicy
         }
     }
 
-    /// <summary>A string no rule names: hidden in Strict, looked through by the detectors otherwise.</summary>
-    private string Loose(string s, string path, in Ctx c)
+    /// <summary>
+    /// A string no rule hides. Under a <c>keep</c> on its own path: as stored. Named by no rule
+    /// in Strict mode: hidden. Otherwise — Standard mode, or let through by a <c>keep</c> above
+    /// it — looked through by the detectors.
+    /// </summary>
+    private string Loose(string s, string path, Decision decision, in Ctx c)
     {
-        if (Mode != McpMaskingMode.Strict) return MaskText(s, c.Stats);
+        if (decision == Decision.Keep) return s;
+        if (decision == Decision.Open || Mode != McpMaskingMode.Strict) return MaskText(s, c.Stats);
         c.Stats.Add(MaskReason.Strict, path);
         return TokenOfText(s, isNumber: false);
     }
 
     /// <summary>
-    /// A number no rule names, as text. Hidden in Strict; otherwise hidden only when it is a
-    /// card number or an IIN that happens to be stored as an integer.
+    /// A number no rule hides, as text, by the same three roads as <see cref="Loose"/>: as stored
+    /// under a <c>keep</c> on its own path, hidden where Strict mode has it and no rule names it,
+    /// and otherwise hidden only when it is a card number or an IIN that happens to be stored as
+    /// a number.
     /// </summary>
-    private string LooseNumber(ref MessagePackReader r, string path, bool keep, in Ctx c, out bool hidden)
+    private string LooseNumber(ref MessagePackReader r, string path, Decision decision, in Ctx c, out bool hidden)
     {
         hidden = false;
         string text = ReadNumber(ref r, out long? integer);
-        if (keep) return text;
+        if (decision == Decision.Keep) return text;
 
-        if (Mode == McpMaskingMode.Strict)
+        if (decision != Decision.Open && Mode == McpMaskingMode.Strict)
         {
             hidden = true;
             c.Stats.Add(MaskReason.Strict, path);

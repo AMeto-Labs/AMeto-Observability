@@ -279,7 +279,7 @@ A rule names a property and what happens to its value.
 | `hash` | The value is replaced by its token. |
 | `remove` | The property is left out of the answer. |
 | `keepLast4` | `****` and the last four characters. |
-| `keep` | The value goes out as stored; the detectors leave it alone. The allow-list of Strict mode. |
+| `keep` | The value at the rule's own path goes out as stored; the detectors leave it alone. What is spelled under that path is let through Strict mode and still goes past the detectors. The allow-list of Strict mode. |
 
 - The field is a property path as a filter spells it — `Customer.Iin` — with `*` for any run of
   characters, compared without regard to case.
@@ -292,17 +292,27 @@ A rule names a property and what happens to its value.
   and its property or inside one name. An OTLP attribute is one property with dots in its name —
   `client.address`, `user.id` — and a filter spells it as it spells a property of an object, so a
   rule reads both the same way: a rule on `client` covers the object `client` and the attributes
-  `client.address` and `client.id` alike. That goes for `keep` as for the others.
-- `keepLast4` cuts the value at its own path. What is spelled under that path is hidden whole —
-  there are no last four characters of an object.
+  `client.address` and `client.id` alike. Every name keeps its place in a path, an empty one
+  too: the property `Pin` of a property with no name is `.Pin`, to a rule and to a filter.
+- `keepLast4` and `keep` are about the value at their own path. Under a `keepLast4` everything is
+  hidden whole — there are no last four characters of an object.
+- Under a `keep` everything is let through Strict mode, and nothing is vouched for: the detectors
+  look through it as they do through a property no rule names. A `keep` on `card`, meant for the
+  property that holds a card's brand, does not send `payment.card.number` as stored. A pattern
+  without a dot is tried against the last segment at every level, so `card` is above that
+  attribute as much as `payment` is — and in Strict mode it lets `payment.card.holder` through
+  as well, a name no detector knows. To send what is under a path as stored, name it:
+  `payment.card.number`, or `payment.*` for everything under `payment`. Of two `keep`s the one
+  on the path itself decides.
 - The elements of a list are named by the list's own path: `Items.Sku` is the `Sku` of every
   item, whichever way a filter spells the position — `Items[0].Sku`, `Items.0.Sku`,
   `Items[' 0'].Sku`. What counts as a position is asked of the query engine itself, so the
   rules and the engine cannot read one spelling two ways.
 - A rule may be limited to some services. An event of another service is then answered as if the
-  rule were not there. A filter or a table is not about one service, so there a field counts as
-  hidden when a rule hides it in *any* service — and a `keep` counts only when it holds for
-  every service.
+  rule were not there. A filter or a table is not about one service but about every service its
+  profile reads, so there a field counts as hidden when a rule hides it in *any* of them — and a
+  `keep` counts only when it holds for all of them. A rule for a service the profile does not
+  read is nothing to that profile: not in what it is shown, and not in what it may ask.
 - When several rules match, the most protective wins: remove, then hash, then keepLast4, then keep.
 
 A new installation starts with three `remove` rules: `*Password*`, `*Secret*`, `Authorization`.
@@ -330,13 +340,14 @@ identifier looks like: name those fields in a rule, or use Strict mode.
 **Detectors work on answers, not on questions.** They do not make a field a hidden one. A filter
 may still order, pattern-match and aggregate a field no rule names, and so learn about a value a
 detector would have hidden in the answer. What must not be asked about needs a rule — or Strict
-mode, where every field is hidden unless a `keep` names it.
+mode, where every field is hidden unless a `keep` names it or a path above it.
 
 ### Modes
 
 - **Standard** — hide what the rules name and what the detectors find.
-- **Strict** — hide every string and number, except the properties a `keep` rule names. Booleans
-  and nulls pass. The message template, exception texts and property names still go through the
+- **Strict** — hide every string and number, except the properties a `keep` rule names, which go
+  out as stored, and what is spelled under them, which goes past the detectors. Booleans and
+  nulls pass. The message template, exception texts and property names still go through the
   detectors.
 
 ### Tokens
@@ -376,8 +387,9 @@ open there, and the next `logs_context`, a `sum` with a `count` beside it, or a 
   that reads every service needs a rule that holds for every service. `logs_fields` marks such a
   property `= only`;
 - for a value a detector hides whole wherever an equality can find it — a card number, an IIN,
-  an email address — any property no `keep` or `keepLast4` rule names, in any service: the
-  detector hides it there as well. An equality compares texts without regard to case, and a text
+  an email address — any property no `keep` or `keepLast4` rule names in a service the profile
+  reads: the detector hides it there as well, under a `keep` on a path above it too. An
+  equality compares texts without regard to case, and a text
   that reads as a number with that number in a numeric field; so not an IBAN or a JWT, which the
   detectors know by the case of their letters, not a phone number (`'+77015550123'` equals
   `77015550123`, and no detector knows a phone number stored as a number), and not an IIN with a
@@ -416,7 +428,8 @@ only — against a token, or against a value the person already has. Anything el
 refused, and so is an aggregate other than a count: `min(CardNumber)` is a card number.
 
 A field is hidden by every road to it: under a rule on its parent or on the first part of its
-name, in any service a rule names, through a list position however it is spelled. And nothing
+name, under a name that is empty, in any service the profile reads, through a list position
+however it is spelled. And nothing
 reads a hidden value through its parent — the functions that could (`toJson()`, `elementAt()`,
 `keys()`, `values()`, `fromJson()`) are not among those a filter here is built from.
 
@@ -435,7 +448,12 @@ reads a hidden value through its parent — the functions that could (`toJson()`
 
   The answer says how many values were left out, so a sum that lacks some of its values does not
   pass for a whole one. `count` counts every value, whatever it is. A field a `keep` rule names
-  for every service is taken whole, as it is shown whole.
+  for every service the profile reads is taken whole, as it is shown whole; one that is only
+  under a `keep` is not.
+- **A table's key shows what a search shows of the value, and no more.** Under `keepLast4` it is
+  the last four characters — unless the rule holds for only some of the services the profile
+  reads and a detector finds something in the value: the other services hide it whole, and so
+  does the table.
 - **The number an aggregate comes to goes past the detectors** as well, as a number does in a
   search, and a whole number too long for the arithmetic to hold exactly is not shown at all: its
   leading digits would be right, and most of an identifier.
