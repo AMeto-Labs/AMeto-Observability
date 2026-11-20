@@ -169,9 +169,9 @@ export class McpSectionComponent {
     this.go({ mcp: 'profiles', tool: null });
   }
 
-  async copyKey(): Promise<void> {
-    const key = this.revealed()?.key;
-    if (!key) return;
+  /** Copy: the key this button was drawn beside, as Done takes down the one it was drawn for. */
+  async copyKey(shown: RevealedKey): Promise<void> {
+    const { key } = shown;
     await copyToClipboard(key);
     this.copied.set(key);
     setTimeout(() => this.copied.update(k => (k === key ? null : k)), 1500);
@@ -182,13 +182,26 @@ export class McpSectionComponent {
    * the click is handled. Then Done takes nothing down for a moment, whether the next key comes
    * up in its place at once or arrives just after the dialog closed; a key shown with nothing
    * taken down just before it is not held up.
+   *
+   * A click that is the second or a later one of a run — a double click, however slow the
+   * system lets one be — takes nothing down either: the pause is 700 ms, and a double click can
+   * be set to 900. The pause stays for whatever does not count its clicks.
    */
-  done(key: RevealedKey): void {
+  done(key: RevealedKey, click?: Event): void {
+    if (click instanceof MouseEvent && click.detail > 1) return;
     if (this.doneHeld() || this.revealed() !== key) return;
     this.store.acknowledgeKey(key);
     this.doneHeld.set(true);
     clearTimeout(this.donePause);
     this.donePause = setTimeout(() => this.doneHeld.set(false), DONE_PAUSE_MS);
+  }
+
+  /**
+   * Enter held down on Done repeats, and each repeat is a click: past the pause the next key
+   * would be taken down unseen. A repeat is not a press; it activates nothing.
+   */
+  holdRepeat(key: KeyboardEvent): void {
+    if (key.repeat && (key.key === 'Enter' || key.key === ' ')) key.preventDefault();
   }
 
   /** Leaving the editor drops what it holds; ask once when that is something. */

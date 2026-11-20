@@ -354,12 +354,14 @@ export const McpSectionStore = signalStore(
       /**
        * Gives the profile a new key. The old one has stopped working by the time the answer
        * comes, so the new one goes to `keys` at once, with the profile's id and the name the list
-       * gives it on arrival. Its preview in the list is the one thing only a read can bring.
+       * gives it on arrival — or, the profile gone from the list by then, the name it had when the
+       * key was asked for: a key is never called by a bare id. Its preview in the list is the one
+       * thing only a read can bring.
        */
       async rotateKey(id: string): Promise<void> {
-        await receiveKey(api.rotateProfileKey(id), ({ key }) => ({
-          key, profileId: id, profile: store.profiles().find(p => p.id === id)?.name ?? id,
-        }));
+        const nameOf = (): string | undefined => store.profiles().find(p => p.id === id)?.name;
+        const asked = nameOf() ?? id;
+        await receiveKey(api.rotateProfileKey(id), ({ key }) => ({ key, profileId: id, profile: nameOf() ?? asked }));
         readListsAgain();
       },
 

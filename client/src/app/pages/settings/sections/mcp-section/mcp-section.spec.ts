@@ -1125,6 +1125,140 @@ describe('Settings → AI / MCP', () => {
     expect(dirty.dirtyTabsList()).toEqual([]);
   });
 
+  /** Two keys, the new profile's on screen and the rotated one waiting behind it. */
+  async function twoKeys(): Promise<ComponentFixture<McpSectionComponent>> {
+    const f = await open('profiles');
+    const post = await createSupport(f);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    const rotate = await rotateInCard(f);
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    rotate.flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+    return f;
+  }
+
+  it('Done held is still in the pointer\'s way, and stays where it was when the next key comes up', async () => {
+    const f = await twoKeys();
+    // What is said of the keys waiting stands beside Done, in Done's own row: when it goes —
+    // with the last key but one — the row is as tall as it was, and Done where it was.
+    const done = button(f, 'Done', '.modal');
+    const row = done.parentElement!;
+    expect(row.classList.contains('m-actions')).toBe(true);
+    expect(all(f, '.modal .m-key-behind').map(n => n.parentElement)).toEqual([row]);
+    expect(row.querySelector('.m-key-behind')!.textContent).toBe('Another key is waiting: it is shown after this one.');
+
+    vi.useFakeTimers();
+    done.focus();
+    done.click();
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    expect(all(f, '.modal .m-key-behind')).toEqual([]);
+    expect(button(f, 'Done', '.modal')).toBe(done);
+    expect(done.parentElement).toBe(row);
+
+    // Held, Done looks switched off and still takes the pointer: with pointer-events off, the
+    // second click of a double click went through it to what lay behind, and the focus went
+    // out of the dialog with it. The click that lands on it now is dropped where it is handled.
+    expect(done.getAttribute('aria-disabled')).toBe('true');
+    expect(getComputedStyle(done).pointerEvents).not.toBe('none');
+    expect(document.activeElement).toBe(done);
+  });
+
+  it('a click counted as the second of a run takes nothing down, however long after the first', async () => {
+    const f = await twoKeys();
+    vi.useFakeTimers();
+    const done = button(f, 'Done', '.modal');
+    const click = (detail: number): boolean => done.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail }));
+    click(1);
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+
+    // A slow double click. A system can be set to count clicks 900 ms apart as one run, and the
+    // pause is over by then; the browser says which click of its run this is.
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS + 150);
+    await settle(f);
+    expect(done.hasAttribute('aria-disabled')).toBe(false);
+    click(2);
+    await settle(f);
+    click(3);
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    // A click of its own takes the key down; so does Enter or Space, whose click counts none.
+    click(1);
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('Enter held down on Done is one press: its repeats activate nothing', async () => {
+    const f = await twoKeys();
+    const done = button(f, 'Done', '.modal');
+    /** True when the page stopped the key from doing what it does — for Enter on a button, a click. */
+    const stopped = (key: string, repeat: boolean): boolean =>
+      !done.dispatchEvent(new KeyboardEvent('keydown', { key, repeat, bubbles: true, cancelable: true }));
+
+    expect(stopped('Enter', false)).toBe(false);
+    expect(stopped(' ', false)).toBe(false);
+    // Held down, the key repeats, and past the pause each repeat would take a key down unseen.
+    expect(stopped('Enter', true)).toBe(true);
+    expect(stopped(' ', true)).toBe(true);
+    // Any other key is none of Done's business, repeated or not.
+    expect(stopped('Tab', true)).toBe(false);
+  });
+
+  it('for a moment after the last key is taken down, a click meant for its Done does not reach the page behind', async () => {
+    const f = await twoKeys();
+    vi.useFakeTimers();
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    // While a key is on screen, its dialog is what stands over the page.
+    expect(all(f, '.m-key-shield')).toEqual([]);
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    expect(all(f, '.m-key-shield')).toEqual([]);
+
+    // The last key is taken down and the dialog goes. What stood behind its Done — a question
+    // a tab still has open, a switch that saves on a click — is where the second click of a
+    // double click would land. For as long as Done would have been held, this takes it.
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
+    const shield = el(f, '.m-key-shield');
+    const drawn = getComputedStyle(shield);
+    expect([drawn.position, drawn.zIndex]).toEqual(['fixed', '1000']);
+    expect(shield.getAttribute('aria-hidden')).toBe('true');
+    // Last in the section, as the key dialog was: over whatever dialog a tab has open.
+    expect(shield.nextElementSibling).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    expect(all(f, '.m-key-shield')).toEqual([]);
+  });
+
+  it('Copy copies the key it stands beside', async () => {
+    const f = await twoKeys();
+    const written: string[] = [];
+    const before = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: (text: string) => { written.push(text); return Promise.resolve(); } },
+    });
+    try {
+      el<HTMLButtonElement>(f, '.modal .m-key-reveal button[title="Copy"]').click();
+      await settle(f);
+      expect(written).toEqual(['the-new-key-shown-once']);
+    } finally {
+      if (before) Object.defineProperty(navigator, 'clipboard', before);
+      else delete (navigator as { clipboard?: unknown }).clipboard;
+    }
+  });
+
   it('a key that arrives while another tab is open is shown on that tab, which stays open', async () => {
     const f = await open('profiles');
     const post = await createSupport(f);
@@ -1451,6 +1585,25 @@ describe('Settings → AI / MCP', () => {
     expect(field.hasAttribute('aria-invalid')).toBe(false);
     expect(field.hasAttribute('aria-describedby')).toBe(false);
     expect(all(f, '#mcp-rule-error')).toEqual([]);
+  });
+
+  it('says of a keep that it vouches for its own field, not for what is under it', async () => {
+    const f = await openMasking();
+    button(f, 'Add rule').click();
+    await settle(f);
+
+    const action = el<HTMLSelectElement>(f, '.modal select.m-select');
+    const says = (): string => action.closest('label')!.querySelector('.m-hint')!.textContent!.trim();
+    expect(says()).toBe(
+      'Replace the value with its token. The AI can still match and search by it. Where two rules match one field, the more protective wins.');
+
+    // The server lets what is under a kept path through Strict mode and leaves the detectors on
+    // it: a keep on `card` does not send `payment.card.number` as stored. The editor says so.
+    choose(action, 'keep');
+    await settle(f);
+    expect(says()).toBe(
+      'Send the value as stored; in Strict mode this is the allow-list. Properties under it are let through as well, ' +
+      'and the detectors still check them. Where two rules match one field, the more protective wins.');
   });
 
   // ── Tools ───────────────────────────────────────────────────────────────────

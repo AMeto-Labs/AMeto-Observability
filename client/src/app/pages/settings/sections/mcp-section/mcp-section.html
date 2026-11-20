@@ -63,20 +63,33 @@
     <div class="m-key-reveal">
       <lucide-icon name="key" [size]="14" />
       <span class="m-key-text">{{ shown.key }}</span>
-      <button type="button" class="btn-icon" title="Copy" (click)="copyKey()">
+      <button type="button" class="btn-icon" title="Copy" (click)="copyKey(shown)">
         <lucide-icon [name]="copied() === shown.key ? 'check' : 'copy'" [size]="13" />
       </button>
     </div>
     <span class="m-sub">Copy this key now — it won't be shown again. Only its hash is stored. Give it to the client as the bearer token of the MCP endpoint.</span>
-    @if (keysBehind(); as behind) {
-      <span class="m-sub m-strong">{{ behind }}</span>
-    }
     <div class="m-actions">
+      <!-- What is said of the keys still waiting stands beside Done, in Done's own row, so that
+           nothing moves under the pointer when it goes. On a line of its own above Done it took
+           that line away with the last key but one: Done rose, and the second click of a double
+           click fell on the dialog's bare body — and took the focus out of the dialog. -->
+      @if (keysBehind(); as behind) {
+        <span class="m-sub m-strong m-key-behind">{{ behind }}</span>
+      }
       <!-- Held for a moment after a key was taken down (DONE_PAUSE_MS). aria-disabled rather
            than disabled: a disabled button gives up the focus, which would drop out of the
            dialog to the page, and Enter on Done would no longer reach the dialog once the
            moment has passed. -->
-      <button type="button" class="btn primary" [attr.aria-disabled]="doneHeld() || null" (click)="done(shown)">Done</button>
+      <button type="button" class="btn primary" [attr.aria-disabled]="doneHeld() || null"
+              (keydown)="holdRepeat($event)" (click)="done(shown, $event)">Done</button>
     </div>
   }
 </app-modal>
+
+<!-- For the moment after the last key was taken down. The dialog is gone by then, and the second
+     click of a double click on its Done would land on whatever stood behind it: a question a
+     tab still has open, or a switch that saves on a click. This takes that click, for as long
+     as Done would have been held; a key that arrives meanwhile is shown as any other. -->
+@if (doneHeld() && revealed() === null) {
+  <div class="m-key-shield" aria-hidden="true"></div>
+}

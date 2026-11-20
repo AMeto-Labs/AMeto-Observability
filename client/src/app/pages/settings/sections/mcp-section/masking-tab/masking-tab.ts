@@ -46,7 +46,9 @@ const ACTIONS: readonly { id: McpMaskAction; label: string; tone: string; does: 
   { id: 'hash',      label: 'Hash',        tone: 'acc', does: 'Replace the value with its token. The AI can still match and search by it.' },
   { id: 'keepLast4', label: 'Keep last 4', tone: '',    does: 'Show the last four characters and hide the rest.' },
   { id: 'remove',    label: 'Remove',      tone: 'err', does: 'Leave the property out of the answer.' },
-  { id: 'keep',      label: 'Keep',        tone: 'ok',  does: 'Send the value as stored. In Strict mode this is the allow-list.' },
+  // A keep vouches for the value at its own path only (docs/MCP.md, Field rules): what is under
+  // that path is let through Strict mode, and the detectors go on looking through it.
+  { id: 'keep',      label: 'Keep',        tone: 'ok',  does: 'Send the value as stored; in Strict mode this is the allow-list. Properties under it are let through as well, and the detectors still check them.' },
 ];
 
 /** What a detector checks beyond the shape of the text, where it checks anything. */

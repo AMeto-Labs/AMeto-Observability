@@ -16,11 +16,30 @@
 app-modal { display: contents; }
 
 /* Done held for a moment after a key was taken down: it looks as a disabled button does, and
-   keeps the focus as a disabled one would not. */
+   keeps the focus as a disabled one would not. It still takes the pointer — the click is
+   dropped where it is handled. With pointer-events off, a click meant for it went through to
+   whatever lay behind, and the focus went with it: out of the dialog, on the second click of a
+   double click. */
 .btn[aria-disabled='true'] {
   opacity: .45;
   cursor: default;
-  pointer-events: none;
+}
+
+/* Over the whole window for the moment after the last key's dialog has closed (see the
+   template). It shows nothing and takes the clicks meant for a Done that is no longer there. As
+   high as the dialogs stand, and later in the page than any of them, so over those as well. */
+.m-key-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+}
+
+/* What is said of the keys still waiting, at the start of Done's row. It takes the room Done
+   leaves and wraps inside it, so the row is as tall as Done with it or without. */
+.m-key-behind {
+  flex: 1;
+  min-width: 0;
+  align-self: center;
 }
 
 /* ── The section's own tabs ─────────────────────────────────────────────────── */

@@ -250,6 +250,17 @@ describe('Settings → AI / MCP — the store', () => {
     expect(store.keys().map(k => k.key)).toEqual(['the-new-key']);
   });
 
+  it('a rotated key whose profile left the list before it arrived is named as when it was asked for', async () => {
+    const rotating = store.rotateKey('p1');
+    // Deleted somewhere else while the key was on its way, and found out by another answer.
+    store.profileGone('p1');
+    http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' }).flush({ key: 'the-new-key' });
+    await rotating;
+    // Not by its bare id: the name is what a person can tell a key by.
+    expect(store.keys()).toEqual([{ key: 'the-new-key', profileId: 'p1', profile: 'Payments team' }]);
+    answerLists([], [T1]);
+  });
+
   it('a request for a key that is refused leaves nothing on its way and nothing to show', async () => {
     const rotating = store.rotateKey('p1');
     expect(store.keysOnTheirWay()).toBe(1);
