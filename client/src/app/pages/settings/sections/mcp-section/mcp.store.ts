@@ -27,9 +27,15 @@ export type McpTabId = (typeof MCP_TABS)[number]['id'];
  */
 export type McpDirtyPart = 'limits' | 'profile' | 'tool';
 
-/** A key just created or rotated, with the name of the profile it opens. */
+/** A key just created or rotated, with the profile it opens. */
 export interface RevealedKey {
   key: string;
+  /**
+   * The profile's id. The dialog names the profile as the list names it when the key is shown:
+   * a rename saved while the key waits, or is on screen, is the name beside it on the page.
+   */
+  profileId: string;
+  /** The profile's name when the key arrived: what the key is called once the profile has left the list. */
   profile: string;
 }
 
@@ -316,7 +322,7 @@ export const McpSectionStore = signalStore(
        */
       async createProfile(input: McpProfileInput): Promise<McpProfile> {
         const { profile } = await receiveKey(api.createProfile(input),
-          created => ({ key: created.key, profile: created.profile.name }));
+          created => ({ key: created.key, profileId: created.profile.id, profile: created.profile.name }));
         patchState(store, withProfile(lists(), profile));
         readListsAgain();
         return profile;
@@ -337,21 +343,33 @@ export const McpSectionStore = signalStore(
       },
 
       /**
+       * A profile the server has just said is no more — deleted somewhere else after the list was
+       * read. It leaves both lists as one deleted here would, and nothing is asked of the server:
+       * the answer that said so is as fresh as a read would be.
+       */
+      profileGone(id: string): void {
+        if (store.profiles().some(p => p.id === id)) patchState(store, withoutProfile(lists(), id));
+      },
+
+      /**
        * Gives the profile a new key. The old one has stopped working by the time the answer
-       * comes, so the new one goes to `keys` at once — named as the list names the profile when
-       * it arrives, which is the name beside it on the page. Its preview in the list is the one
-       * thing only a read can bring.
+       * comes, so the new one goes to `keys` at once, with the profile's id and the name the list
+       * gives it on arrival. Its preview in the list is the one thing only a read can bring.
        */
       async rotateKey(id: string): Promise<void> {
         await receiveKey(api.rotateProfileKey(id), ({ key }) => ({
-          key, profile: store.profiles().find(p => p.id === id)?.name ?? id,
+          key, profileId: id, profile: store.profiles().find(p => p.id === id)?.name ?? id,
         }));
         readListsAgain();
       },
 
-      /** The key on screen has been taken down: the next one that arrived, if any, is shown in its place. */
-      acknowledgeKey(): void {
-        patchState(store, { keys: store.keys().slice(1) });
+      /**
+       * `key` has been taken down: the next one that arrived, if any, is shown in its place. Only
+       * the key on screen can be taken down, and only once — a second click meant for it, landing
+       * after the next key took its place, names a key that is no longer first and takes nothing.
+       */
+      acknowledgeKey(key: RevealedKey): void {
+        if (store.keys()[0] === key) patchState(store, { keys: store.keys().slice(1) });
       },
 
       // ── Field rules ───────────────────────────────────────────────────────

@@ -10,6 +10,19 @@
 /* The settings page hides a section with [hidden]; a display of our own would undo it. */
 :host([hidden]) { display: none; }
 
+/* The key dialog draws itself over the page (position: fixed), so its host holds nothing that
+   takes room. Left an item of the column above, it would still have a gap put before it: space
+   at the foot of every tab, whether the dialog is open or not. */
+app-modal { display: contents; }
+
+/* Done held for a moment after a key was taken down: it looks as a disabled button does, and
+   keeps the focus as a disabled one would not. */
+.btn[aria-disabled='true'] {
+  opacity: .45;
+  cursor: default;
+  pointer-events: none;
+}
+
 /* ── The section's own tabs ─────────────────────────────────────────────────── */
 .m-tabs {
   display: flex;

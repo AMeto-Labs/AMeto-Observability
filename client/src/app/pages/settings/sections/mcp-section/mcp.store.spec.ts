@@ -215,7 +215,7 @@ describe('Settings → AI / MCP — the store', () => {
     // Nothing else has been answered yet — and the key is here, with the name of its profile.
     const created = await creating;
     expect(created.id).toBe('p2');
-    expect(store.keys()).toEqual([{ key: 'the-key-shown-once', profile: 'Support' }]);
+    expect(store.keys()).toEqual([{ key: 'the-key-shown-once', profileId: 'p2', profile: 'Support' }]);
     // The profile is in the list from the answer alone, with the other end of its grant.
     expect(store.profiles().map(p => p.id)).toEqual(['p1', 'p2']);
     expect(store.tools()[0].profiles).toEqual(['p1', 'p2']);
@@ -232,7 +232,7 @@ describe('Settings → AI / MCP — the store', () => {
 
     // Taken down, the key is gone, and nothing is left that a reload would lose.
     expect(store.anyDirty()).toBe(true);
-    store.acknowledgeKey();
+    store.acknowledgeKey(store.keys()[0]);
     expect(store.keys()).toEqual([]);
     expect(store.anyDirty()).toBe(false);
   });
@@ -241,7 +241,7 @@ describe('Settings → AI / MCP — the store', () => {
     const rotating = store.rotateKey('p1');
     http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' }).flush({ key: 'the-new-key' });
     await rotating;
-    expect(store.keys()).toEqual([{ key: 'the-new-key', profile: 'Payments team' }]);
+    expect(store.keys()).toEqual([{ key: 'the-new-key', profileId: 'p1', profile: 'Payments team' }]);
 
     failLists();
     // The preview in the list is the old key's; the store says the list may be behind.
@@ -259,6 +259,43 @@ describe('Settings → AI / MCP — the store', () => {
     expect(store.keysOnTheirWay()).toBe(0);
     expect(store.keys()).toEqual([]);
     expect(store.anyDirty()).toBe(false);
+  });
+
+  it('takes down the key it is told of, and only while that key is the one on screen', async () => {
+    const p2: McpProfile = { ...P1, id: 'p2', name: 'Support', keyPreview: '11aa22bb…' };
+    const creating = store.createProfile(PROFILE_INPUT);
+    http.expectOne({ method: 'POST', url: '/api/mcp/profiles' }).flush({ profile: p2, key: 'the-new-key' });
+    await creating;
+    answerLists([P1, p2], [T1]);
+    const rotating = store.rotateKey('p1');
+    http.expectOne({ method: 'POST', url: '/api/mcp/profiles/p1/rotate-key' }).flush({ key: 'the-rotated-key' });
+    await rotating;
+    answerLists([P1, p2], [T1]);
+    const [created, rotated] = store.keys();
+    expect([created.key, rotated.key]).toEqual(['the-new-key', 'the-rotated-key']);
+
+    // The key behind the one on screen has not been seen: it cannot be taken down yet.
+    store.acknowledgeKey(rotated);
+    expect(store.keys()).toEqual([created, rotated]);
+    store.acknowledgeKey(created);
+    expect(store.keys()).toEqual([rotated]);
+    // A second Done meant for the key before — a double click — takes nothing.
+    store.acknowledgeKey(created);
+    expect(store.keys()).toEqual([rotated]);
+    expect(store.anyDirty()).toBe(true);
+    store.acknowledgeKey(rotated);
+    expect(store.keys()).toEqual([]);
+  });
+
+  it('a profile the server says is gone leaves both lists, and nothing is read again for it', () => {
+    store.profileGone('p1');
+    expect(store.profiles()).toEqual([]);
+    expect(store.tools()[0].profiles).toEqual([]);
+    expect(store.stale()).toBe(false);
+    // A profile already out of the list leaves the lists as they are.
+    const tools = store.tools();
+    store.profileGone('p1');
+    expect(store.tools()).toBe(tools);
   });
 
   // ── A change is in the state from its own answer ────────────────────────────

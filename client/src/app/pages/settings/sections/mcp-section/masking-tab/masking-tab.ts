@@ -373,12 +373,15 @@ export class MaskingTabComponent {
         this.previewing.set(false);
       },
       error: e => {
-        const problem: McpFieldError = profileId && e instanceof HttpErrorResponse && e.status === 404
-          ? { error: goneProfile(profileName) }
-          : mcpError(e, 'The preview could not be taken.');
+        const gone = !!profileId && e instanceof HttpErrorResponse && e.status === 404;
+        const problem: McpFieldError = gone ? { error: goneProfile(profileName) } : mcpError(e, 'The preview could not be taken.');
         this.previewError.set(problem.error);
         this.previewErrorField.set(problem.field ?? null);
         this.previewing.set(false);
+        // Out of the lists at once, so "Preview as" no longer offers it: the select falls back
+        // to the mode the profile had (see the effect in the constructor), and the sentence
+        // above still says what became of it.
+        if (gone) this.store.profileGone(profileId);
       },
     });
   }

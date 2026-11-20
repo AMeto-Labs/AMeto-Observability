@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, computed, effect, inject, signal, untracked } from '@angular/core';
+import { ChangeDetectionStrategy, Component, DestroyRef, computed, effect, inject, signal, untracked } from '@angular/core';
 import { Location } from '@angular/common';
 import { takeUntilDestroyed, toSignal } from '@angular/core/rxjs-interop';
 import { ActivatedRoute, NavigationStart, ParamMap, Router } from '@angular/router';
@@ -30,6 +30,13 @@ const placeOf = (params: ParamMap): Place => {
 };
 
 const samePlace = (a: Place, b: Place): boolean => a.tab === b.tab && a.tool === b.tool;
+
+/**
+ * How long Done takes nothing down after it has taken a key down. The next key comes up in the
+ * same dialog, its Done in the same place and still focused: without the pause, the second click
+ * of a double click or a repeated Enter would take a key down that was never seen.
+ */
+export const DONE_PAUSE_MS = 700;
 
 /**
  * Where the browser's current history entry stands among the others, where the browser says:
@@ -104,14 +111,28 @@ export class McpSectionComponent {
    * hidden behind another, and a dialog inside a hidden tab is not seen at all.
    */
   readonly revealed = computed<RevealedKey | null>(() => this.store.keys()[0] ?? null);
+  /** Named as the list names the profile now; a profile gone from the list, as it was named when its key arrived. */
   readonly keyTitle = computed(() => {
     const r = this.revealed();
-    return r ? `Key of “${r.profile}”` : '';
+    if (!r) return '';
+    return `Key of “${this.store.profiles().find(p => p.id === r.profileId)?.name ?? r.profile}”`;
+  });
+  /** Said under the key while others wait behind it: each is shown once, and none should come as a surprise. */
+  readonly keysBehind = computed(() => {
+    const behind = this.store.keys().length - 1;
+    if (behind < 1) return '';
+    return behind === 1
+      ? 'Another key is waiting: it is shown after this one.'
+      : `${behind} more keys are waiting: they are shown one at a time after this one.`;
   });
   /** The key whose Copy button says it was copied, for a moment; a key shown after it was not. */
   readonly copied = signal<string | null>(null);
+  /** True for a moment after Done took a key down (see DONE_PAUSE_MS): the key shown meanwhile cannot be taken down yet. */
+  readonly doneHeld = signal(false);
+  private donePause: ReturnType<typeof setTimeout> | undefined;
 
   constructor() {
+    inject(DestroyRef).onDestroy(() => clearTimeout(this.donePause));
     this.router.events.pipe(takeUntilDestroyed()).subscribe(e => {
       if (e instanceof NavigationStart) this.traversing = e.navigationTrigger === 'popstate';
     });
@@ -154,6 +175,20 @@ export class McpSectionComponent {
     await copyToClipboard(key);
     this.copied.set(key);
     setTimeout(() => this.copied.update(k => (k === key ? null : k)), 1500);
+  }
+
+  /**
+   * Done: takes down `key`, the key this Done was drawn for — not whatever is first by the time
+   * the click is handled. Then Done takes nothing down for a moment, whether the next key comes
+   * up in its place at once or arrives just after the dialog closed; a key shown with nothing
+   * taken down just before it is not held up.
+   */
+  done(key: RevealedKey): void {
+    if (this.doneHeld() || this.revealed() !== key) return;
+    this.store.acknowledgeKey(key);
+    this.doneHeld.set(true);
+    clearTimeout(this.donePause);
+    this.donePause = setTimeout(() => this.doneHeld.set(false), DONE_PAUSE_MS);
   }
 
   /** Leaving the editor drops what it holds; ask once when that is something. */

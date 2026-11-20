@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { McpCall, McpOverview, McpPreview, McpProfile, McpPublishedTool, McpRule, McpSummary } from '../../../../core/models/mcp.model';
 import { SettingsDirtyService } from '../../settings-dirty.service';
-import { McpSectionComponent } from './mcp-section';
+import { DONE_PAUSE_MS, McpSectionComponent } from './mcp-section';
 
 const OVERVIEW: McpOverview = {
   path: '/mcp',
@@ -141,6 +141,7 @@ describe('Settings → AI / MCP', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     // Every request a case caused is one it has accounted for: a read nobody expected — the
@@ -156,8 +157,18 @@ describe('Settings → AI / MCP', () => {
   /**
    * Waits for the view the way a person would: a change here is a promise (the store awaits the
    * server's answer) followed by effects, and `whenStable` alone returns between the two.
+   *
+   * Under fake timers the clock stands still: what the next turns of the event loop would run —
+   * the store's next step, the change detection after it — is run by moving the clock a
+   * millisecond a turn (a timer set for no delay while the clock moves is due a millisecond
+   * later), and a pause (Done's, say) is passed only by moving it past the pause. `whenStable`
+   * is not waited for there: it would wait for a timer that only the case can move.
    */
   async function settle(f: ComponentFixture<unknown>): Promise<void> {
+    if (vi.isFakeTimers()) {
+      for (let turn = 0; turn < 4; turn++) await vi.advanceTimersByTimeAsync(1);
+      return;
+    }
     for (let turn = 0; turn < 3; turn++) {
       await f.whenStable();
       await new Promise<void>(resolve => setTimeout(resolve));
@@ -325,6 +336,16 @@ describe('Settings → AI / MCP', () => {
     el<HTMLButtonElement>(f, '[role=alert] button').click();
     await land(f);
     expect(text(f)).toContain('MCP endpoint');
+  });
+
+  it('the key dialog takes no place in the section\'s column, so no gap is put before it', async () => {
+    const f = TestBed.createComponent(McpSectionComponent);
+    await land(f);
+    // The section is a flex column with gaps; its last item is the key dialog's host, which
+    // holds nothing that takes room (the dialog itself is drawn over the page).
+    const host = el(f, ':scope > app-modal');
+    expect(host.nextElementSibling).toBeNull();
+    expect(getComputedStyle(host).display).toBe('contents');
   });
 
   // ── Connection ──────────────────────────────────────────────────────────────
@@ -959,6 +980,33 @@ describe('Settings → AI / MCP', () => {
     expect(dirty.dirtyTabsList()).toEqual([]);
   });
 
+  it('a key on screen is named as the list names its profile now — and, once the profile is gone, as when it arrived', async () => {
+    const f = await open('profiles');
+    const title = (): string | null => el(f, '.modal__title').textContent;
+    type(el<HTMLInputElement>(f, 'input[placeholder="Payments team"]'), 'Payments developers');
+    await settle(f);
+    button(f, 'Save', 'app-mcp-profiles-tab').click();
+    await settle(f);
+    const put = http.expectOne({ method: 'PUT', url: '/api/mcp/profiles/p1' });
+    const rotate = await rotateInCard(f);
+
+    // The key answers first: the profile is still called what it was.
+    rotate.flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }], TOOLS);
+    expect(title()).toBe('Key of “Payments team”');
+
+    // The rename is answered while the key is on screen: the dialog calls the profile what the list does.
+    put.flush({ ...PROFILES[0], name: 'Payments developers', keyPreview: 'c0ffee00…' });
+    await settle(f);
+    expect(title()).toBe('Key of “Payments developers”');
+
+    // Deleted somewhere else meanwhile: the read after the save lists it no more. The key is
+    // still the one shown, under the name it came with.
+    await lists(f, [], [{ ...TOOLS[0], profiles: [] }]);
+    expect(title()).toBe('Key of “Payments team”');
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+  });
+
   it('a key taken down while another is still on its way leaves the page asking before a reload', async () => {
     const f = await open('profiles');
     const post = await createSupport(f);
@@ -969,6 +1017,7 @@ describe('Settings → AI / MCP', () => {
     (await rotateInCard(f)).flush({ key: 'the-rotated-key' });
     await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }], TOOLS);
     expect(el(f, '.modal__title').textContent).toBe('Key of “Payments team”');
+    vi.useFakeTimers();
     button(f, 'Done', '.modal').click();
     await settle(f);
 
@@ -979,6 +1028,12 @@ describe('Settings → AI / MCP', () => {
     post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
     await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
     expect(el(f, '.modal__title').textContent).toBe('Key of “Support”');
+    // It came up a moment after a key was taken down, under where that key's Done was: its own
+    // Done waits that moment out, as it would had it come up in the other's place.
+    expect(button(f, 'Done', '.modal').getAttribute('aria-disabled')).toBe('true');
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    expect(button(f, 'Done', '.modal').hasAttribute('aria-disabled')).toBe(false);
     button(f, 'Done', '.modal').click();
     await settle(f);
     expect(dirty.dirtyTabsList()).toEqual([]);
@@ -1005,14 +1060,66 @@ describe('Settings → AI / MCP', () => {
     await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
     expect(all(f, '.modal__title').map(t => t.textContent)).toEqual(['Key of “Support”']);
     expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+    // The dialog says another key follows, so the next one is no surprise.
+    expect(el(f, '.modal').textContent).toContain('Another key is waiting: it is shown after this one.');
 
+    vi.useFakeTimers();
     button(f, 'Done', '.modal').click();
     await settle(f);
     expect(all(f, '.modal__title').map(t => t.textContent)).toEqual(['Key of “Payments team”']);
     expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    expect(el(f, '.modal').textContent).not.toContain('waiting');
     expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
 
+    // Its Done takes it down once the moment after the one before has passed.
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
     button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
+    expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a double click on Done takes down the key on screen, not the one that comes up in its place', async () => {
+    const f = await open('profiles');
+    // A new profile on its way, and the first profile's key rotated meanwhile: both answer.
+    const post = await createSupport(f);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    all(f, '[role=row].pick')[0].click();
+    await settle(f);
+    const rotate = await rotateInCard(f);
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    rotate.flush({ key: 'the-rotated-key' });
+    await lists(f, [{ ...PROFILES[0], keyPreview: 'c0ffee00…' }, SUPPORT], TOOLS);
+
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+    expect(el(f, '.modal').textContent).toContain('Another key is waiting');
+    // Nothing was taken down before it: its Done takes no pause.
+    const done = button(f, 'Done', '.modal');
+    expect(done.hasAttribute('aria-disabled')).toBe(false);
+
+    // The first click takes the new profile's key down. The rotated key comes up in the same
+    // dialog, under the very same Done, which keeps the focus — and is held.
+    vi.useFakeTimers();
+    done.focus();
+    done.click();
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    expect(button(f, 'Done', '.modal')).toBe(done);
+    expect(document.activeElement).toBe(done);
+    expect(done.getAttribute('aria-disabled')).toBe('true');
+
+    // The second click of the double click lands there: it takes nothing down.
+    done.click();
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
+    expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
+
+    // A moment later Done is Done again, for the key that has now been seen.
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    expect(done.hasAttribute('aria-disabled')).toBe(false);
+    done.click();
     await settle(f);
     expect(all(f, '.modal')).toEqual([]);
     expect(dirty.dirtyTabsList()).toEqual([]);
@@ -1198,10 +1305,11 @@ describe('Settings → AI / MCP', () => {
     expect(previewLine(f, 1, 'PaymentId').textContent).toBe('h:0123456789ab');
   });
 
-  it('a preview as a profile deleted meanwhile says that the profile is gone', async () => {
+  it('a preview as a profile deleted meanwhile says that the profile is gone, and no longer offers it', async () => {
     const f = await openMasking();
+    const previewAs = (): HTMLSelectElement => el(f, 'select[aria-label="Preview as"]');
     // Deleted somewhere else after this page read the list: the list here still offers it.
-    choose(el<HTMLSelectElement>(f, 'select[aria-label="Preview as"]'), 'p1');
+    choose(previewAs(), 'p1');
     await settle(f);
     const asProfile = http.expectOne('/api/mcp/preview');
     expect(asProfile.request.body).toEqual({ profileId: 'p1' });
@@ -1210,6 +1318,10 @@ describe('Settings → AI / MCP', () => {
 
     expect(el(f, '#mcp-preview-error').textContent)
       .toBe('The profile “Payments team” is gone: it was deleted after this page read the list.');
+    // Out of the list at once — nothing is read for it (the case would fail on a request) — and
+    // the select is back on the mode the profile had.
+    expect([...previewAs().options].map(o => o.value)).toEqual(['mode:standard', 'mode:strict']);
+    expect(previewAs().value).toBe('mode:standard');
   });
 
   it('a slow preview does not land on top of a newer one', async () => {
