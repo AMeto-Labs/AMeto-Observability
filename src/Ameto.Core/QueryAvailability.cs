@@ -13,7 +13,10 @@ namespace Ameto.Core;
 /// asks. See issue #95.</para>
 ///
 /// <para><b>The states only move forward:</b> <see cref="Loading"/> → <see cref="Available"/> →
-/// <see cref="Closed"/>, or <see cref="Loading"/> → <see cref="Degraded"/> → <see cref="Closed"/>.
+/// <see cref="Closed"/>, or <see cref="Loading"/> → <see cref="Degraded"/> → <see cref="Closed"/> —
+/// or straight from <see cref="Loading"/> to <see cref="Closed"/>, for a store whose teardown
+/// began while it was still loading: the load it cut short is neither a load that finished nor
+/// one that ended short.
 /// A store is Degraded from the instant its load ends, or never — never after it has been
 /// Available — so the two PARTIAL states are a prefix of its life. That is what makes the question
 /// answerable around an asynchronous read with two volatile reads and no lock: an answer taken
@@ -30,6 +33,8 @@ public enum QueryAvailability : byte
     /// <summary>
     /// The store is still discovering what it holds on disk (its cold tier is scanned in the
     /// background after startup): a read now sees only what arrived since the start — a PART.
+    /// Also the state of a store whose teardown stopped that discovery half way, until it is
+    /// <see cref="Closed"/>: what it had found by then is as much a part.
     /// </summary>
     Loading = 1,
 

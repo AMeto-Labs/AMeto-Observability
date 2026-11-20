@@ -69,7 +69,9 @@ public sealed class RetentionStoreFileLifetimeTests
     /// <summary>
     /// What every test of the engine does: a store built inline, an engine over it, the engine
     /// disposed, the directory deleted. The engine closes what it opened (its WAL, its segments,
-    /// <c>counts.db</c>); the store was the one thing left.
+    /// <c>counts.db</c>); the store was the one thing left. Disposed at once, with no wait for the
+    /// boot catalog scan: the teardown stops that scan and waits for it itself
+    /// (<see cref="CatalogScanShutdownTests"/>).
     /// </summary>
     [Fact]
     public async Task A_directory_can_be_removed_as_soon_as_its_engine_is_disposed()
@@ -80,7 +82,6 @@ public sealed class RetentionStoreFileLifetimeTests
             Options.Create(options),
             new RetentionStore(options, NullLogger<RetentionStore>.Instance),
             NullLogger<StorageEngine>.Instance);
-        await engine.CatalogLoaded;      // the boot scan is a task the dispose does not wait for
         await engine.DisposeAsync();
 
         DeletePlainly(dir);

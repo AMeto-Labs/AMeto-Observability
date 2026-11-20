@@ -91,8 +91,9 @@ public sealed class TestDataDirectoryTests
     }
 
     /// <summary>
-    /// The handle the retries are for: one that closes by itself a moment later, as the boot
-    /// catalog scan's reader does. The holder is closed only once the delete has been seen to
+    /// The handle the retries are for: one that closes by itself a moment later, as an antivirus
+    /// scan of a fresh file does (and as the boot catalog scan's reader did, before the engine's
+    /// teardown waited for that scan). The holder is closed only once the delete has been seen to
     /// start — it removes the file nobody holds first — so the first attempt meets it.
     /// </summary>
     [StreamingMergeCrashSafetyTests.WindowsFact]

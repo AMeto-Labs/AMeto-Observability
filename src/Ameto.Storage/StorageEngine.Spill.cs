@@ -869,7 +869,7 @@ public sealed partial class StorageEngine
                     var live = _write;
                     if ((live.Spill is not null || Volatile.Read(ref live.HotRefused)) && !SwapFailing) break;
 
-                    SpillFile next = NextDespillable(_catalogLoad.IsCompleted);
+                    SpillFile next = NextDespillableNow();
                     if (next.Path is null) break;
 
                     if (!TryTakeFlushSlot()) break;   // released by the despill, or by its retry
@@ -948,6 +948,19 @@ public sealed partial class StorageEngine
         }
         return default;
     }
+
+    /// <summary>
+    /// <see cref="NextDespillable"/> as the loop asks it: "scanned" is a boot scan that RAN TO ITS
+    /// END (<see cref="CatalogScanRanToItsEnd"/>). One shutdown stopped has not judged the files it
+    /// did not reach, and a torn level among them is still in its block's mask, so such a block is
+    /// not for the taking although the scan's task has ended. (The token that stopped the scan stops
+    /// the loop too, and a despill begun in between gives up at its first check, before it writes;
+    /// the rule is kept here so that it does not rest on that.)
+    /// </summary>
+    private SpillFile NextDespillableNow() => NextDespillable(CatalogScanRanToItsEnd);
+
+    /// <summary>Test hook: whether the despill loop would take a block now (<see cref="NextDespillableNow"/>).</summary>
+    internal bool AnyBlockDespillableNowForTest => NextDespillableNow().Path is not null;
 
     /// <summary>Marks a queued block as taken by a despill (see <see cref="RunDespillLoopAsync"/>).</summary>
     private void MarkDespillInFlight(ulong segId)

@@ -51,4 +51,20 @@ internal static partial class StorageEngineLog
                 + "that partial data (unless Ameto:Alerts:EvaluateOnDegradedStore is set): a missing window would read "
                 + "as a quiet one. Restart once the cause is fixed")]
     internal static partial void CatalogScanFailed(ILogger logger, Exception exception, string segmentDirectory);
+
+    /// <summary>
+    /// The catalog scan was STOPPED by shutdown before it had read every segment file — not the
+    /// failure above: nothing is wrong with the directory, no restart is owed for it, and the files
+    /// it did not reach are read by the next start, as after any stop. Information, once per scan
+    /// that met the stop — the counterpart of the "Loaded … segments" line of a scan that ran to
+    /// its end. A scan whose task was cancelled before a thread took it up says nothing (it never
+    /// ran); one that starts in that race, or is run by hand after the engine is gone, says it at
+    /// once, with whatever the catalog holds. The store stays
+    /// <see cref="Ameto.Core.QueryAvailability.Loading"/> until its teardown closes it.
+    /// </summary>
+    [LoggerMessage(Level = LogLevel.Information,
+        Message = "The log segment catalog scan of {SegmentDirectory} was stopped by shutdown before it had read every "
+                + "segment file: {Registered} segment(s) were in the catalog by then. Nothing was changed on disk for the "
+                + "files it had not reached, and the next start scans the directory whole")]
+    internal static partial void CatalogScanStopped(ILogger logger, string segmentDirectory, int registered);
 }

@@ -22,12 +22,14 @@ namespace Ameto.Testing;
 ///   <c>AlertPersistence</c> open <c>Ameto.db</c> through the pool, which is right for a server:
 ///   one data directory, kept until the process exits. A test that removes the directory is the
 ///   one that has to let the pool go, so it is cleared here, before every attempt.</item>
-///   <item>A HANDLE THAT IS ABOUT TO CLOSE. The boot catalog scan of an engine is a task its
-///   <c>DisposeAsync</c> does not wait for, and it holds one segment open at a time: a delete that
-///   meets it leaves that one <c>.seg</c>. An antivirus or an indexer reading files written a
-///   moment ago may do the same. Both let go by themselves, so the delete is retried, backing off
-///   from 10 ms, for <see cref="RetryLimit"/> in all. A delete that succeeds at once, the normal
-///   case, costs nothing extra.</item>
+///   <item>A HANDLE THAT IS ABOUT TO CLOSE. An antivirus or an indexer reading files written a
+///   moment ago holds one for an instant, and a delete that meets it leaves that file. It lets go
+///   by itself, so the delete is retried, backing off from 10 ms, for <see cref="RetryLimit"/> in
+///   all. A delete that succeeds at once, the normal case, costs nothing extra. (The product had
+///   such a handle of its own: the boot catalog scan of a log engine was a task its
+///   <c>DisposeAsync</c> returned without, holding one segment open at a time, and that is how a
+///   test that reopened a store and ended early left one <c>.seg</c>. The teardown stops that
+///   scan and waits for it now — <c>CatalogScanShutdownTests</c>.)</item>
 ///   <item>A DIRECTORY JUNCTION INSIDE. .NET's recursive delete (10.0.15) throws "Access to the
 ///   path is denied" for the junction after it has removed the junction and everything else, and
 ///   leaves the emptied directory. The second attempt finds no junction.</item>
