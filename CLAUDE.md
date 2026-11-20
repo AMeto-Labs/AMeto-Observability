@@ -12,6 +12,7 @@
 
 ## Tests
 - Run tests as CI does: `dotnet test -c Debug` at the repo root (all six projects, Ameto.Perf included).
+- A test removes its data directory with `TestDataDirectory.Delete` (`tests/Shared`), after disposing what it opened there; not with `Directory.Delete` under an empty `catch`, which leaves the directory in TEMP in silence.
 
 ## Prohibitions
 - Do not change the GC settings in `src/Ameto.Server/Ameto.Server.csproj`: Workstation GC is deliberate for small hosts.

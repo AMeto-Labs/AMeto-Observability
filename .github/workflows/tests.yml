@@ -123,6 +123,41 @@ jobs:
           }
           Write-Host "no skipped tests across $($summaries.Count) test projects"
 
+      # WHAT THE SUITE LEFT IN TEMP. Every test that builds an engine, a store or a host does it over
+      # a directory under TEMP and deletes it in teardown, and for months most of those deletes failed
+      # in silence, on Windows only: one green run left 885 ameto-* directories (101 MB), and a
+      # developer machine held 33 479 of them (4.7 GB) before anyone looked. Here TEMP starts empty
+      # and leaves with the runner, so the same failure could not be seen at all. After a GREEN run
+      # the count is zero — a red run stops at the step above, and has every reason to leave its
+      # directories.
+      #
+      # A WARNING, NOT A FAILURE, AND WHAT WOULD CHANGE THAT. Tests that delete through
+      # TestDataDirectory.Delete (tests/Shared) retry a delete a closing handle blocks, and fail by
+      # themselves if the directory stays. About two hundred older teardowns are still a bare
+      # Directory.Delete under an empty catch: nothing holds their files any more, but one handle is
+      # still about to close when they run — the boot catalog scan of an engine, a task its
+      # DisposeAsync does not wait for — and on a two-core runner a delete can meet it. Until the
+      # engine joins that scan, a hard gate here would be red now and then on a suite that passed. So
+      # this step names what it finds, and turning `::warning::` into `exit 1` is the whole change
+      # the day it has stayed quiet.
+      - name: Report data directories the suite left in TEMP
+        shell: pwsh
+        run: |
+          $temp = [System.IO.Path]::GetTempPath()
+          $left = @(Get-ChildItem -LiteralPath $temp -Directory -Filter 'ameto-*')
+          if ($left.Count -eq 0) { Write-Host "the suite left no ameto-* directory in $temp"; exit 0 }
+
+          # By prefix, with what one of each still holds: the prefix names the test class, the files name the handle.
+          $groups = $left | Group-Object { $_.Name -replace '[-_]?[0-9a-fA-F]{8,}.*$', '' } | Sort-Object Count -Descending
+          foreach ($g in $groups) {
+            $sample = $g.Group[0]
+            $files  = @(Get-ChildItem -LiteralPath $sample.FullName -Recurse -File | ForEach-Object { $_.FullName.Substring($sample.FullName.Length + 1) })
+            $inside = if ($files.Count -eq 0) { 'empty' } else { ($files | Select-Object -First 5) -join ', ' }
+            Write-Host ("{0,4} x {1}  ({2}: {3})" -f $g.Count, $g.Name, $sample.Name, $inside)
+          }
+          $names = ($groups | ForEach-Object { "$($_.Count) x $($_.Name)" }) -join ', '
+          Write-Host "::warning::The test run left $($left.Count) data director$(if ($left.Count -eq 1) { 'y' } else { 'ies' }) in TEMP: $names. A teardown's delete failed and said nothing; see tests/Shared/TestDataDirectory.cs."
+
       # THE HANG'S EVIDENCE LEAVES WITH THE RUNNER unless it is uploaded. A hang in a class fixture's
       # teardown (a WebApplicationFactory host stopping after its last test) happens after every test
       # has finished, so "the test running when the crash occurred" has nothing to name, and the dump
