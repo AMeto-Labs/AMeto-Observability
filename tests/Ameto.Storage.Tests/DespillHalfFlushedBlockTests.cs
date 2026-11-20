@@ -246,6 +246,53 @@ public sealed class DespillHalfFlushedBlockTests : IDisposable
     }
 
     /// <summary>
+    /// The despill of a half-written block waits for the boot scan because it keeps the scan's
+    /// verdict on the block's levels. A scan SHUTDOWN stopped has given none: its task has ended —
+    /// Canceled — with the files it did not reach unjudged, and "the scan has ended" used to be all
+    /// the loop asked. The block is not for the taking then; the next start, whose scan runs to
+    /// its end, takes it.
+    ///
+    /// <para>Asked of the loop's own question, with the loop itself held: the token that stops the
+    /// scan stops the loop too, so the loop cannot be seen deciding this from outside.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_block_an_earlier_run_half_wrote_is_not_taken_after_a_scan_shutdown_stopped()
+    {
+        var opts = Options();
+        var (spill, _) = await HalfDespilledBlockAsync(opts);
+
+        var scan    = new TaskCompletionSource();
+        var despill = new TaskCompletionSource();
+        StorageEngine.HoldCatalogScanForTest.Value = scan.Task;
+        StorageEngine.HoldDespillForTest.Value     = despill.Task;
+        StorageEngine run2;
+        try { run2 = Engine(opts); }
+        finally
+        {
+            StorageEngine.HoldCatalogScanForTest.Value = null;
+            StorageEngine.HoldDespillForTest.Value     = null;
+        }
+        bool takenBeforeTheScan;
+        try
+        {
+            Assert.Equal(1, run2.SpillFilesPending);
+            takenBeforeTheScan = run2.AnyBlockDespillableNowForTest;
+        }
+        finally { await run2.DisposeAsync(); }   // neither hold was released: the scan is stopped, not run
+
+        Assert.False(takenBeforeTheScan, "setup: the block did not wait for the boot scan");
+        Assert.True(run2.CatalogLoaded.IsCanceled, "setup: the boot scan was not stopped by shutdown");
+        Assert.Equal(1, run2.SpillFilesPending);
+        Assert.False(run2.AnyBlockDespillableNowForTest,
+            "a block an earlier run half-wrote is for the taking after a boot scan that shutdown stopped — a scan that judged none of its levels");
+
+        await using var run3 = Engine(opts);
+        await run3.CatalogLoaded;
+        WaitFor(() => run3.SpillFilesPending == 0 && !File.Exists(spill), "run 3, whose scan ran to its end, to despill the block");
+        AssertEveryEventOnce(run3, 150);
+    }
+
+    /// <summary>
     /// Writes the spilled block — events 0..99 at Information, 100..149 at Error — and runs an engine
     /// whose despill moves the Information level into place and then "dies": the throw stands in for
     /// the kill, and the shutdown cancels the retry it schedules. Returns the spill file, still on
