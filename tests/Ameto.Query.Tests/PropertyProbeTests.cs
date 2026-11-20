@@ -153,4 +153,55 @@ public sealed class PropertyProbeTests
         Assert.False(Matches(ev, "customer = 'cust-3'"));   // wrong case is a different key
         Assert.True(Matches(ev, "Customer = 'cust-3'"));
     }
+
+    /// <summary>
+    /// msgpack lets a key be any value, and the project's own Serilog sink writes the keys of a
+    /// <c>Dictionary&lt;int, …&gt;</c> property as integers. A key that is not a string names
+    /// nothing a filter can ask for, so its pair is skipped and the map read on — by the probe at
+    /// the top level, which always did, and by the dictionary, which threw on the key: the catch
+    /// around it lost the WHOLE map (free text and every nested path saw no properties at all on
+    /// such an event), and the probe, decoding a value that held such a map, answered that the
+    /// property was absent. So the answers change both ways: what the event holds is found, and a
+    /// negation that read the property as missing no longer matches. The index walk skips such a
+    /// pair the same way.
+    /// </summary>
+    [Fact]
+    public void A_key_that_is_not_a_string_is_skipped_by_the_probe_and_the_dictionary_alike()
+    {
+        static LogEvent WithKeysThatAreNotStrings() => Event(static (ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(5);
+            w.Write(7);        w.Write("x");
+            w.Write("P");      w.Write("needle");
+            w.Write("Ctx");    w.WriteMapHeader(2); w.WriteNil(); w.Write("y"); w.Write("Tenant"); w.Write("acme");
+            w.Write("Counts"); w.WriteMapHeader(1); w.Write(500); w.Write(3);
+            w.Write("L");      w.WriteArrayHeader(2); w.WriteMapHeader(1); w.Write(1); w.Write("x"); w.Write("needle");
+        });
+
+        (string Filter, bool Expected)[] asks =
+        [
+            ("P = 'needle'",         true),    // the probe always read this one
+            ("Ctx.Tenant = 'acme'",  true),
+            ("needle",               true),    // free text reads the dictionary
+            ("has(Counts)",          true),    // a map, even an empty one
+            ("L = 'needle'",         true),    // a top-level value that holds such a map
+            ("Ctx.Tenant != 'acme'", false),   // these three read the property as missing
+            ("Ctx.Tenant = null",    false),
+            ("not has(Counts)",      false),
+        ];
+
+        foreach (bool materialised in (bool[])[false, true])
+        {
+            var ev = WithKeysThatAreNotStrings();
+            if (materialised) Assert.NotNull(ev.Properties);
+            foreach (var (filter, expected) in asks)
+                Assert.True(expected == Matches(ev, filter), $"`{filter}`, materialised: {materialised}: expected {expected}");
+        }
+
+        var map = WithKeysThatAreNotStrings().Properties;
+        Assert.NotNull(map);
+        Assert.Equal(new[] { "P", "Ctx", "Counts", "L" }, map.Keys);
+        Assert.Equal(new[] { "Tenant" }, Assert.IsType<Dictionary<string, object?>>(map["Ctx"]).Keys);
+        Assert.Empty(Assert.IsType<Dictionary<string, object?>>(map["Counts"]));
+    }
 }

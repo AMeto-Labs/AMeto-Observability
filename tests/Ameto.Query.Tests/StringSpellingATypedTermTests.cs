@@ -287,7 +287,11 @@ public sealed class StringSpellingATypedTermTests : IAsyncLifetime
     /// <summary>
     /// Every typed form the property walk files. A nil is asked for by no filter the index sees
     /// (<c>P = null</c> is never hinted), so its own text is never probed; its term is still
-    /// shared, and the string beside it is what can go missing.
+    /// shared, and the string beside it is what can go missing. That holds for a nil MAP value,
+    /// in rows apart. A nil ELEMENT of an array is filed as the string <c>"&lt;null&gt;"</c>, as
+    /// the reader reads it, so in the two array arrangements the nil meets nothing: the string
+    /// alone files the term the share-a-term check finds, and those cases only show that the
+    /// string is found.
     /// </summary>
     private static readonly Dictionary<string, Kind> Kinds = new()
     {

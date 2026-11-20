@@ -18,9 +18,14 @@ namespace Ameto.Indexing;
 /// <see cref="MessagePackReader"/> and feeds the indexes directly — no per-event
 /// <c>Dictionary</c>, no boxing, no per-attribute strings. This is the flush-path allocation hot
 /// spot (index build was ~16 KB/event); the streaming walk is byte-parity with the old dictionary
-/// path (see <see cref="BuildReference"/>, exercised by the parity test) for every valid UTF-8
-/// input. A key or value that is NOT valid UTF-8 is indexed as its raw bytes, where the
-/// char-based walk indexed the U+FFFD-replaced decoding — see <see cref="SegmentInvertedIndex"/>.
+/// path (see <see cref="BuildReference"/>, exercised by the parity tests) for every valid UTF-8
+/// input without a repeated key — keys that are not strings, nil and extension elements of arrays
+/// and binary values included, which it files as the reader reads them (see the note above
+/// <c>WalkMap</c>). A key repeated in one map is filed once per occurrence, where the dictionary
+/// keeps only the last value: the index then holds more than the scan reads, which costs a
+/// re-check and never a row. A key or value that is NOT valid UTF-8 is indexed as its raw bytes,
+/// where the char-based walk indexed the U+FFFD-replaced decoding — see
+/// <see cref="SegmentInvertedIndex"/>.
 /// </summary>
 public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 {
@@ -627,6 +632,9 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             try
             {
                 var reader = new MessagePackReader(new ReadOnlySequence<byte>(_payload.Memory));
+                // A payload the reader cannot read either — truncated, or holding a code msgpack
+                // never uses. Not a key that is not a string: that is valid msgpack, and WalkMap
+                // skips its pair rather than ending here.
                 try { WalkMap(ref reader, 0, offset, 0); }
                 catch { /* malformed payload — index what we could, mirror old try/catch tolerance */ }
             }
@@ -637,20 +645,53 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         }
     }
 
+    // WHAT THE WALK FILES IS WHAT THE SCAN READS. A filter is matched against the event as
+    // LogEventSerializer reads it — in the hot tier, and in a flushed group once the index has let
+    // the group through — and both gates in front of that read "not filed" as "not there". So a
+    // value has to be filed under the text the scan reads, or the row is one the hot tier returns
+    // and the flushed segment does not. Where the reader does not read a value as itself, the walk
+    // follows the reader: a pair whose key is not a string is skipped (WalkMap), a nil or extension
+    // ELEMENT of an array is the string "<null>" and a binary value the text "System.Byte[]"
+    // (AddScalar). The reference build reads the properties through that same reader, so the
+    // parity tests hold the walk to it.
+    //
+    // Not every reading is followed. A map or an array is not filed as a WHOLE: the scan's text
+    // predicates read one as its .NET type name ("System.Object[]", "System.Collections.Generic.
+    // Dictionary`2[…]"), which no client is shown and no filter should match — there the scan is
+    // the side that is wrong, and `contains(Payload, 'Dictionary')` still finds a row hot that a
+    // flushed group drops. That is left to the scan.
+
     private void WalkMap(ref MessagePackReader reader, int prefixLen, uint offset, int depth)
     {
         if (depth > _maxFlattenDepth) { reader.Skip(); return; }
         int count = reader.ReadMapHeader();
         for (int e = 0; e < count; e++)
         {
+            // A key that is not a string — msgpack allows any; the project's own Serilog sink
+            // writes a Dictionary<int, …> property's keys as integers — names nothing a filter can
+            // ask for: the scan's probe skips the pair and reads on, and so does its dictionary.
+            // So does the walk. Read as a string, the key threw, the catch-all in
+            // IndexPropertiesStreaming swallowed it, and every property after it on the row went
+            // unindexed: `R = 'needle'` returned the row hot and nothing once flushed.
+            if (reader.NextMessagePackType != MessagePackType.String)
+            {
+                reader.Skip();   // the key
+                reader.Skip();   // its value
+                continue;
+            }
             ReadOnlySpan<byte> keyUtf8 = ReadStr(ref reader);
             EnsureKey(prefixLen + keyUtf8.Length + 1);
             keyUtf8.CopyTo(_key.AsSpan(prefixLen));
-            WalkValue(ref reader, prefixLen + keyUtf8.Length, offset, depth);
+            WalkValue(ref reader, prefixLen + keyUtf8.Length, offset, depth, element: false);
         }
     }
 
-    private void WalkValue(ref MessagePackReader reader, int flatLen, uint offset, int depth)
+    /// <param name="element">
+    /// The value is an element of an array, at any depth of arrays — which is where the reader
+    /// reads a nil or an extension as the string <c>"&lt;null&gt;"</c> (<see cref="AddScalar"/>).
+    /// A map resets it: its values are map values again, wherever the map sits.
+    /// </param>
+    private void WalkValue(ref MessagePackReader reader, int flatLen, uint offset, int depth, bool element)
     {
         switch (reader.NextMessagePackType)
         {
@@ -662,42 +703,44 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 
             case MessagePackType.Array:
                 int n = reader.ReadArrayHeader();
-                for (int i = 0; i < n; i++) WalkValue(ref reader, flatLen, offset, depth);
+                for (int i = 0; i < n; i++) WalkValue(ref reader, flatLen, offset, depth, element: true);
                 break;
 
             default:
-                AddScalar(ref reader, flatLen, offset);
+                AddScalar(ref reader, flatLen, offset, element);
                 break;
         }
     }
 
-    private void AddScalar(ref MessagePackReader reader, int flatLen, uint offset)
+    /// <summary>
+    /// Files one scalar under the flat key in <see cref="_key"/>, as the scan reads it.
+    ///
+    /// <para>Three of them the reader does not read as themselves, and the walk follows it. A nil
+    /// or an extension (a msgpack timestamp, say) is null to <c>LogEventSerializer.ReadDynamic</c>;
+    /// as a map value it stays null, and is filed as a nil — but as an ELEMENT of an array
+    /// <c>ReadArray</c> turns it into the string <c>"&lt;null&gt;"</c>, which the scan compares,
+    /// the events API shows and the UI's "filter by this value" builds <c>Tags[1] = '&lt;null&gt;'</c>
+    /// from, so it is filed as that string. A binary value is a <c>byte[]</c>, which the scan's text
+    /// predicates (<c>contains</c>, <c>like</c>, <c>startsWith</c>, <c>in</c> and the text
+    /// functions) read as its <c>ToString()</c>, <c>"System.Byte[]"</c> — the text clients are shown
+    /// for it too — so it is filed as that text. The walk used to file a nil element as a nil and skip the other two,
+    /// and those filters found the row hot and nothing once flushed.</para>
+    ///
+    /// <para>The index follows the reader rather than the reader the index because the reader's
+    /// text is what every client sees and every saved filter means, while the index is read only to
+    /// decide which rows the scan reads. Nothing is lost by it either: the nil an element was filed
+    /// as is a term no query asks for — <c>X = null</c> is never hinted, since a missing property
+    /// matches it too.</para>
+    /// </summary>
+    private void AddScalar(ref MessagePackReader reader, int flatLen, uint offset, bool element)
     {
         var flatKey = _key.AsSpan(0, flatLen);
 
         switch (reader.NextMessagePackType)
         {
             case MessagePackType.String:
-            {
-                ReadOnlySpan<byte> v = ReadStr(ref reader);
-                int prop = _inverted.PropertyId(flatKey, out bool newKey);
-                // Marked BEFORE it is filed, as AddHeaderString does: a filed string whose property
-                // is not marked is the one state the rule must never leave behind, and the mark can
-                // throw (it may grow the bitset).
-                bool tagged = MaySpellATypedTerm(v);
-                if (tagged) NoteTaggedSpelling(prop);
-                var r    = _inverted.AddValue(offset, prop, v);          // serialised == plain for strings
-                _bloomPresented += 2;
-                if (newKey) _bloom.AddUtf8(flatKey);
-                // New to the inverted index — or a repeat the bloom may not have been given: a
-                // string that may spell a typed value's term (see MaySpellATypedTerm), or the
-                // exception marker's own term met by a client's value for the first time (see
-                // AddExists; that debt is struck off once the text is in the filter).
-                bool owed = r == IndexAddOutcome.Existing && prop == _markerOwesBloom && v.SequenceEqual(MarkerValue);
-                FoldValue(offset, v, bloom: owed || tagged || r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
-                if (owed) _markerOwesBloom = -1;
+                AddString(offset, flatKey, ReadStr(ref reader));
                 break;
-            }
             case MessagePackType.Integer:
             {
                 if (reader.NextCode == MessagePackCode.UInt64)
@@ -736,19 +779,71 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 break;
             }
             case MessagePackType.Nil:
-            {
                 reader.ReadNil();
-                int prop = _inverted.PropertyId(flatKey, out bool newKey);
-                var r    = _inverted.AddValue(offset, prop, "\0null"u8);
-                _bloomPresented += 2;
-                if (newKey) _bloom.AddUtf8(flatKey);
-                if (r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop)) _bloom.Add(ReadOnlySpan<byte>.Empty);   // v?.ToString() ?? "" → ""
+                if (element) AddString(offset, flatKey, NullElementText);
+                else         AddNil(offset, flatKey);
                 break;
-            }
-            default:
+
+            case MessagePackType.Binary:
                 reader.Skip();
+                AddString(offset, flatKey, BinaryText);
+                break;
+
+            default:
+                // An extension. (The one code that is neither, 0xC1, is never valid msgpack: the
+                // skip throws on it, as the reader's does, and the row's walk ends there.)
+                reader.Skip();
+                if (element) AddString(offset, flatKey, NullElementText);
+                else         AddNil(offset, flatKey);
                 break;
         }
+    }
+
+    /// <summary>
+    /// The string <c>LogEventSerializer.ReadArray</c> reads a nil or extension ELEMENT of an array
+    /// as — and the text <c>MsgPackJsonTranscoder</c> shows clients for one.
+    /// </summary>
+    private static ReadOnlySpan<byte> NullElementText => "<null>"u8;
+
+    /// <summary>
+    /// What the scan's text predicates read a binary value as — <c>byte[].ToString()</c> — and the
+    /// text <c>MsgPackJsonTranscoder</c> shows clients for one.
+    /// </summary>
+    private static ReadOnlySpan<byte> BinaryText => "System.Byte[]"u8;
+
+    /// <summary>
+    /// Files one string: a client's, or the text the reader reads a value as
+    /// (<see cref="NullElementText"/>, <see cref="BinaryText"/>) — which IS the term a client string
+    /// of that text files, with the same bloom text, so the two can meet in either order.
+    /// </summary>
+    private void AddString(uint offset, ReadOnlySpan<byte> flatKey, ReadOnlySpan<byte> v)
+    {
+        int prop = _inverted.PropertyId(flatKey, out bool newKey);
+        // Marked BEFORE it is filed, as AddHeaderString does: a filed string whose property
+        // is not marked is the one state the rule must never leave behind, and the mark can
+        // throw (it may grow the bitset).
+        bool tagged = MaySpellATypedTerm(v);
+        if (tagged) NoteTaggedSpelling(prop);
+        var r    = _inverted.AddValue(offset, prop, v);          // serialised == plain for strings
+        _bloomPresented += 2;
+        if (newKey) _bloom.AddUtf8(flatKey);
+        // New to the inverted index — or a repeat the bloom may not have been given: a
+        // string that may spell a typed value's term (see MaySpellATypedTerm), or the
+        // exception marker's own term met by a client's value for the first time (see
+        // AddExists; that debt is struck off once the text is in the filter).
+        bool owed = r == IndexAddOutcome.Existing && prop == _markerOwesBloom && v.SequenceEqual(MarkerValue);
+        FoldValue(offset, v, bloom: owed || tagged || r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
+        if (owed) _markerOwesBloom = -1;
+    }
+
+    /// <summary>Files a nil map value — or an extension one, which the reader reads as a nil.</summary>
+    private void AddNil(uint offset, ReadOnlySpan<byte> flatKey)
+    {
+        int prop = _inverted.PropertyId(flatKey, out bool newKey);
+        var r    = _inverted.AddValue(offset, prop, "\0null"u8);
+        _bloomPresented += 2;
+        if (newKey) _bloom.AddUtf8(flatKey);
+        if (r == IndexAddOutcome.NewValue || HasTaggedSpelling(prop)) _bloom.Add(ReadOnlySpan<byte>.Empty);   // v?.ToString() ?? "" → ""
     }
 
     private void AddLong(long l, uint offset, ReadOnlySpan<byte> flatKey)

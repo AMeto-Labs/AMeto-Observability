@@ -183,11 +183,11 @@ public sealed class BloomFirstSightTests
             foreach (string kind in TypedKinds.Keys)
             foreach (string order in (string[])["string,typed", "typed,string", "[string,typed]", "[typed,string]", "typed,typed,string,typed,string"])
             {
-                // A nil INSIDE an array is no comparison with the reference: the reference reads
-                // the element as the string "<null>" (LogEventSerializer.ReadArray — and the scan
-                // reads it so too), where the walk files a nil. That disagreement is older than
-                // this rule and untouched by it; the walk's side of the meeting is still asked of
-                // the engine, in StringSpellingATypedTermTests.
+                // A nil INSIDE an array is skipped: it is no typed value there. The reader reads
+                // the element as the string "<null>" (LogEventSerializer.ReadArray), and the walk
+                // files it so, as the reference does — so it never meets the string "\0null", and
+                // its bloom text is "<null>", not the nil's "" that the assertion asks for. A nil
+                // and that string meet as a map value, in the orders rows apart.
                 if (kind == "nil" && order.StartsWith('[')) continue;
                 data.Add(kind, order);
             }

@@ -159,6 +159,23 @@ Inside the brackets, escape a literal single quote with `\'`.
 > written bare (it may also name a nested map of that shape) and is one level in
 > brackets: `['http.request.method']`.
 
+### Values that do not read as themselves
+
+Some stored values read as something other than themselves:
+
+- A **nil or msgpack-extension element of an array** (a msgpack timestamp, say)
+  reads as the string `'<null>'` — which is also how the event view shows it — so
+  `Tags[1] = '<null>'` and `contains(Tags, 'null')` find it. A nil or extension
+  property that is not in an array reads as `null`.
+- A **binary value** reads as the text `'System.Byte[]'` (also how the event view
+  shows it) wherever a filter reads a value as text: `contains`, `startsWith`,
+  `endsWith`, `like`, `in` and the text functions. `=` does not read it as text:
+  `Bin = 'System.Byte[]'` matches nothing.
+- A **map key that is not a string** (msgpack allows any; a .NET
+  `Dictionary<int, …>` logged through Serilog has integer keys) cannot be named by
+  a filter. Its pair is skipped, by free text too, and the rest of the event reads
+  as usual.
+
 ## Built-in CLEF fields
 
 | Field | Alias | Description |
