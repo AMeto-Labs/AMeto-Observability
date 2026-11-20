@@ -142,12 +142,14 @@ jobs:
       # A WARNING, NOT A FAILURE, AND WHAT WOULD CHANGE THAT. Tests that delete through
       # TestDataDirectory.Delete (tests/Shared) retry a delete a closing handle blocks, and fail by
       # themselves if the directory stays. About two hundred older teardowns are still a bare
-      # Directory.Delete under an empty catch: nothing holds their files any more, but one handle is
-      # still about to close when they run — the boot catalog scan of an engine, a task its
-      # DisposeAsync does not wait for — and on a two-core runner a delete can meet it. Until the
-      # engine joins that scan, a hard gate here would be red now and then on a suite that passed. So
-      # this step names what it finds, and failing on a green run's leftovers is a small change the
-      # day it has stayed quiet.
+      # Directory.Delete under an empty catch, with no retry. Nothing of the product's holds their
+      # files when they run: the last handle that did was the boot catalog scan of a log engine, a
+      # task its DisposeAsync returned without, and the teardown now stops that scan and waits for
+      # it (StorageEngine.DisposeCoreAsync; CatalogScanShutdownTests). What a bare delete can still
+      # meet is not ours — an antivirus or an indexer reading a file written a moment ago — and
+      # whether that happens on these runners is a question for the runs, not for the code. So this
+      # step still only names what it finds, and failing on a green run's leftovers is a small
+      # change the day it has stayed quiet over enough runs of main to say so.
       #
       # IT NEVER FAILS THE JOB ITSELF: it reports, the tests decide. GitHub runs pwsh with
       # $ErrorActionPreference = 'stop', under which one entry it cannot list would end the step;

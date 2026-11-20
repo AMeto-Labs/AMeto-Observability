@@ -330,8 +330,8 @@ internal static class QuerySegmentFixtures
     /// <c>Directory.Delete</c>, everywhere in this suite.
     ///
     /// <para>It is <see cref="Ameto.Testing.TestDataDirectory.Delete(string)"/>, which the test projects
-    /// share: retried while a handle that is about to close still blocks it — a finishing
-    /// background read, an antivirus scan of the fresh <c>.seg</c> files — and a failure of the
+    /// share: retried while a handle that is about to close still blocks it — an antivirus or an
+    /// indexer reading the fresh <c>.seg</c> files — and a failure of the
     /// test when the directory is there at the end of that, where this method used to return in
     /// silence. Its history is why the helper exists. Disposing the engine did not close
     /// <c>Ameto.db</c>: <see cref="RetentionStore"/> opened it through Microsoft.Data.Sqlite's
