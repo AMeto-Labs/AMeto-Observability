@@ -25,6 +25,14 @@ app-modal { display: contents; }
   cursor: default;
 }
 
+/* Under the pointer it stays as it is: it takes the pointer now, and would otherwise light up
+   as a button that is about to act. */
+.btn.primary[aria-disabled='true']:hover {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--text-on-primary);
+}
+
 /* Over the whole window for the moment after the last key's dialog has closed (see the
    template). It shows nothing and takes the clicks meant for a Done that is no longer there. As
    high as the dialogs stand, and later in the page than any of them, so over those as well. */
@@ -34,12 +42,38 @@ app-modal { display: contents; }
   z-index: 1000;
 }
 
+/* The key dialog is as tall for one key as for the next: it is centred, and a difference in
+   height between two keys moves Done by half of it, out from under a second click.
+
+   Its title is one line. A profile's name may be a hundred characters, and one that took a
+   second line made its dialog taller than the next key's. The whole name is in the page still,
+   for a screen reader and for whoever selects it; the Profiles tab shows it whole. */
+:host ::ng-deep .m-key-dialog .modal__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Done's row is two lines of what is said beside it, with that or without: on a narrow screen
+   the sentence wraps, and a row as tall as its text was three pixels taller than Done alone. */
+.m-key-dialog .m-actions {
+  align-items: center;
+  min-height: 32px;
+}
+
 /* What is said of the keys still waiting, at the start of Done's row. It takes the room Done
-   leaves and wraps inside it, so the row is as tall as Done with it or without. */
+   leaves and wraps inside it, to two lines and no more: on a screen too narrow for that the
+   rest is cut, and the whole of it is the element's title. */
 .m-key-behind {
+  display: -webkit-box;
   flex: 1;
   min-width: 0;
-  align-self: center;
+  max-height: 32px;
+  overflow: hidden;
+  line-height: 16px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 /* ── The section's own tabs ─────────────────────────────────────────────────── */

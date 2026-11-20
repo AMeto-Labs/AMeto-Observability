@@ -44,7 +44,7 @@ const goneProfile = (name: string | undefined): string =>
 
 const ACTIONS: readonly { id: McpMaskAction; label: string; tone: string; does: string }[] = [
   { id: 'hash',      label: 'Hash',        tone: 'acc', does: 'Replace the value with its token. The AI can still match and search by it.' },
-  { id: 'keepLast4', label: 'Keep last 4', tone: '',    does: 'Show the last four characters and hide the rest.' },
+  { id: 'keepLast4', label: 'Keep last 4', tone: '',    does: 'Show the last four characters and hide the rest. A value shorter than eight characters is hidden whole; of a list, each element is cut.' },
   { id: 'remove',    label: 'Remove',      tone: 'err', does: 'Leave the property out of the answer.' },
   // A keep vouches for the value at its own path only (docs/MCP.md, Field rules): what is under
   // that path is let through Strict mode, and the detectors go on looking through it.

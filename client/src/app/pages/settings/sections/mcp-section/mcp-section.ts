@@ -39,6 +39,15 @@ const samePlace = (a: Place, b: Place): boolean => a.tab === b.tab && a.tool ===
 export const DONE_PAUSE_MS = 700;
 
 /**
+ * How long after a key has come up a click the browser counts as the second or a later one of a
+ * run is taken for the rest of a double click, and dropped. A system can be set to count clicks
+ * 900 ms apart as one run, which is longer than the pause. Past this a click is somebody
+ * clicking, however the browser counts it: every click made inside the system's interval
+ * lengthens the run, and a rule with no end to it would drop them all, without a word.
+ */
+export const DOUBLE_CLICK_MS = 1000;
+
+/**
  * Where the browser's current history entry stands among the others, where the browser says:
  * the Navigation API's index. Null without that API.
  */
@@ -130,9 +139,14 @@ export class McpSectionComponent {
   /** True for a moment after Done took a key down (see DONE_PAUSE_MS): the key shown meanwhile cannot be taken down yet. */
   readonly doneHeld = signal(false);
   private donePause: ReturnType<typeof setTimeout> | undefined;
+  /** When the key on screen came up (see DOUBLE_CLICK_MS). */
+  private shownAt = 0;
 
   constructor() {
     inject(DestroyRef).onDestroy(() => clearTimeout(this.donePause));
+    effect(() => {
+      if (this.revealed()) this.shownAt = Date.now();
+    });
     this.router.events.pipe(takeUntilDestroyed()).subscribe(e => {
       if (e instanceof NavigationStart) this.traversing = e.navigationTrigger === 'popstate';
     });
@@ -184,11 +198,13 @@ export class McpSectionComponent {
    * taken down just before it is not held up.
    *
    * A click that is the second or a later one of a run — a double click, however slow the
-   * system lets one be — takes nothing down either: the pause is 700 ms, and a double click can
-   * be set to 900. The pause stays for whatever does not count its clicks.
+   * system lets one be — takes nothing down either while the key has only just come up: the
+   * pause is 700 ms, and a double click can be set to 900. That covers a key that comes up
+   * under a double click begun elsewhere as well. The pause stays for whatever does not count
+   * its clicks.
    */
   done(key: RevealedKey, click?: Event): void {
-    if (click instanceof MouseEvent && click.detail > 1) return;
+    if (click instanceof MouseEvent && click.detail > 1 && Date.now() - this.shownAt < DOUBLE_CLICK_MS) return;
     if (this.doneHeld() || this.revealed() !== key) return;
     this.store.acknowledgeKey(key);
     this.doneHeld.set(true);

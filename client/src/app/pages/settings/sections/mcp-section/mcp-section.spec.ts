@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { McpCall, McpOverview, McpPreview, McpProfile, McpPublishedTool, McpRule, McpSummary } from '../../../../core/models/mcp.model';
 import { SettingsDirtyService } from '../../settings-dirty.service';
-import { DONE_PAUSE_MS, McpSectionComponent } from './mcp-section';
+import { DONE_PAUSE_MS, DOUBLE_CLICK_MS, McpSectionComponent } from './mcp-section';
 
 const OVERVIEW: McpOverview = {
   path: '/mcp',
@@ -1151,6 +1151,19 @@ describe('Settings → AI / MCP', () => {
     expect(all(f, '.modal .m-key-behind').map(n => n.parentElement)).toEqual([row]);
     expect(row.querySelector('.m-key-behind')!.textContent).toBe('Another key is waiting: it is shown after this one.');
 
+    // The dialog is as tall for this key as for the next. It stands in the centre of the
+    // window, so a difference in height moves Done by half of it: a profile's name that took a
+    // second line of the title did, and so did what is said beside Done where it wrapped. The
+    // title is one line; Done's row is two lines of that sentence, with it or without, and the
+    // sentence is held to them — its whole text is its title.
+    const dialog = el(f, 'app-modal.m-key-dialog');
+    const drawnTitle = getComputedStyle(dialog.querySelector('.modal__title')!);
+    expect([drawnTitle.whiteSpace, drawnTitle.overflow, drawnTitle.textOverflow]).toEqual(['nowrap', 'hidden', 'ellipsis']);
+    expect(getComputedStyle(row).minHeight).toBe('32px');
+    const behind = row.querySelector<HTMLElement>('.m-key-behind')!;
+    expect([getComputedStyle(behind).maxHeight, getComputedStyle(behind).overflow]).toEqual(['32px', 'hidden']);
+    expect(behind.title).toBe(behind.textContent);
+
     vi.useFakeTimers();
     done.focus();
     done.click();
@@ -1159,6 +1172,7 @@ describe('Settings → AI / MCP', () => {
     expect(all(f, '.modal .m-key-behind')).toEqual([]);
     expect(button(f, 'Done', '.modal')).toBe(done);
     expect(done.parentElement).toBe(row);
+    expect(getComputedStyle(row).minHeight).toBe('32px');
 
     // Held, Done looks switched off and still takes the pointer: with pointer-events off, the
     // second click of a double click went through it to what lay behind, and the focus went
@@ -1168,7 +1182,7 @@ describe('Settings → AI / MCP', () => {
     expect(document.activeElement).toBe(done);
   });
 
-  it('a click counted as the second of a run takes nothing down, however long after the first', async () => {
+  it('a click counted as the second of a run takes nothing down while the key has only just come up', async () => {
     const f = await twoKeys();
     vi.useFakeTimers();
     const done = button(f, 'Done', '.modal');
@@ -1189,11 +1203,38 @@ describe('Settings → AI / MCP', () => {
     expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
     expect(dirty.dirtyTabsList()).toEqual(['ai-mcp']);
 
-    // A click of its own takes the key down; so does Enter or Space, whose click counts none.
-    click(1);
+    // Not for ever: every click made inside the system's interval lengthens the run, and
+    // somebody clicking on would never get through. A second after the key came up, a click is
+    // a click, whichever of its run the browser calls it.
+    await vi.advanceTimersByTimeAsync(DOUBLE_CLICK_MS - DONE_PAUSE_MS - 150);
+    await settle(f);
+    click(4);
     await settle(f);
     expect(all(f, '.modal')).toEqual([]);
     expect(dirty.dirtyTabsList()).toEqual([]);
+  });
+
+  it('a key that comes up under a double click begun elsewhere is not taken down by its second click', async () => {
+    const f = await open('profiles');
+    const post = await createSupport(f);
+    post.flush({ profile: SUPPORT, key: 'the-new-key-shown-once' });
+    await lists(f, [PROFILES[0], SUPPORT], TOOLS);
+    vi.useFakeTimers();
+    const done = button(f, 'Done', '.modal');
+    const click = (detail: number): boolean => done.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, detail }));
+
+    // Nothing was taken down before it, so Done is not held — and the click that lands on it
+    // is the second of a run that began on whatever stood there before the dialog.
+    expect(done.hasAttribute('aria-disabled')).toBe(false);
+    await vi.advanceTimersByTimeAsync(200);
+    click(2);
+    await settle(f);
+    expect(el(f, '.m-key-text').textContent).toBe('the-new-key-shown-once');
+
+    // A click of its own takes the key down at once; so does Enter or Space, whose click counts none.
+    click(1);
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
   });
 
   it('Enter held down on Done is one press: its repeats activate nothing', async () => {
@@ -1241,7 +1282,7 @@ describe('Settings → AI / MCP', () => {
     expect(all(f, '.m-key-shield')).toEqual([]);
   });
 
-  it('Copy copies the key it stands beside', async () => {
+  it('Copy copies the key it stands beside, not the one that has just taken its place', async () => {
     const f = await twoKeys();
     const written: string[] = [];
     const before = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
@@ -1250,9 +1291,15 @@ describe('Settings → AI / MCP', () => {
       value: { writeText: (text: string) => { written.push(text); return Promise.resolve(); } },
     });
     try {
+      vi.useFakeTimers();
+      // Done takes the first key down. Until the page is drawn again the Copy beside it is still
+      // that key's, and a click that lands on it then copies the key it was drawn for — not
+      // whichever the store holds first by now, which nobody has seen.
+      button(f, 'Done', '.modal').click();
       el<HTMLButtonElement>(f, '.modal .m-key-reveal button[title="Copy"]').click();
       await settle(f);
       expect(written).toEqual(['the-new-key-shown-once']);
+      expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
     } finally {
       if (before) Object.defineProperty(navigator, 'clipboard', before);
       else delete (navigator as { clipboard?: unknown }).clipboard;
