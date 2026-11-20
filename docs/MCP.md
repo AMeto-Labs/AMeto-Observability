@@ -278,16 +278,16 @@ A rule names a property and what happens to its value.
 |--------|--------|
 | `hash` | The value is replaced by its token. |
 | `remove` | The property is left out of the answer. |
-| `keepLast4` | `****` and the last four characters. |
+| `keepLast4` | `****` and the last four characters of the value as it is written, if it is eight characters or longer; a shorter one — a `true`, a `false`, a six-digit code — is `****` alone. Of a list: of each of its elements. |
 | `keep` | The value at the rule's own path goes out as stored; the detectors leave it alone. What is spelled under that path is let through Strict mode and still goes past the detectors. The allow-list of Strict mode. |
 
 - The field is a property path as a filter spells it — `Customer.Iin` — with `*` for any run of
   characters, compared without regard to case.
 - A pattern without a dot is also tried against the last segment of a path: `CardNumber` hides
   `CardNumber` and `Payment.CardNumber`. A pattern with a dot matches whole paths only.
-- A rule on a property that holds an object or a list hides the whole value under one token,
-  and everything under it: with a rule on `Buyer`, a filter or a `group by` on `Buyer.Name` is
-  one on a hidden field.
+- A rule on a property that holds an object hides the whole value under one token, and
+  everything under it: with a rule on `Buyer`, a filter or a `group by` on `Buyer.Name` is one on
+  a hidden field. So does a `hash` on a list; what a `keepLast4` does to a list is said below.
 - "Under it" is by the dots of the path as it is spelled, whether a dot stands between an object
   and its property or inside one name. An OTLP attribute is one property with dots in its name —
   `client.address`, `user.id` — and a filter spells it as it spells a property of an object, so a
@@ -295,7 +295,12 @@ A rule names a property and what happens to its value.
   `client.address` and `client.id` alike. Every name keeps its place in a path, an empty one
   too: the property `Pin` of a property with no name is `.Pin`, to a rule and to a filter.
 - `keepLast4` and `keep` are about the value at their own path. Under a `keepLast4` everything is
-  hidden whole — there are no last four characters of an object.
+  hidden whole — there are no last four characters of an object, and an object at the path itself
+  is one token for the same reason.
+- The elements of a list are named by the list's path — `SavedCards[0]` is `SavedCards` to a rule
+  — so a `keepLast4` on a list cuts each of its elements, and a list inside it likewise:
+  `["****1111","****0004"]`. A search and a table of the elements (`group by SavedCards[0]`) show
+  the same four characters of each. A `hash` on a list is still one token for the whole list.
 - Under a `keep` everything is let through Strict mode, and nothing is vouched for: the detectors
   look through it as they do through a property no rule names. A `keep` on `card`, meant for the
   property that holds a card's brand, does not send `payment.card.number` as stored. A pattern
@@ -399,9 +404,13 @@ open there, and the next `logs_context`, a `sum` with a `count` beside it, or a 
 
 Anything else is refused with a sentence that says so, before anything is read: a property no rule
 hides, one a rule hides in only some of the services the profile reads (`= only, no token` in
-`logs_fields`), one a `keep` or a `keepLast4` shows in any of them — the last four characters are
-the whole of a short value — and a built-in field (`@service = 'h:…'`, `@x.type = 'h:…'`), which no
+`logs_fields`), one a `keep` or a `keepLast4` shows in any of them — four characters are half of
+a value of eight — and a built-in field (`@service = 'h:…'`, `@x.type = 'h:…'`), which no
 hidden value is kept in and every answer shows as it is.
+
+So is the token of a `true` or a `false`, against any property. Strict mode lets booleans pass, so
+a property it alone hides shows them as they are, and an equality with the text of one finds them:
+the token would be read off the first event it found.
 
 A path is judged in every way the engine can read it. `Items.0.Sku` is the first element of a
 list (which the rules name `Items.Sku`) or the property `Sku` of a property named `0`, and

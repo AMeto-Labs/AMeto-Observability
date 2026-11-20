@@ -600,6 +600,103 @@ public sealed class McpFilterGuardTests
     }
 
     /// <summary>
+    /// A <c>keepLast4</c> on a list cuts each of its elements: the rules name a list's elements
+    /// by the list's path, and so does a table — <c>group by SavedCards[0]</c> is judged by
+    /// <c>SavedCards</c>. While the answer hashed the list whole, that table showed the last four
+    /// characters of every element a search showed none of (the sixth review). A true or a
+    /// false is cut as the text it is written with, which is what the engine makes a key of:
+    /// hashed in the answer, it was <c>****alse</c> in a table — which names the value, so a
+    /// value shorter than eight characters is now the mark alone, in the answer and in a key.
+    /// </summary>
+    [Fact]
+    public void AKeepLast4OnAList_CutsEachElement_AndATableOfThemShowsNoMore()
+    {
+        static string Path(string spelling) => ((CompareNode)FilterParser.Parse($"{spelling} = 'x'")).Property;
+
+        foreach (var mode in (McpMaskingMode[])[McpMaskingMode.Standard, McpMaskingMode.Strict])
+        {
+            var policy = Policy(mode, new TokenVault(), Rule("SavedCards", MaskAction.KeepLast4), Rule("Flag", MaskAction.KeepLast4));
+            string Shown(string name, object? value) => Cells(policy.Mask(Event("x", new() { [name] = value }), new MaskStats()))[name];
+
+            Assert.Equal("""["****1111","****0004"]""", Shown("SavedCards", new List<object?> { "4111111111111111", "5500000000000004" }));
+            Assert.Equal("""["****6363","****"]""",     Shown("SavedCards", new List<object?> { 6456116363L, 77L }));
+            Assert.Equal("""[["****KWXY"],null,"****"]""", Shown("SavedCards", new List<object?> { new List<object?> { "ZQ-77-KWXY" }, null, false }));
+            Assert.Equal("[]", Shown("SavedCards", new List<object?>()));
+            // A map has no last four characters: one token for it, in its place in the list.
+            Assert.Matches("""^\["h:[0-9a-f]{12}","\*\*\*\*1111"\]$""",
+                Shown("SavedCards", new List<object?> { new Dictionary<string, object?> { ["n"] = "4111111111111111" }, "4111111111111111" }));
+            // And not a list at all: as before.
+            Assert.Equal("****1111", Shown("SavedCards", "4111111111111111"));
+
+            // A table's key of an element is what a search shows of that element — the engine's own reading of it.
+            var ev = Event("x", new() { ["SavedCards"] = new List<object?> { "4111111111111111", new List<object?> { "x", "5500000000000004" } } });
+            foreach (var (spelling, cut) in ((string, string)[])[("SavedCards[0]", "****1111"), ("SavedCards[1][1]", "****0004")])
+            {
+                string path = Path(spelling);
+                string read = Assert.IsType<string>(FilterEvaluator.ReadProperty(ev, path));
+                Assert.Equal(cut, policy.MaskGroupKey(FilterGuard.RulePath(path), read, new MaskStats(), Payments.Services));
+                Assert.Contains($"\"{cut}\"", Cells(policy.Mask(ev, new MaskStats()))["SavedCards"]);
+            }
+
+            // A true and a false: their text, cut — and too short for four characters to be a part of it.
+            foreach (bool flag in (bool[])[true, false])
+            {
+                Assert.Equal("****", Shown("Flag", flag));
+                Assert.Equal("****", policy.MaskGroupKey("Flag", flag ? "true" : "false", new MaskStats(), Payments.Services));
+            }
+
+            // Four characters are shown of a value of eight or more: of a shorter one they are
+            // the value or most of it. The same cut in the answer and in a table's key.
+            Assert.Equal(8, MaskingPolicy.ShortestCut);
+            foreach (var (value, cut) in ((object, string)[])[("1234567", "****"), ("12345678", "****5678"), (123456L, "****"), (12345678L, "****5678"), ("", "****")])
+            {
+                Assert.Equal(cut, Shown("Flag", value));
+                Assert.Equal(cut, policy.MaskGroupKey("Flag", Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture), new MaskStats(), Payments.Services));
+            }
+        }
+
+        // A list under an object: cut in its place, the object's other properties as they were.
+        var nested = Standard(Rule("Customer.Cards", MaskAction.KeepLast4));
+        var customer = new Dictionary<string, object?> { ["Cards"] = new List<object?> { "4111111111111111", 5500000000000004L }, ["Tier"] = "gold" };
+        Assert.Equal("""{"Cards":["****1111","****0004"],"Tier":"gold"}""", Cells(nested.Mask(Event("x", new() { ["Customer"] = customer }), new MaskStats()))["Customer"]);
+    }
+
+    /// <summary>
+    /// Strict mode lets booleans pass, and an equality with the text of one finds them. So the
+    /// token of a true or a false — a table gives one, for <c>group by</c> a field that is
+    /// hidden — compared with a field Strict mode alone hides would be read off the first event
+    /// it found. It is compared with nothing. (Found by putting a false among the values of
+    /// the property test below.)
+    /// </summary>
+    [Fact]
+    public void ATokenOfATrueOrAFalse_StandsAgainstNothing()
+    {
+        var vault  = new TokenVault();
+        var policy = Policy(McpMaskingMode.Strict, vault, Rule("IsVip", MaskAction.Hash));
+
+        // A table's key under the rule: a token, and one the vault knows.
+        string token = policy.MaskGroupKey("IsVip", "false", new MaskStats())!;
+        Assert.Matches("^h:[0-9a-f]{12}$", token);
+        Assert.True(MaskToken.TryParse(token, out ulong bits) && vault.TryResolve(bits, out _));
+
+        // A boolean no rule names goes out as it is, in Strict mode too; the one under the rule as that token.
+        var cells = Cells(policy.Mask(Event("x", new() { ["Retried"] = false, ["IsVip"] = false, ["Note"] = "n" }), new MaskStats()));
+        Assert.Equal("false", cells["Retried"]);
+        Assert.Equal(token, cells["IsVip"]);
+        Assert.StartsWith("h:", cells["Note"]);
+
+        // So it is compared with nothing — not with what Strict mode hides, not with what the rule does.
+        foreach (string filter in (string[])[$"Retried = '{token}'", $"IsVip = '{token}'", $"Retried in ['{token}', 'x']", $"Retried != '{token}'", $"Note = '{token}'"])
+            Assert.NotNull(FilterGuard.Prepare(filter, policy, vault, Payments.Services).Error);
+
+        // In any case of its letters, as the engine's equality takes it; and nothing else is caught by it.
+        Assert.False(policy.TokenMayMeet("IsVip", "TRUE",  isNumber: false));
+        Assert.False(policy.TokenMayMeet("IsVip", "False", isNumber: false));
+        Assert.True(policy.TokenMayMeet("IsVip", "falsehood", isNumber: false));
+        Assert.True(policy.TokenMayMeet("IsVip", "1", isNumber: true));
+    }
+
+    /// <summary>
     /// The path the guard judges is the path the answer judges: every name in its place, an
     /// empty one too. <c>[''].Pin</c> was <c>Pin</c> to the guard and <c>.Pin</c> to the answer,
     /// and under a rule on <c>*.Pin</c> a filter and a table read what the answer hid (the
@@ -760,10 +857,15 @@ public sealed class McpFilterGuardTests
         // detectors work on answers, and a filter may read a field no rule names — and the
         // others are: nothing is kept, shown in a table or found by a token past what the
         // answer shows, and there the answer shows less than it does of the other two.
+        //
+        // And a false, which is no secret and is here for its type: the engine makes a table's
+        // key of a true or a false as it does of a text, and what a rule does to the one it has
+        // to do to the other (the sixth review's round: a keepLast4 cut the key and hashed the value).
         (object Value, string Shown, string Cut, bool Known)[] secrets =
         [
-            ("ZQ-77-KWXY", "ZQ-77-KWXY", "KWXY", false), (7391562, "7391562", "****1562", false),
+            ("ZQ-77-KWXY", "ZQ-77-KWXY", "KWXY", false), (73915628, "73915628", "****5628", false),
             ("4111111111111111", "4111111111111111", "****1111", true), (4111111111111111L, "4111111111111111", "****1111", true),
+            (false, "false", "alse", false),
         ];
 
         static Dictionary<string, object?> Map(string key, object? value) => new() { [key] = value };
@@ -788,6 +890,9 @@ public sealed class McpFilterGuardTests
             Map("", new List<object?> { Map("X", secret) }),
             Map("", Map("", Map("X", secret))),                                                 // no name twice over
             Map("..X", secret),
+            Map("L", new List<object?> { secret }),                                             // a list of the values themselves
+            Map("L", new List<object?> { new List<object?> { "x", secret } }),                  // and a list of such lists
+            Map("L", Map("0", secret)),                                                         // a map whose key reads as a position
         ];
         string[] spellings =
         [
@@ -796,6 +901,7 @@ public sealed class McpFilterGuardTests
             "A.B.C", "A['B.C']", "['A.B.C']", "['A.B'].C", "A.B['C']",
             "A[0].B.1.C", "A.0.B.1.C", "A.0.B['1'].C", "A['0'].B[1].C",
             "[''].X", "['']['X']", "[''][0].X", "['.X']", "[''][''].X", "['..X']",
+            "L[0]", "L.0", "L['0']", "L[0][1]", "L.0.1", "L[0]['1']",
         ];
         McpMaskRule[][] ruleSets =
         [
@@ -831,6 +937,10 @@ public sealed class McpFilterGuardTests
             [Rule("*.X", MaskAction.Keep)],
             [Rule(".X", MaskAction.Hash, b)],
             [Rule("*", MaskAction.Keep, a), Rule("*.*", MaskAction.Remove, b)],
+            [Rule("L", MaskAction.KeepLast4)],                                                  // a list's elements are the list's path
+            [Rule("L", MaskAction.KeepLast4, a)],
+            [Rule("L", MaskAction.Keep, a), Rule("L", MaskAction.KeepLast4, b)],
+            [Rule("L", MaskAction.Remove, b)],
         ];
         McpProfile[] profiles =
         [

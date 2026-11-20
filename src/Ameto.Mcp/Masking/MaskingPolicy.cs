@@ -475,6 +475,12 @@ public sealed class MaskingPolicy
     /// </summary>
     public bool TokenMayMeet(string path, string text, bool isNumber, IReadOnlyList<string>? services = null)
     {
+        // A true or a false stands against nothing. Strict mode lets booleans pass, so a field
+        // it alone hides shows them as they are; and an equality with the text of one finds
+        // them. Its token — a table gives one, for `group by` a field Strict mode hides — would
+        // read its value off the first such field. There are two of them: nothing is lost.
+        if (!isNumber && IsBooleanText(text)) return false;
+
         Verdict field = Judge(path, services);
         return field.HiddenWholeEverywhere || (!field.ShownSomewhere && DetectorsHide(text, isNumber));
     }
@@ -503,7 +509,8 @@ public sealed class MaskingPolicy
     /// a text with a number as numbers, and a number is hidden only when its digits are a card
     /// number or an IIN — <c>"+77015550123"</c> equals 77015550123, shown as it is, and
     /// <c>"050312501234"</c> equals 50312501234. Past 2^53 a double holds no whole number
-    /// exactly, and the equality would take its neighbours too.</item>
+    /// exactly: a property stored as one equals every literal that rounds to it, and the digits
+    /// it is shown by are not the value's own.</item>
     /// </list>
     /// </summary>
     private bool DetectorsHide(string text, bool isNumber)
@@ -518,11 +525,24 @@ public sealed class MaskingPolicy
         // find whole in capitals and in small letters they find whole in any mix of the two.
         if (!FoundWhole(text) || !FoundWhole(text.ToUpperInvariant()) || !FoundWhole(text.ToLowerInvariant())) return false;
 
-        // As the engine reads a text as a number (FilterEvaluator.ToDouble).
+        // As the engine reads a text as a number: NumberStyles.Any in the invariant culture. It
+        // was one reading, through a double (FilterEvaluator.ToDouble); the comparison that
+        // became exact reads a whole number by Int128.TryParse and anything else by
+        // double.TryParse, with the same styles (IndexValueForms.TryReadInteger and
+        // TryReadDouble). The first reads no text the second does not, and as the same number up
+        // to 2^53, so this one parse answers for both: a text that is no number to it equals no
+        // number in a field.
         if (!double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out double asNumber)) return true;
         return asNumber == Math.Floor(asNumber) && Math.Abs(asNumber) <= ExactIntegers
             && SensitiveValueDetectors.IsSensitiveNumber((long)asNumber, _detectors, out _);
     }
+
+    /// <summary>
+    /// The text of a boolean as the engine's equality takes it: <c>true</c> or <c>false</c>, in
+    /// any case of their letters — a stored true equals <c>'TRUE'</c>.
+    /// </summary>
+    private static bool IsBooleanText(string text) =>
+        text.Equals("true", StringComparison.OrdinalIgnoreCase) || text.Equals("false", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Whether the detectors find the text as one value, from its first character to its last.</summary>
     private bool FoundWhole(string text)
@@ -833,7 +853,14 @@ public sealed class MaskingPolicy
         {
             case Decision.Remove:    r.Skip(); c.Stats.Add(MaskReason.Rule, path, rule); return null;
             case Decision.Hash:      return Hashed(ref r, path, in c, MaskReason.Rule, rule);
-            case Decision.KeepLast4: return Cut(ref r, path, in c, rule);
+            case Decision.KeepLast4:
+            {
+                if (r.NextMessagePackType != MessagePackType.Array) return Cut(ref r, path, in c, rule);
+                var cut = new ArrayBufferWriter<byte>(256);
+                using (var w = new Utf8JsonWriter(cut, JsonOptions))
+                    WriteCut(w, ref r, path, in c, rule, depth: 1);
+                return Encoding.UTF8.GetString(cut.WrittenSpan);
+            }
         }
 
         // Not hidden by a rule: kept, let through from above, or named by none.
@@ -896,7 +923,7 @@ public sealed class MaskingPolicy
                     w.WritePropertyName(Name(key, c.Stats));
                     if (r.TryReadNil())            w.WriteNullValue();
                     else if (d == Decision.Hash)   w.WriteStringValue(Hashed(ref r, child, in c, MaskReason.Rule, rule));
-                    else if (d == Decision.KeepLast4) w.WriteStringValue(Cut(ref r, child, in c, rule));
+                    else if (d == Decision.KeepLast4) WriteCut(w, ref r, child, in c, rule, depth + 1);
                     else WriteJson(w, ref r, child, d, in c, depth + 1);
                 }
                 w.WriteEndObject();
@@ -1014,7 +1041,38 @@ public sealed class MaskingPolicy
         }
     }
 
-    /// <summary>The last four characters of a scalar; anything else is hashed.</summary>
+    /// <summary>
+    /// What a <c>keepLast4</c> on a value's own path sends of it, as JSON: of a list, each of its
+    /// elements cut — the rules name those by the list's path, and so does a table, whose
+    /// <c>group by Cards[0]</c> is judged by <c>Cards</c> and cut to its last four
+    /// (<see cref="MaskGroupKey"/>). While the list was hashed whole here, that table showed four
+    /// characters of every element a search showed none of (the sixth review).
+    /// </summary>
+    private void WriteCut(Utf8JsonWriter w, ref MessagePackReader r, string path, in Ctx c, string? ruleId, int depth)
+    {
+        switch (r.NextMessagePackType)
+        {
+            case MessagePackType.Array when depth <= MaxDepth:
+            {
+                int count = r.ReadArrayHeader();
+                w.WriteStartArray();
+                for (int i = 0; i < count; i++) WriteCut(w, ref r, path, in c, ruleId, depth + 1);
+                w.WriteEndArray();
+                break;
+            }
+
+            case MessagePackType.Nil: r.ReadNil(); w.WriteNullValue(); break;
+            default:                  w.WriteStringValue(Cut(ref r, path, in c, ruleId)); break;
+        }
+    }
+
+    /// <summary>
+    /// A scalar cut as it is written (<see cref="LastFour"/>) — a text, a number, a true or a
+    /// false: whatever the engine makes a table's key of, by the same text and the same cut, so
+    /// that the key and this agree by construction. A true and a false are shorter than anything
+    /// four characters are shown of, and go out as the mark alone, here and there. Anything else
+    /// — a map, bytes, a list too deep to walk — has no last four characters and is hashed whole.
+    /// </summary>
     private string Cut(ref MessagePackReader r, string path, in Ctx c, string? ruleId)
     {
         switch (r.NextMessagePackType)
@@ -1026,13 +1084,29 @@ public sealed class MaskingPolicy
             case MessagePackType.Float:
                 c.Stats.Add(MaskReason.Rule, path, ruleId);
                 return LastFour(ReadNumber(ref r, out _));
+            case MessagePackType.Boolean:
+                c.Stats.Add(MaskReason.Rule, path, ruleId);
+                return LastFour(r.ReadBoolean() ? "true" : "false");
             default:
                 return Hashed(ref r, path, in c, MaskReason.Rule, ruleId);
         }
     }
 
+    /// <summary>
+    /// The shortest value a <c>keepLast4</c> shows four characters of. Of a shorter one they are
+    /// the value or most of it — <c>false</c> was <c>****alse</c>, a one-time code
+    /// <c>123456</c> was <c>****3456</c> — and it goes out as the mark alone. A card number, a
+    /// phone number, an IIN, an IBAN are all longer.
+    /// </summary>
+    internal const int ShortestCut = 8;
+
+    /// <summary>
+    /// What a <c>keepLast4</c> leaves of a value as it is written: the mark and its last four
+    /// characters, or the mark alone of a value too short for four characters to be a part of
+    /// it. The one cut there is: the answer's and a table's key's (<see cref="MaskGroupKey"/>).
+    /// </summary>
     private static string LastFour(string value) =>
-        value.Length <= 4 ? "****" : string.Concat("****", value.AsSpan(value.Length - 4));
+        value.Length < ShortestCut ? "****" : string.Concat("****", value.AsSpan(value.Length - 4));
 
     /// <summary>
     /// A property's name as it is sent. A name is a name nearly always — but a dictionary keyed

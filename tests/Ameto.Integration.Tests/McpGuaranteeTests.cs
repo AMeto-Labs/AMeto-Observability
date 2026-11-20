@@ -1030,6 +1030,47 @@ public sealed class McpGuaranteeTests(McpEndpointTests.Host host) : IClassFixtur
         }
     }
 
+    /// <summary>
+    /// A <c>keepLast4</c> on a list shows the same of its elements in a search and in a table.
+    /// While a search hashed the list whole, <c>group by SavedCards[0]</c> — judged by the
+    /// list's path, as its elements are — showed the last four characters of every card in it
+    /// (the sixth review).
+    /// </summary>
+    [Fact]
+    public async Task AKeepLast4OnAList_ShowsTheSameOfItsElementsInASearchAndInATable()
+    {
+        var admin = await host.AdminAsync();
+        await Rule(admin, new { field = "SavedCards", action = "keepLast4" });
+        string service = McpTesting.NewService();
+        await McpTesting.IngestAsync(admin, new McpTesting.Event(service, "Cards of {Customer}")
+        {
+            Properties =
+            {
+                ["Customer"]   = "cust-QW",
+                ["SavedCards"] = new List<object?> { "4111111111111111", "5500000000000004" },
+            },
+        });
+        var (_, key) = await McpTesting.CreateProfileAsync(admin, new { name = "a list under keepLast4", services = new[] { service } });
+        await using var client = await McpTesting.ConnectAsync(host, key);
+
+        var (search, _) = await Call(client, "logs_search");
+        Assert.Contains("1 event", search);
+        Assert.DoesNotContain("4111111111111111", search);
+        Assert.DoesNotContain("5500000000000004", search);
+        Assert.Contains("****1111", search);
+        Assert.Contains("****0004", search);
+
+        foreach (var (element, cut) in ((string, string)[])[("SavedCards[0]", "****1111"), ("SavedCards[1]", "****0004")])
+        {
+            var (table, error) = await Call(client, "logs_aggregate", ("query", $"select count(*) group by {element}"));
+            Assert.False(error, table);
+            Assert.Contains(cut, table);
+            Assert.Contains(cut, search);                // no more than the search shows
+            Assert.DoesNotContain("411111", table);
+            Assert.DoesNotContain("550000", table);
+        }
+    }
+
     [Fact]
     public async Task ThePreview_SaysWhichStoredPropertyEachSentOneIs()
     {

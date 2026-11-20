@@ -28,7 +28,11 @@ public enum MaskAction
     Hash = 0,
     /// <summary>Leave the property out of the answer.</summary>
     Remove = 1,
-    /// <summary>Show the last four characters, hide the rest.</summary>
+    /// <summary>
+    /// Show the last four characters of the value as it is written — a text or a number of eight
+    /// characters or more — and hide the rest; a shorter value, a true or a false among them, is
+    /// hidden whole. Of a list, of each of its elements; an object is hidden whole.
+    /// </summary>
     KeepLast4 = 2,
     /// <summary>
     /// Send the value at the rule's own path as stored — the detectors leave it alone. What is
