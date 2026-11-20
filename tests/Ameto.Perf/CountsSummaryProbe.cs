@@ -92,26 +92,34 @@ public sealed class CountsSummaryProbe
     }
 
     /// <summary>
-    /// What the comparison above stands on: a store this probe reopens is counted only once its
-    /// catalog is whole.
+    /// What the comparison above stands on: a store this probe reopens is handed over, and so
+    /// counted, only once its catalog is whole.
     ///
     /// <para>The engine reads its segments directory in the background and serves whatever that
-    /// scan has registered so far (<see cref="StorageEngine.CatalogLoaded"/>), so two counts taken
-    /// straight off the constructor are counts of two different catalogs. That is how this probe
-    /// came to report the scan at 45 000 and the summaries at 180 000 over the same 24 files: in
-    /// the run that was measured, the first count began a millisecond after the constructor
-    /// returned, with 3 of the files registered, and the scan ended 20 ms later. Which side won
-    /// was the machine's to decide — the scan on the CI runners, so far; the count on a
-    /// developer's machine, in every run.</para>
+    /// boot scan has registered so far (<see cref="StorageEngine.CatalogLoaded"/>), so two counts
+    /// taken straight off the constructor are counts of two different catalogs. That is how this
+    /// probe came to report the block scan at 45 000 and the summaries at 180 000 over the same
+    /// 24 files: in the run that was measured, the first count began a millisecond after the
+    /// constructor returned, with 3 of the files registered, and the boot scan ended 20 ms later.
+    /// Which of the two came first was the machine's to decide: the boot scan on the CI runners,
+    /// in every run so far; the count on a developer's machine, in every run on one day and in
+    /// three of ten on the next.</para>
     ///
-    /// <para>Here the scan is held back for far longer than a constructor takes, so the count
-    /// loses that race on every run unless <see cref="Open"/> waits it out: without the wait the
-    /// reopened store answers from an empty catalog, and this fails with 0 where 8 segments and
-    /// 60 000 events are expected. (A machine that stalls for the whole half second between the
-    /// constructor and the count would let the missing wait pass; it cannot make the wait fail.)</para>
+    /// <para>Here the boot scan is held back for half a second, far longer than a reopening
+    /// takes, so <see cref="Open"/> returns before the scan has begun on every run unless it
+    /// waits the scan out. Without the wait this fails on every run: the store is still
+    /// <see cref="QueryAvailability.Loading"/> where <see cref="Open"/> checks it, and its catalog
+    /// holds none of the 8 segments. (The half second runs from the hold being made, before the
+    /// engine is constructed: a reopening that took all of it would let a missing wait pass. No
+    /// timing fails this with the wait in place.)</para>
+    ///
+    /// <para>It reads the catalog and takes no count, on purpose. xUnit may run this fact first,
+    /// and the timings above are of a process as cold as the month-wide fact finds it: a block
+    /// scan taken here had that fact print its own scan at 28 ms where it prints 17, and a
+    /// summaries count taken here, at 20.</para>
     /// </summary>
     [Fact]
-    public void A_reopened_store_is_counted_only_once_its_catalog_is_whole()
+    public void A_reopened_store_is_handed_over_only_once_its_catalog_is_whole()
     {
         const int events = 60_000;   // two flushes: a segment per level from each
         string dir = Path.Combine(Path.GetTempPath(), "ameto-countsprobe-" + Guid.NewGuid().ToString("N"));
@@ -120,17 +128,10 @@ public sealed class CountsSummaryProbe
             using (var e = Open(dir)) { Fill(e, events); }
             int onDisk = Directory.GetFiles(Path.Combine(dir, "segments"), "*.seg").Length;
 
-            var from = Base.AddHours(-12);
-            var to   = Base.AddDays(Days).AddHours(12);
-            const int bucket = 43_200;
-
             using var reopened = Open(dir, bootScanHeldUntil: Task.Delay(TimeSpan.FromMilliseconds(500)));
-            Assert.Equal(onDisk, reopened.Engine.ListSegments().Count);
-
-            var scanned       = Count(reopened.Engine, from, to, bucket, summaries: false);
-            var fromSummaries = Count(reopened.Engine, from, to, bucket, summaries: true);
-            Assert.Equal(events, scanned.Total);
-            AssertSame(scanned, fromSummaries);
+            var catalog = reopened.Engine.ListSegments();
+            Assert.Equal(onDisk, catalog.Count);
+            Assert.Equal(events, catalog.Sum(s => (long)s.EventCount));
         }
         finally
         {
@@ -246,9 +247,14 @@ public sealed class CountsSummaryProbe
     /// <summary>
     /// A store over <paramref name="dir"/>, handed over once its boot scan has ended. Until then
     /// the catalog holds the segments the scan has reached so far, and every read is of those:
-    /// see <see cref="A_reopened_store_is_counted_only_once_its_catalog_is_whole"/>, which is
+    /// see <see cref="A_reopened_store_is_handed_over_only_once_its_catalog_is_whole"/>, which is
     /// what <paramref name="bootScanHeldUntil"/> is for — the scan starts only when it completes.
     /// The engine is otherwise the public constructor's.
+    ///
+    /// <para>A scan can also end short: a file it could not open for a reason that is not the
+    /// file's bytes stays out of the catalog and leaves the store
+    /// <see cref="QueryAvailability.Degraded"/>. That fails here, under its own name, where a
+    /// count taken of such a store would fail later as two roads that disagree.</para>
     /// </summary>
     private static Store Open(string dir, Task? bootScanHeldUntil = null)
     {
@@ -261,8 +267,12 @@ public sealed class CountsSummaryProbe
             MemoryBudgets.Current(), bootScanHeldUntil: bootScanHeldUntil);
         engine.IndexSinkFactory = static (c, t) => new SegmentIndexBuilder(c, 5, t);
         var store = new Store(engine);
-        try { engine.CatalogLoaded.GetAwaiter().GetResult(); }
-        catch { store.Dispose(); throw; }   // a scan that faulted: the store is not handed over, so it is closed here
+        try
+        {
+            engine.CatalogLoaded.GetAwaiter().GetResult();
+            Assert.Equal(QueryAvailability.Available, engine.Availability);
+        }
+        catch { store.Dispose(); throw; }   // a scan that faulted or ended short: the store is not handed over, so it is closed here
         return store;
     }
 
