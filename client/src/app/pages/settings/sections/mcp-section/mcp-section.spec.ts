@@ -1163,6 +1163,19 @@ describe('Settings → AI / MCP', () => {
     const drawnTitle = getComputedStyle(dialog.querySelector('.modal__title')!);
     expect([drawnTitle.whiteSpace, drawnTitle.textOverflow]).not.toContain('nowrap');
     expect([drawnTitle.whiteSpace, drawnTitle.textOverflow]).not.toContain('ellipsis');
+    // …nor run past the dialog's edge where it has no place to break: it is broken anywhere.
+    expect([drawnTitle.overflowWrap, parseFloat(drawnTitle.minWidth)]).toEqual(['anywhere', 0]);
+    // In a window too low for the dialog it is the title that gives way, not the body; and
+    // where the body scrolls all the same, Done's row stays in sight at its foot.
+    const drawnHeader = getComputedStyle(dialog.querySelector('.modal__header')!);
+    expect([drawnHeader.flexShrink, drawnHeader.overflowY]).toEqual(['1000', 'auto']);
+    expect(getComputedStyle(row).position).toBe('sticky');
+    // Where the edge is, and how much room there is above it, are sums a test page does not
+    // work out: that the two rules are there is all that is said of them here. The heights
+    // themselves are measured in a browser.
+    const rules = Array.from(document.querySelectorAll('style'), s => s.textContent ?? '').join('\n');
+    expect(rules).toMatch(/\.m-key-dialog \.modal-backdrop[^}]*padding-bottom:[^;}]*50dvh - 108px/);
+    expect(rules).toMatch(/\.m-key-dialog \.modal\b[^_}]*\{[^}]*max-height:[^;}]*100dvh[^;}]*50dvh - 108px/);
     expect(getComputedStyle(row).minHeight).toBe('32px');
     const behind = row.querySelector<HTMLElement>('.m-key-behind')!;
     expect([getComputedStyle(behind).maxHeight, getComputedStyle(behind).overflow]).toEqual(['32px', 'hidden']);

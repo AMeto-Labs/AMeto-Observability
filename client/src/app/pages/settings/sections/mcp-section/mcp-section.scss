@@ -55,9 +55,29 @@ app-modal { display: contents; }
   padding-bottom: max(var(--page-pad), calc(50dvh - 108px));
 }
 
-/* No taller than the room above that edge; past it the dialog's body scrolls, as any dialog's. */
+/* No taller than the room above that edge. */
 :host ::ng-deep .m-key-dialog .modal {
   max-height: calc(100dvh - var(--page-pad) - max(var(--page-pad), calc(50dvh - 108px)));
+}
+
+/* A name with no place to break in it — svc_payments_…_production — is broken anywhere, rather
+   than run past the dialog's edge: there it was cut without a mark, and the end of a name is
+   where two profiles differ. */
+:host ::ng-deep .m-key-dialog .modal__title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* In a window too low for the dialog — a small one, or a large one zoomed far in — it is the
+   title that gives way, and not the body: it keeps one line in sight and scrolls to the rest.
+   Left to the body, a title of four lines pushed Done down by its three extra ones and out of
+   sight — for the keys of a profile with a long name and for no others, which is a Done that
+   moves between two keys. */
+:host ::ng-deep .m-key-dialog .modal__header {
+  flex-shrink: 1000;
+  align-items: flex-start;
+  min-height: calc(var(--fs-lg) * var(--lh-tight) + 2 * var(--gap) + 1px);
+  overflow-y: auto;
 }
 
 /* Done's row is two lines of what is said beside it, with that or without: on a narrow screen
@@ -65,6 +85,14 @@ app-modal { display: contents; }
 .m-key-dialog .m-actions {
   align-items: center;
   min-height: 32px;
+
+  /* Where the window is lower still and the body has to scroll, Done's row stays in sight at
+     its foot, at the height it has when nothing scrolls, and what scrolls passes under it. */
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  background: var(--bg-secondary);
+  box-shadow: 0 var(--section-pad) 0 var(--bg-secondary);
 }
 
 /* What is said of the keys still waiting, at the start of Done's row. It takes the room Done
