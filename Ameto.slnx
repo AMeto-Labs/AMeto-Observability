@@ -4,6 +4,7 @@
     <Project Path="src/Ameto.Core/Ameto.Core.csproj" />
     <Project Path="src/Ameto.Indexing/Ameto.Indexing.csproj" />
     <Project Path="src/Ameto.Ingestion/Ameto.Ingestion.csproj" />
+    <Project Path="src/Ameto.Mcp/Ameto.Mcp.csproj" />
     <Project Path="src/Ameto.Metrics/Ameto.Metrics.csproj" />
     <Project Path="src/Ameto.Otel/Ameto.Otel.csproj" />
     <Project Path="src/Ameto.Query/Ameto.Query.csproj" />

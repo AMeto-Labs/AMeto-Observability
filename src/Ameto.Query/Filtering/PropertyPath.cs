@@ -35,6 +35,26 @@ public static class PropertyPath
         IsIndexSegment(segment) ? segment[1..] : segment;
 
     /// <summary>
+    /// Reads a segment as a position in a list — THE definition of which segments are one.
+    /// The evaluator asks it of every segment that meets a list (<c>Foo.0</c> and
+    /// <c>Foo['0']</c> reach the first element, as <c>Foo[0]</c> does), and anything that has
+    /// to know which paths can reach a list's elements asks the same question here, so the two
+    /// cannot come to disagree about a spelling.
+    ///
+    /// <para>They did once: this accepts whatever <see cref="int.TryParse(ReadOnlySpan{char}, System.Globalization.NumberStyles, IFormatProvider?, out int)"/>
+    /// accepts as an integer — white space on either side, a leading sign, a trailing NUL —
+    /// while a reader that took "a position is a run of digits" for the rule judged
+    /// <c>Items[' 0'].Sku</c> as a path through a property called <c>" 0"</c>, and let it past
+    /// a rule on <c>Items.Sku</c>.</para>
+    ///
+    /// <para>Allocation-free: the evaluator calls it per event.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    public static bool TryReadPosition(ReadOnlySpan<char> segmentValue, out int position) =>
+        int.TryParse(segmentValue, System.Globalization.NumberStyles.Integer,
+                     System.Globalization.CultureInfo.InvariantCulture, out position);
+
+    /// <summary>
     /// True when the encoded path could ALSO name a single flat property key spelled with
     /// literal dots — i.e. it is nested and carries no array subscript.
     ///

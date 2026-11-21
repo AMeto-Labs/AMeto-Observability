@@ -1,0 +1,24 @@
+.side { width: 400px; }
+
+/* The last column holds the status and, beside it, the ×N of a refusal recorded for many. */
+.cols { grid-template-columns: 62px 124px minmax(0, 1fr) 52px 56px 52px 52px 104px; }
+
+.facts {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 4px 10px;
+  font-size: var(--fs-dense);
+  overflow-wrap: anywhere;
+}
+
+.masked {
+  grid-template-columns: minmax(0, 1fr) 90px 40px;
+  min-height: 26px;
+}
+
+.refusal {
+  color: var(--text-secondary);
+  font-family: var(--font-ui);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-body);
+}
