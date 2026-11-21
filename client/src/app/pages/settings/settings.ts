@@ -21,6 +21,7 @@ import { RetentionSectionComponent } from './sections/retention-section/retentio
 import { UsersSectionComponent } from './sections/users-section/users-section';
 import { ApiKeysSectionComponent } from './sections/api-keys-section/api-keys-section';
 import { UpdatesSectionComponent } from './sections/updates-section/updates-section';
+import { McpSectionComponent } from './sections/mcp-section/mcp-section';
 
 @Component({
   selector: 'app-settings',
@@ -33,6 +34,7 @@ import { UpdatesSectionComponent } from './sections/updates-section/updates-sect
     UsersSectionComponent,
     ApiKeysSectionComponent,
     UpdatesSectionComponent,
+    McpSectionComponent,   // used inside @defer only, so it ships as a chunk of its own
   ],
   providers: [SettingsDirtyService],
   templateUrl: './settings.html',

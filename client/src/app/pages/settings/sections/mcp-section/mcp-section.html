@@ -1,0 +1,108 @@
+<nav class="m-tabs" aria-label="AI / MCP sections">
+  @for (tab of tabs; track tab.id) {
+    <button
+      type="button"
+      class="m-tab"
+      [class.active]="activeTab() === tab.id"
+      [attr.aria-current]="activeTab() === tab.id ? 'page' : null"
+      (click)="select(tab.id)"
+    >{{ tab.label }}</button>
+  }
+</nav>
+
+@if (store.loadError(); as error) {
+  <div class="m-load-error" role="alert">
+    <span>{{ error }}</span>
+    <button type="button" class="btn" (click)="store.load()">Try again</button>
+  </div>
+} @else if (!store.loaded()) {
+  <span class="loading-text">Loading…</span>
+} @else {
+  @if (store.stale()) {
+    <!-- A change went through, and the read that follows every change did not. The change is
+         shown; what else moved on the server meanwhile (a rotated key's preview, another
+         administrator's edit) may not be. -->
+    <div class="m-stale" role="status">
+      <span>The change was saved, but the profiles and tools could not be read again after it: what is shown may be behind the server.</span>
+      <button type="button" class="btn" (click)="store.refreshLists()">Read again</button>
+    </div>
+  }
+  <!-- A tab is created the first time it is opened and kept from then on, so what was typed
+       into one survives a look at another. -->
+  @if (visited().has('connection')) {
+    <app-mcp-connection-tab class="m-tabpanel" [hidden]="activeTab() !== 'connection'" (createProfile)="newProfile()" />
+  }
+  @if (visited().has('profiles')) {
+    <app-mcp-profiles-tab class="m-tabpanel" [hidden]="activeTab() !== 'profiles'" [createRequest]="createRequest()" />
+  }
+  @if (visited().has('masking')) {
+    <app-mcp-masking-tab class="m-tabpanel" [hidden]="activeTab() !== 'masking'" />
+  }
+  @if (visited().has('tools')) {
+    <app-mcp-tools-tab class="m-tabpanel" [hidden]="activeTab() !== 'tools' || editing() !== null" (edit)="openTool($event)" />
+  }
+  @if (editing(); as toolId) {
+    <app-mcp-tool-editor class="m-tabpanel" [toolId]="toolId" (closed)="closeEditor()" (saved)="openTool($event, true)" />
+  }
+  @if (visited().has('activity')) {
+    <app-mcp-activity-tab class="m-tabpanel" [hidden]="activeTab() !== 'activity'" [active]="activeTab() === 'activity'" />
+  }
+}
+
+<!-- The key, once: after a profile is created or its key rotated, whichever tab is open by the
+     time it arrives. Keys are shown one at a time, in the order they arrived, and none takes the
+     place of another; each names its profile, for the card on the Profiles tab may be another
+     one's by then. Last in the section, so that it is drawn over any question a tab has open —
+     the rotation still on its way, say: every dialog stands at the same height, and of two the
+     later one in the page is on top.
+
+     Done stands at one place for every key (m-key-dialog): the dialog's lower edge is held
+     rather than its middle, and Done's row is the last thing in it, of one height. Centred, a
+     difference in height between two keys moved Done by half of it — a long profile name on two
+     lines of the title did — and the second click of a double click missed Done again. The name
+     is shown whole: it is how one key is told from the next. Where a window is too low for the
+     whole of it, the title is cut at a line and scrolls, and the whole name is its tooltip. -->
+<app-modal class="m-key-dialog" [open]="revealed() !== null" [title]="keyTitle()" titleTooltip [dismissable]="false">
+  <!-- `shown` is the key as drawn: Done names it, not whatever the store holds first by the
+       time a click is handled. The block is kept when the next key takes its place, and so is
+       the focus on Done. -->
+  @if (revealed(); as shown) {
+    <!-- What scrolls first where the window is too low for the dialog: the key and what is said
+         of it. The profile's name above keeps its lines for as long as this has anything to
+         give, and Done's row below is outside what scrolls — neither scrolled out of sight nor
+         pushed sideways by a scroll bar. -->
+    <div class="m-key-scroll">
+      <div class="m-key-reveal">
+        <lucide-icon name="key" [size]="14" />
+        <span class="m-key-text">{{ shown.key }}</span>
+        <button type="button" class="btn-icon" title="Copy" (click)="copyKey(shown)">
+          <lucide-icon [name]="copied() === shown.key ? 'check' : 'copy'" [size]="13" />
+        </button>
+      </div>
+      <span class="m-sub">Copy this key now — it won't be shown again. Only its hash is stored. Give it to the client as the bearer token of the MCP endpoint.</span>
+    </div>
+    <div class="m-actions">
+      <!-- What is said of the keys still waiting stands beside Done, in Done's own row, so that
+           nothing moves under the pointer when it goes. On a line of its own above Done it took
+           that line away with the last key but one: Done rose, and the second click of a double
+           click fell on the dialog's bare body — and took the focus out of the dialog. -->
+      @if (keysBehind(); as behind) {
+        <span class="m-sub m-strong m-key-behind" [attr.title]="behind">{{ behind }}</span>
+      }
+      <!-- Held for a moment after a key was taken down (DONE_PAUSE_MS). aria-disabled rather
+           than disabled: a disabled button gives up the focus, which would drop out of the
+           dialog to the page, and Enter on Done would no longer reach the dialog once the
+           moment has passed. -->
+      <button type="button" class="btn primary" [attr.aria-disabled]="doneHeld() || null"
+              (keydown)="holdRepeat($event)" (click)="done(shown, $event)">Done</button>
+    </div>
+  }
+</app-modal>
+
+<!-- For the moment after the last key was taken down. The dialog is gone by then, and the second
+     click of a double click on its Done would land on whatever stood behind it: a question a
+     tab still has open, or a switch that saves on a click. This takes that click, for as long
+     as Done would have been held; a key that arrives meanwhile is shown as any other. -->
+@if (doneHeld() && revealed() === null) {
+  <div class="m-key-shield" aria-hidden="true"></div>
+}

@@ -70,6 +70,13 @@
   overflow-y: auto;
 }
 
+/* A section whose code could not be fetched: a sentence where the section would be. No display
+   of its own — it is hidden with its tab, by the [hidden] attribute. */
+.section-load-error {
+  color: var(--error);
+  font-size: var(--fs-sm);
+}
+
 /* ── Phone: one column, the rail a strip of tabs above the content ── */
 @include bp.below(bp.$bp-sm) {
   .settings-body { flex-direction: column; }

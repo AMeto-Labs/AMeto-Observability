@@ -1,4 +1,4 @@
-export type SettingsTabId = 'dashboards' | 'events' | 'retention' | 'users' | 'api-keys' | 'updates';
+export type SettingsTabId = 'dashboards' | 'events' | 'retention' | 'users' | 'api-keys' | 'ai-mcp' | 'updates';
 
 export interface SettingsTab {
   id: SettingsTabId;
@@ -17,5 +17,8 @@ export const SETTINGS_TABS: readonly SettingsTab[] = [
   { id: 'retention',  label: 'Retention',  icon: 'database', adminOnly: true },
   { id: 'users',      label: 'Users',      icon: 'users', adminOnly: true },
   { id: 'api-keys',   label: 'API Keys',   icon: 'key' },
+  // Admin-only: every change here widens or narrows what leaves the server for an AI
+  // assistant, and the preview on its Masking tab shows an event as stored.
+  { id: 'ai-mcp',     label: 'AI / MCP',   icon: 'bot', adminOnly: true },
   { id: 'updates',    label: 'Updates',    icon: 'download', adminOnly: true },
 ];

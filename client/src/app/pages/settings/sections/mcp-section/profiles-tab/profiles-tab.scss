@@ -1,0 +1,40 @@
+.side { width: 440px; }
+
+.cols { grid-template-columns: minmax(0, 1fr) 84px 156px 76px 76px; }
+
+.tall { min-height: 46px; }
+
+/* The card is a section without the section component's header: its caption carries the
+   profile's name and sits in a row with the line that says who created it. */
+.card { min-width: 0; }
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px 12px;
+  padding-top: 2px;
+}
+
+.blocked .m-cd { color: var(--text-muted); }
+
+/* The input a service is typed into and its button: one item of the row, so they wrap together. */
+.adder {
+  display: inline-flex;
+  flex: 1 1 190px;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.service-input {
+  flex: 1;
+  min-width: 0;
+  height: var(--ctl-h-sm);
+  font-size: var(--fs-xs);
+}
+
+.limits {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--gap);
+}

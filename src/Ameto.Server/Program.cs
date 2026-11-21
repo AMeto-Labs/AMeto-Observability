@@ -3,6 +3,7 @@ using Ameto.Replication;
 using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Ingestion;
+using Ameto.Mcp;
 using Ameto.Metrics;
 using Ameto.Otel;
 using Ameto.Query;
@@ -168,6 +169,8 @@ builder.Services.AddHostedService(static sp => sp.GetRequiredService<UpdateCheck
 bool enableTracing = builder.Configuration.GetValue("Ameto:Tracing:Enabled", true);
 bool enableMetrics = builder.Configuration.GetValue("Ameto:Metrics:Enabled", true);
 bool enableAlerts  = builder.Configuration.GetValue("Ameto:Alerts:Enabled",  true);
+// The AI endpoint (/mcp) and its settings API. Off: neither is mapped and the MCP SDK is never set up.
+bool enableMcp     = builder.Configuration.GetValue("Ameto:Mcp:Enabled",     true);
 
 // The alert evaluator consumes IMetricAggregator + ITraceStatsProvider, so it can
 // only run when both subsystems are present. Disable it otherwise to avoid a DI failure.
@@ -236,6 +239,16 @@ if (enableAlerts)
     {
         EvaluateOnDegradedStore = builder.Configuration.GetValue("Ameto:Alerts:EvaluateOnDegradedStore", false),
     });
+}
+
+// ── AI endpoint (Model Context Protocol) ──────────────────────────────────────
+// Read-only log tools for AI assistants, behind profile keys, with the masking rules applied to
+// every answer. Its searches take the same slots and the same time budget as everyone else's
+// (QueryGuard), so an assistant queues with the Logs page rather than beside it.
+if (enableMcp)
+{
+    builder.Services.AddAmetoMcp(serverOptions.DataDirectory);
+    builder.Services.AddSingleton<ISearchGate, QueryGuardSearchGate>();
 }
 
 // ── Kestrel ───────────────────────────────────────────────────────────────────
@@ -408,6 +421,9 @@ async Task EntryDocumentOrNextAsync(HttpContext ctx, RequestDelegate next)
 }
 app.UseStaticFiles();
 
+// /mcp answers 503 while the section is switched off in Settings. Frame-free unless it refuses.
+if (enableMcp) app.UseAmetoMcpSwitch();
+
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 app.MapAuthEndpoints();
 app.MapAuthSessionEndpoints();
@@ -419,6 +435,11 @@ app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
 app.MapUpdateEndpoints();
 app.MapReplicationEndpoints();
+if (enableMcp)
+{
+    app.MapAmetoMcp();
+    app.MapMcpAdminEndpoints();
+}
 app.MapOtlpEndpoints(enableTracing, enableMetrics, basePath.PathBase);
 // Only when a port is configured. Kestrel endpoints do not scope routing — every route on this
 // WebApplication answers on every listener — so mapping these unconditionally put the Export

@@ -8,7 +8,7 @@ import {
   // full lucide `icons` barrel (~2.5 MB source) eagerly was the single biggest
   // contributor to the initial bundle. Add an icon here when you use a new one.
   Activity, AlertCircle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Asterisk, Ban,
-  Bell, BellOff, BellRing, BookOpen, Box, Boxes, Braces, Brackets,
+  Bell, BellOff, BellRing, BookOpen, Bot, Box, Boxes, Braces, Brackets,
   Calendar, CalendarClock, ChartBar, ChartLine, ChartPie, Check, CheckCheck, CheckCircle,
   ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, CircleAlert, Clock, Copy,
   CornerDownLeft, Database, Download, Ellipsis, EllipsisVertical, Equal, ExternalLink, FileQuestion,
@@ -26,7 +26,7 @@ import { routes } from './app.routes';
 
 const APP_ICONS = {
   Activity, AlertCircle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Asterisk, Ban,
-  Bell, BellOff, BellRing, BookOpen, Box, Boxes, Braces, Brackets,
+  Bell, BellOff, BellRing, BookOpen, Bot, Box, Boxes, Braces, Brackets,
   Calendar, CalendarClock, ChartBar, ChartLine, ChartPie, Check, CheckCheck, CheckCircle,
   ChevronDown, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, CircleAlert, Clock, Copy,
   CornerDownLeft, Database, Download, Ellipsis, EllipsisVertical, Equal, ExternalLink, FileQuestion,

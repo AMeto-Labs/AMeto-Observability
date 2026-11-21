@@ -145,7 +145,7 @@ public sealed class AggregationExecutor(
                 acc = new Accumulator(keyBuilder.TakeParts(), aggs.Count);
                 groups.Add(new string(keyBuilder.Composite), acc);
             }
-            acc.Add(ev, aggs);
+            acc.Add(ev, aggs, query.Admits);
         }
         }
         catch (OperationCanceledException) { /* reported as partial below, like every other stop */ }
@@ -481,7 +481,7 @@ public sealed class AggregationExecutor(
             return a;
         }
 
-        public void Add(LogEvent ev, IReadOnlyList<AggregateSpec> aggs)
+        public void Add(LogEvent ev, IReadOnlyList<AggregateSpec> aggs, Func<AggregateSpec, object, bool>? admits)
         {
             for (int i = 0; i < aggs.Count; i++)
             {
@@ -492,6 +492,7 @@ public sealed class AggregationExecutor(
                 if (raw is null) continue;                               // absent: contributes nothing
 
                 if (spec.Kind == AggregateKind.Count) { _counts[i]++; continue; }
+                if (admits is not null && !admits(spec, raw)) continue;   // see AggregationQuery.Admits
                 if (!TryNumber(raw, out double d)) continue;             // sum('abc') is not an error, just no data
 
                 _counts[i]++;

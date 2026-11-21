@@ -11,6 +11,7 @@
     <ProjectReference Include="..\Ameto.Otel\Ameto.Otel.csproj" />
     <ProjectReference Include="..\Ameto.Tracing\Ameto.Tracing.csproj" />
     <ProjectReference Include="..\Ameto.Metrics\Ameto.Metrics.csproj" />
+    <ProjectReference Include="..\Ameto.Mcp\Ameto.Mcp.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />

@@ -1,0 +1,17 @@
+.side { width: 340px; }
+
+.builtin-cols   { grid-template-columns: 28px 124px minmax(0, 1fr) 64px; }
+.published-cols { grid-template-columns: minmax(0, 1fr) 190px 54px 76px 60px 52px; }
+
+.row    { min-height: 32px; }
+.tall   { min-height: 46px; }
+.offered {
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 44px;
+}
+
+.row-actions {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 2px;
+}

@@ -1,0 +1,159 @@
+<div class="m-cols">
+  <div class="m-main">
+    <app-section title="Activity">
+      <div class="m-row between wrap">
+        <span class="m-row tight wrap">
+          <select class="m-select" aria-label="Profile" [ngModel]="profileId()" (ngModelChange)="profileId.set($event)">
+            <option value="">All profiles</option>
+            @for (p of store.profiles(); track p.id) { <option [value]="p.id">{{ p.name }}</option> }
+          </select>
+          <select class="m-select" aria-label="Tool" [ngModel]="tool()" (ngModelChange)="tool.set($event)">
+            <option value="">All tools</option>
+            @for (name of toolNames(); track name) { <option [value]="name">{{ name }}</option> }
+          </select>
+          <select class="m-select" aria-label="Status" [ngModel]="status()" (ngModelChange)="status.set($event)">
+            <option value="">Any status</option>
+            @for (s of statuses; track s) { <option [value]="s">{{ s }}</option> }
+          </select>
+          <select class="m-select" aria-label="Time range" [ngModel]="hours()" (ngModelChange)="hours.set(+$event)">
+            @for (r of ranges; track r.hours) { <option [value]="r.hours">{{ r.label }}</option> }
+          </select>
+          <button type="button" class="btn-icon" title="Read again" aria-label="Read the list again" [disabled]="loading()" (click)="reload()">
+            <lucide-icon [name]="loading() ? 'loader-circle' : 'refresh-cw'" [size]="13" />
+          </button>
+        </span>
+        <button type="button" class="btn m-fixed" (click)="openListInLogs()">
+          <lucide-icon name="external-link" [size]="13" />
+          Open in Logs
+        </button>
+      </div>
+
+      @if (error(); as message) {
+        <span class="m-err" role="alert">{{ message }}</span>
+      }
+
+      <div class="m-table" role="table" aria-label="AI calls">
+        <div class="m-hr cols" role="row">
+          <span role="columnheader">Time</span>
+          <span role="columnheader">Profile</span>
+          <span role="columnheader">Tool</span>
+          <span class="m-num" role="columnheader">Events</span>
+          <span class="m-num" role="columnheader">Masked</span>
+          <span class="m-num" role="columnheader">Tokens</span>
+          <span class="m-num" role="columnheader">ms</span>
+          <span role="columnheader">Status</span>
+        </div>
+        <!-- One stop for the Tab key; the arrows walk the rows, and the row walked to is picked. -->
+        @for (r of rows(); track r.call.id; let i = $index) {
+          <div
+            class="m-tr cols pick"
+            role="row"
+            [attr.tabindex]="r.call.id === selected()?.id ? 0 : -1"
+            [class.sel]="r.call.id === selected()?.id"
+            [attr.aria-selected]="r.call.id === selected()?.id"
+            (click)="pick(r.call.id)"
+            (keydown)="onRowKey($event, i)"
+          >
+            <span class="m-mut" role="cell" [attr.title]="r.day + ' ' + r.time">{{ r.time }}</span>
+            <span class="m-el" role="cell">{{ r.call.profile }}</span>
+            <span class="m-cd m-el" role="cell">{{ r.call.tool }}</span>
+            <span class="m-mut m-num" role="cell">{{ r.events }}</span>
+            <span class="m-mut m-num" role="cell">{{ r.masked }}</span>
+            <span class="m-mut m-num" role="cell">{{ r.tokens }}</span>
+            <span class="m-mut m-num" role="cell">{{ r.ms }}</span>
+            <span class="m-row tight" role="cell">
+              <span class="m-pill" [class]="r.tone">{{ r.call.status }}</span>
+              @if (r.repeats) {
+                <span class="m-hint" [attr.title]="'Refused ' + r.repeats + ' times this minute so far'">×{{ r.repeats }}</span>
+              }
+            </span>
+          </div>
+        } @empty {
+          <!-- A read that failed has said so above; "no calls" under it would be a second, wrong answer. -->
+          @if (!error()) {
+            <div class="m-empty">{{ loading() ? 'Reading the calls…' : 'No calls in this window.' }}</div>
+          }
+        }
+      </div>
+
+      @if (rows().length || !error()) {
+        <div class="m-row between">
+          <span class="m-hint">{{ footer() }}</span>
+          @if (more()) {
+            <button type="button" class="btn" [disabled]="loadingMore() || loading()" (click)="loadMore()">
+              @if (loadingMore()) { <lucide-icon name="loader-circle" [size]="13" /> }
+              Load more
+            </button>
+          }
+        </div>
+      }
+    </app-section>
+  </div>
+
+  @if (detail(); as d) {
+    <div class="m-side side">
+      <section class="section" [attr.aria-label]="d.title">
+        <div class="m-row between">
+          <span class="section-title">{{ d.title }}</span>
+          <span class="m-pill" [class]="d.tone">{{ d.call.status }}</span>
+        </div>
+
+        <div class="facts">
+          <span class="m-dim">Profile</span><span>{{ d.call.profile }}</span>
+          <span class="m-dim">Client</span><span>{{ d.call.client || 'not given' }}</span>
+          <span class="m-dim">Tool</span><span class="m-cd">{{ d.call.tool }}</span>
+          <span class="m-dim">Result</span><span>{{ d.result }}</span>
+        </div>
+
+        @if (d.repeats) {
+          <span class="m-hint">{{ d.repeats }}</span>
+        }
+
+        @if (d.call.refusal; as refusal) {
+          <div class="m-fld">
+            <span class="m-lbl">What the AI was told</span>
+            <div class="m-code refusal">{{ refusal }}</div>
+          </div>
+        }
+
+        <div class="m-fld">
+          <span class="m-lbl">Arguments</span>
+          <pre class="m-code">{{ d.arguments || '{}' }}</pre>
+        </div>
+
+        @if (d.filter.length) {
+          <div class="m-fld">
+            <span class="m-lbl">Filter as written</span>
+            <pre class="m-code">@for (s of d.filter; track $index) {<span [class.m-tok]="s.kind === 'token'">{{ s.text }}</span>}</pre>
+            @if (d.filterHasToken) {
+              <span class="m-hint">The token was resolved to the stored value on the server. The value itself is not recorded.</span>
+            }
+          </div>
+        }
+
+        @if (d.masked.length) {
+          <div class="m-fld">
+            <span class="m-lbl">Masked values · {{ d.call.masked }}</span>
+            <div class="m-table">
+              @for (m of d.masked; track m.by + m.what) {
+                <div class="m-tr flush masked">
+                  <span class="m-cd m-el">{{ m.what }}</span>
+                  <span class="m-mut">{{ m.by }}</span>
+                  <span class="m-mut m-num">{{ m.count }}</span>
+                </div>
+              }
+            </div>
+          </div>
+        }
+
+        <div class="m-row between">
+          <span class="m-hint">{{ d.took }}</span>
+          <button type="button" class="btn m-fixed" (click)="openCallInLogs(d.call)">
+            <lucide-icon name="external-link" [size]="13" />
+            Open in Logs
+          </button>
+        </div>
+      </section>
+    </div>
+  }
+</div>

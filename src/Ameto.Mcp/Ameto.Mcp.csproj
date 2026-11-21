@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!-- The Model Context Protocol SDK, and the only project that references it: the protocol
+         (two generations of it — stateless 2026-07-28 and the initialize-and-session one
+         before) is the SDK's to keep up with, and everything it pulls in stays behind this
+         assembly. -->
+    <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.4.0" />
+    <PackageReference Include="MessagePack" Version="3.1.7" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ameto.Core\Ameto.Core.csproj" />
+    <ProjectReference Include="..\Ameto.Query\Ameto.Query.csproj" />
+    <ProjectReference Include="..\Ameto.Storage\Ameto.Storage.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The host maps the settings API over the store, the audit fields and the filter helpers. -->
+    <InternalsVisibleTo Include="Ameto.Server" />
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,662 @@
+@use 'breakpoints' as bp;
+
+:host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--section-pad);
+  min-width: 0;
+}
+
+/* The settings page hides a section with [hidden]; a display of our own would undo it. */
+:host([hidden]) { display: none; }
+
+/* The key dialog draws itself over the page (position: fixed), so its host holds nothing that
+   takes room. Left an item of the column above, it would still have a gap put before it: space
+   at the foot of every tab, whether the dialog is open or not. */
+app-modal { display: contents; }
+
+/* Done held for a moment after a key was taken down: it looks as a disabled button does, and
+   keeps the focus as a disabled one would not. It still takes the pointer — the click is
+   dropped where it is handled. With pointer-events off, a click meant for it went through to
+   whatever lay behind, and the focus went with it: out of the dialog, on the second click of a
+   double click. */
+.btn[aria-disabled='true'] {
+  opacity: .45;
+  cursor: default;
+}
+
+/* Under the pointer it stays as it is: it takes the pointer now, and would otherwise light up
+   as a button that is about to act. */
+.btn.primary[aria-disabled='true']:hover {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--text-on-primary);
+}
+
+/* Over the whole window for the moment after the last key's dialog has closed (see the
+   template). It shows nothing and takes the clicks meant for a Done that is no longer there. As
+   high as the dialogs stand, and later in the page than any of them, so over those as well. */
+.m-key-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+}
+
+/* ── The key dialog ────────────────────────────────────────────────────────────
+   Done stands at one place for every key, and a profile's name is shown whole: it is how one
+   key is told from the next, and two names may differ at their end ("… — production",
+   "… — staging"). Three things in the dialog change from one key to the next — the name in
+   its title, what is said of the keys still waiting, and, in a window too low for the dialog,
+   how much of it has to scroll — and none of them may move Done: the second click of a double
+   click lands where Done was.
+
+   So the dialog's lower edge is held, not its middle: a centred dialog moves Done by half of
+   any difference in height. Done's row is the last thing in it, of one height, and outside
+   whatever scrolls. Above the row everything may grow, and the dialog grows upwards.
+
+   As a window gets lower, the dialog gives way in this order, and Done's row never: the key
+   and what is said of it scroll, down to one line of the key; then the title scrolls, by whole
+   lines and down to one; then the margins round the dialog go. In a window lower than that
+   the dialog scrolls as a whole, from its title: a key is shown once, and is not to be lost
+   to a window that has room for Done and none for the key. */
+
+/* The heights that are sums of things said elsewhere — the dialog's own rules (modal.scss), the
+   row of the key (.m-key-reveal, further down) and the theme's sizes — written out from their
+   parts, here and nowhere else. A test page lays nothing out, so only a browser tells when one
+   of the parts has changed; the spec holds the parts it can see to what they are now. */
+$m-key-row: 1px + 6px + 24px + 6px + 1px;                  // the key's line: its border and padding round Copy (--icon-btn)
+$m-key-done: 32px;                                         // Done's row: two lines of what is said beside Done
+$m-key-body: 12px + $m-key-row + $m-key-done + 12px;       // 94 px: those two in the body's padding (--section-pad)
+$m-key-rest: 1px + 10px + 10px + 1px + $m-key-body + 1px;  // 117 px: with the header's padding (--gap) and rule, and the dialog's borders
+$m-key-least: $m-key-rest + 14px * 1.25;                   // 134.5 px: with one line of the title (--fs-lg by --lh-tight)
+
+:host {
+  /* The margin above the dialog and below it: the page's own, and less in a window lower than
+     the least the dialog is with that margin round it. */
+  --m-key-pad: clamp(0px, calc((100dvh - #{$m-key-least}) / 2), var(--page-pad));
+
+  /* How far above the bottom of the window the dialog's lower edge is held: 108 px below the
+     middle, where a dialog of the usual height ends anyway, or the margin. */
+  --m-key-edge: max(var(--m-key-pad), calc(50dvh - 108px));
+
+  /* The room the dialog has: from the margin at the top down to that edge. */
+  --m-key-room: calc(100dvh - var(--m-key-pad) - var(--m-key-edge));
+}
+
+:host ::ng-deep .m-key-dialog .modal-backdrop {
+  align-items: flex-end;
+  padding-top: var(--m-key-pad);
+  padding-bottom: var(--m-key-edge);
+}
+
+:host ::ng-deep .m-key-dialog .modal {
+  max-height: var(--m-key-room);
+}
+
+/* A window lower than the least the dialog is. Its margins are gone by then, and it scrolls as
+   a whole: the line of its title and the key's are what is seen first, Done's row is at its
+   end. Where it is scrolled to is kept from one key to the next, and Done with it. */
+@media (max-height: $m-key-least) {
+  :host ::ng-deep .m-key-dialog .modal {
+    overflow-y: auto;
+  }
+}
+
+/* The header takes the height its title has, and keeps it. */
+:host ::ng-deep .m-key-dialog .modal__header {
+  flex-shrink: 0;
+  align-items: flex-start;
+}
+
+/* The title. A name with no place to break in it — svc_payments_…_production — is broken
+   anywhere, rather than run past the dialog's edge: there it was cut without a mark.
+
+   It is the title that scrolls where it has to, not the header round it: the header's padding
+   is then no part of what overflows, and a title that fits is not made a thing to scroll by a
+   pixel of padding. It has no scroll bar, which would narrow it and wrap it anew — a name
+   that fitted in three lines then took four and lost its end; it scrolls by the wheel, a
+   finger or the keys. It is cut at a whole line of its own (1lh, whatever size a browser
+   draws it at), and never to less than one. What it leaves is what the dialog cannot do
+   without: the key's line and Done's row, with what stands round them. The space between the
+   key and Done's row is not among them: it goes before a line of the name does.
+
+   A title that is cut says so: the last of its lines in sight fades, for as long as there is
+   more of the name under it. (A scroll bar said so once, and it is what wrapped the name
+   anew.) The fading is an animation run by the title's own scrolling, so a title with nowhere
+   to scroll is not touched by it; a browser that has no such animations runs it at once to
+   its end, where nothing fades. In any browser the whole name is what the pointer is told
+   over the title (see the template).
+
+   The animation is named in this rule, and after other declarations, on purpose. In a rule
+   inside an @supports, and first in it, the built style sheet named it without the mark the
+   framework gives the key frames below — in the production build only, where the white space
+   before it is gone — and there was no fading at all. */
+:host ::ng-deep .m-key-dialog .modal__title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  min-height: 1lh;
+  max-height: #{'round(down, calc(var(--m-key-room) - #{$m-key-rest}), 1lh)'};
+  overflow-y: auto;
+  scrollbar-width: none;
+  animation: m-key-title-cut linear both;
+  animation-timeline: scroll(self);
+  mask-image: #{'linear-gradient(#000 calc(100% - 1lh), rgb(0 0 0 / calc(1 - 0.75 * var(--m-key-cut, 0))))'};
+}
+
+:host ::ng-deep .m-key-dialog .modal__title::-webkit-scrollbar {
+  display: none;
+}
+
+/* One, until the title is all but scrolled to its end. */
+@keyframes m-key-title-cut {
+  0%, 90% { --m-key-cut: 1; }
+  100% { --m-key-cut: 0; }
+}
+
+/* The body does not scroll; its middle does, and Done's row stands under that. It is never
+   lower than the key's line and the row in its padding: the key is not what gives way to a
+   low window. The space between the middle and the row belongs to the middle (below), so
+   that it gives way with it. */
+:host ::ng-deep .m-key-dialog .modal__body {
+  gap: 0;
+  min-height: $m-key-body;
+  overflow: hidden;
+}
+
+/* The key and what is said of it: what scrolls first, and all that a scroll bar narrows while
+   the dialog fits its window. It gives way before anything else does, down to the key's line. */
+.m-key-scroll {
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 1;
+  gap: var(--gap);
+  min-height: 0;
+  overflow-y: auto;
+}
+
+/* The space above Done's row — the gap and these four pixels — as the last thing that scrolls. */
+.m-key-scroll::after {
+  flex: none;
+  height: 4px;
+  content: '';
+}
+
+/* Done's row is two lines of what is said beside it, with that or without: on a narrow screen
+   the sentence wraps, and a row as tall as its text was three pixels taller than Done alone.
+   It gives up none of its height to a window that is short of room. */
+.m-key-dialog .m-actions {
+  flex-shrink: 0;
+  align-items: center;
+  min-height: $m-key-done;
+  margin-top: 0;
+}
+
+/* What is said of the keys still waiting, at the start of Done's row. It takes the room Done
+   leaves and wraps inside it, to two lines and no more: on a screen too narrow for that the
+   rest is cut, and the whole of it is the element's title. */
+.m-key-behind {
+  display: -webkit-box;
+  flex: 1;
+  min-width: 0;
+  max-height: $m-key-done;
+  overflow: hidden;
+  line-height: 16px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+/* ── The section's own tabs ─────────────────────────────────────────────────── */
+.m-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+
+.m-tab {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 6px 12px;
+  margin-bottom: -1px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-ui);
+}
+
+.m-tab:hover { color: var(--text-primary); }
+
+.m-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: var(--fw-medium);
+}
+
+.m-load-error {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  color: var(--error);
+  font-size: var(--fs-sm);
+}
+
+/* Not an error — the change it speaks of went through — so it is said in the warning's colour. */
+.m-stale {
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  color: var(--warning);
+  font-size: var(--fs-xs);
+}
+
+/* ── The vocabulary every tab of the section is written in ───────────────────────
+   One copy, here, reaching the tab components below this host — rather than the same forty
+   rules compiled into each of the six. Everything is prefixed m- and scoped to this host. */
+:host ::ng-deep {
+  .m-tabpanel { display: block; min-width: 0; }
+  .m-tabpanel[hidden] { display: none; }
+
+  .m-cols {
+    display: flex;
+    align-items: flex-start;
+    gap: var(--section-pad);
+    min-width: 0;
+  }
+
+  .m-main,
+  .m-side {
+    display: flex;
+    flex-direction: column;
+    gap: var(--section-pad);
+    min-width: 0;
+  }
+
+  .m-main { flex: 1; }
+  .m-side { flex-shrink: 0; }
+
+  .m-sub  { font-size: var(--fs-xs); color: var(--text-secondary); }
+  .m-hint { font-size: var(--fs-xs); color: var(--text-muted); }
+  .m-lbl  { font-size: var(--fs-xs); font-weight: var(--fw-medium); color: var(--text-secondary); }
+  .m-err  { font-size: var(--fs-xs); color: var(--error); }
+  .m-mut  { color: var(--text-secondary); }
+  .m-dim  { color: var(--text-muted); }
+  .m-num  { text-align: right; }
+  .m-strong { font-weight: var(--fw-medium); }
+
+  .m-cd {
+    font-family: var(--font-code);
+    font-size: var(--fs-dense);
+  }
+
+  .m-el {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .m-row {
+    display: flex;
+    align-items: center;
+    gap: var(--gap);
+    min-width: 0;
+  }
+
+  .m-row.between { justify-content: space-between; }
+  .m-row.wrap    { flex-wrap: wrap; }
+  .m-row.top     { align-items: flex-start; }
+  .m-row.tight   { gap: 6px; }
+  .m-grow        { flex: 1; min-width: 0; }
+  .m-fixed       { flex-shrink: 0; }
+
+  .m-fld {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .m-two-lines {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  /* ── Pills, chips, tokens ── */
+  .m-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 7px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    font-size: var(--fs-meta);
+    font-weight: var(--fw-medium);
+    white-space: nowrap;
+  }
+
+  .m-pill.ok   { color: var(--success); }
+  .m-pill.err  { color: var(--error); }
+  .m-pill.warn,
+  .m-pill.acc  { color: var(--accent); }
+
+  .m-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: var(--ctl-h-sm);
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+
+  .m-chip-x {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    margin-right: -4px;
+    padding: 0;
+    border: 0;
+    border-radius: 3px;
+    background: none;
+    color: var(--text-muted);
+  }
+
+  .m-chip-x:hover { color: var(--error); background: var(--error-soft); }
+
+  .m-tok {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+
+  .m-raw {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: var(--error-soft);
+    color: var(--error);
+  }
+
+  .m-par { color: var(--info); }
+
+  /* ── Code and read-only values ── */
+  .m-code {
+    min-width: 0;
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-family: var(--font-code);
+    font-size: var(--fs-dense);
+    line-height: 1.65;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  .m-code.pre {
+    overflow-x: auto;
+    overflow-wrap: normal;
+    white-space: pre;
+  }
+
+  .m-code.tall { max-height: 420px; overflow-y: auto; }
+
+  .m-inp {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    min-height: var(--ctl-h);
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+  }
+
+  .m-select {
+    height: var(--ctl-h);
+    max-width: 100%;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    outline: none;
+  }
+
+  .m-select:focus { border-color: var(--primary); }
+
+  .m-textarea {
+    width: 100%;
+    min-height: 52px;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-size: var(--fs-sm);
+    line-height: var(--lh-base);
+    outline: none;
+    resize: vertical;
+  }
+
+  .m-textarea:focus { border-color: var(--primary); }
+
+  .m-textarea.mono {
+    font-family: var(--font-code);
+    font-size: var(--fs-dense);
+    line-height: 1.65;
+  }
+
+  .field-input.invalid,
+  .m-textarea.invalid { border-color: var(--error); }
+
+  .btn.sm { height: var(--ctl-h-sm); }
+
+  /* ── Switch and segmented control ── */
+  .m-sw {
+    position: relative;
+    flex-shrink: 0;
+    width: 28px;
+    height: 16px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    transition: background .12s, border-color .12s;
+  }
+
+  .m-sw::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    transition: left .12s, background .12s;
+  }
+
+  .m-sw[aria-checked='true'] {
+    border-color: var(--accent);
+    background: var(--accent);
+  }
+
+  .m-sw[aria-checked='true']::after {
+    left: 14px;
+    background: var(--text-on-accent);
+  }
+
+  .m-sw:disabled {
+    cursor: default;
+    opacity: .5;
+  }
+
+  .m-sw:focus-visible,
+  .m-seg button:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: 2px;
+  }
+
+  .m-seg {
+    display: inline-flex;
+    flex-shrink: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+
+  .m-seg button {
+    height: 24px;
+    padding: 0 10px;
+    border: 0;
+    border-right: 1px solid var(--border);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+
+  .m-seg button:last-child { border-right: 0; }
+  .m-seg button:hover { color: var(--text-primary); }
+
+  .m-seg button[aria-pressed='true'] {
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: var(--fw-medium);
+  }
+
+  /* ── Tables: grid rows, so a cell can hold two lines and a row can be picked ── */
+  .m-table {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .m-hr,
+  .m-tr {
+    display: grid;
+    align-items: center;
+    column-gap: 12px;
+    min-height: 30px;
+    padding: 0 8px;
+    border-bottom: 1px solid var(--border-soft);
+  }
+
+  .m-hr {
+    border-bottom-color: var(--border);
+    color: var(--text-secondary);
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-medium);
+  }
+
+  .m-tr { font-size: var(--fs-dense); }
+  .m-tr.flush { padding: 0; }
+  .m-tr.pick { cursor: pointer; }
+  .m-tr.pick:hover { background: var(--bg-hover); }
+  .m-tr.sel,
+  .m-tr.sel:hover { background: var(--accent-soft); }
+
+  /* A list of picked rows is one stop for the Tab key; the ring shows which row holds it. */
+  .m-tr.pick:focus-visible {
+    outline: 2px solid var(--info);
+    outline-offset: -2px;
+  }
+
+  /* A cell that holds a control — a switch, a field, a button — rather than text. */
+  .m-cell {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+  }
+
+  .m-empty {
+    padding: 14px 8px;
+    color: var(--text-muted);
+    font-size: var(--fs-xs);
+  }
+
+  /* ── Tiles ── */
+  .m-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+  }
+
+  .m-tile b {
+    font-size: var(--fs-xl);
+    font-weight: var(--fw-semibold);
+    letter-spacing: var(--ls-tight);
+    line-height: 1.2;
+  }
+
+  /* ── Dialogs ── */
+  .m-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 4px;
+  }
+
+  .m-key-reveal {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--bg-main);
+  }
+
+  .m-key-text {
+    flex: 1;
+    color: var(--accent);
+    font-family: var(--font-code);
+    font-size: var(--fs-sm);
+    word-break: break-all;
+  }
+
+  /* ── Below a wide desktop the side column goes under the main one ── */
+  @include bp.below(bp.$bp-lg) {
+    .m-cols {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .m-side { width: auto !important; }
+  }
+
+  /* On a tablet or a phone a table keeps its columns and scrolls sideways inside its section,
+     rather than widening the page. The layouts for those sizes are still to be designed; this
+     only keeps the desktop one from breaking there. */
+  @include bp.below(bp.$bp-md) {
+    .m-table { overflow-x: auto; }
+
+    .m-table > .m-hr,
+    .m-table > .m-tr:not(.flush) { min-width: 600px; }
+
+    .m-row.between { flex-wrap: wrap; }
+  }
+}
