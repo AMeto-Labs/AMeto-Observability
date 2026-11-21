@@ -1,4 +1,6 @@
-import { ChangeDetectionStrategy, Component, DestroyRef, computed, effect, inject, signal, untracked } from '@angular/core';
+import {
+  ChangeDetectionStrategy, Component, DestroyRef, ElementRef, afterRenderEffect, computed, effect, inject, signal, untracked,
+} from '@angular/core';
 import { Location } from '@angular/common';
 import { takeUntilDestroyed, toSignal } from '@angular/core/rxjs-interop';
 import { ActivatedRoute, NavigationStart, ParamMap, Router } from '@angular/router';
@@ -81,6 +83,7 @@ export class McpSectionComponent {
   private readonly router = inject(Router);
   private readonly location = inject(Location);
   private readonly dirtyService = inject(SettingsDirtyService);
+  private readonly host: ElementRef<HTMLElement> = inject(ElementRef);
 
   readonly tabs = MCP_TABS;
 
@@ -146,6 +149,15 @@ export class McpSectionComponent {
     inject(DestroyRef).onDestroy(() => clearTimeout(this.donePause));
     effect(() => {
       if (this.revealed()) this.shownAt = Date.now();
+    });
+    // A key comes up read from its top: the dialog is the one the key before it stood in, and
+    // where its title or its middle was scrolled to — in a window too low for all of it — is
+    // where the next key's would begin, its name from the third line.
+    afterRenderEffect(() => {
+      if (!this.revealed()) return;
+      for (const scrolled of this.host.nativeElement.querySelectorAll('.m-key-dialog .modal__title, .m-key-scroll')) {
+        scrolled.scrollTop = 0;
+      }
     });
     this.router.events.pipe(takeUntilDestroyed()).subscribe(e => {
       if (e instanceof NavigationStart) this.traversing = e.navigationTrigger === 'popstate';
