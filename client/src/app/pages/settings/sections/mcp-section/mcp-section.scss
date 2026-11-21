@@ -54,16 +54,26 @@ app-modal { display: contents; }
    any difference in height. Done's row is the last thing in it, of one height, and outside
    whatever scrolls. Above the row everything may grow, and the dialog grows upwards.
 
-   As a window gets lower, the dialog gives way in this order, and Done's row never:
-   the key and what is said of it scroll, down to one line of the key; then the title scrolls,
-   by whole lines and down to one; then the margins round the dialog go; then the key's one
-   line. A title of one line and Done's row take 96.5 px between them; in a window lower than
-   that the dialog scrolls as a whole (the rule below is for 97 px and lower). */
+   As a window gets lower, the dialog gives way in this order, and Done's row never: the key
+   and what is said of it scroll, down to one line of the key; then the title scrolls, by whole
+   lines and down to one; then the margins round the dialog go. In a window lower than that
+   the dialog scrolls as a whole, from its title: a key is shown once, and is not to be lost
+   to a window that has room for Done and none for the key. */
+
+/* The heights that are sums of things said elsewhere — the dialog's own rules (modal.scss), the
+   row of the key (.m-key-reveal, further down) and the theme's sizes — written out from their
+   parts, here and nowhere else. A test page lays nothing out, so only a browser tells when one
+   of the parts has changed; the spec holds the parts it can see to what they are now. */
+$m-key-row: 1px + 6px + 24px + 6px + 1px;                  // the key's line: its border and padding round Copy (--icon-btn)
+$m-key-done: 32px;                                         // Done's row: two lines of what is said beside Done
+$m-key-body: 12px + $m-key-row + $m-key-done + 12px;       // 94 px: those two in the body's padding (--section-pad)
+$m-key-rest: 1px + 10px + 10px + 1px + $m-key-body + 1px;  // 117 px: with the header's padding (--gap) and rule, and the dialog's borders
+$m-key-least: $m-key-rest + 14px * 1.25;                   // 134.5 px: with one line of the title (--fs-lg by --lh-tight)
+
 :host {
   /* The margin above the dialog and below it: the page's own, and less in a window lower than
-     the dialog is with that margin round it and only the key's line left to give — one line of
-     the title, one of the key and Done's row: 117 px (see the title) and the title's line. */
-  --m-key-pad: clamp(0px, calc((100dvh - 117px - var(--m-key-line)) / 2), var(--page-pad));
+     the least the dialog is with that margin round it. */
+  --m-key-pad: clamp(0px, calc((100dvh - #{$m-key-least}) / 2), var(--page-pad));
 
   /* How far above the bottom of the window the dialog's lower edge is held: 108 px below the
      middle, where a dialog of the usual height ends anyway, or the margin. */
@@ -71,9 +81,6 @@ app-modal { display: contents; }
 
   /* The room the dialog has: from the margin at the top down to that edge. */
   --m-key-room: calc(100dvh - var(--m-key-pad) - var(--m-key-edge));
-
-  /* One line of the title. */
-  --m-key-line: calc(var(--fs-lg) * var(--lh-tight));
 }
 
 :host ::ng-deep .m-key-dialog .modal-backdrop {
@@ -86,7 +93,10 @@ app-modal { display: contents; }
   max-height: var(--m-key-room);
 }
 
-@media (max-height: 97px) {
+/* A window lower than the least the dialog is. Its margins are gone by then, and it scrolls as
+   a whole: the line of its title and the key's are what is seen first, Done's row is at its
+   end. Where it is scrolled to is kept from one key to the next, and Done with it. */
+@media (max-height: $m-key-least) {
   :host ::ng-deep .m-key-dialog .modal {
     overflow-y: auto;
   }
@@ -105,35 +115,56 @@ app-modal { display: contents; }
    is then no part of what overflows, and a title that fits is not made a thing to scroll by a
    pixel of padding. It has no scroll bar, which would narrow it and wrap it anew — a name
    that fitted in three lines then took four and lost its end; it scrolls by the wheel, a
-   finger or the keys. It is cut at a whole line, and never to less than one. What it leaves is
-   what the dialog cannot do without, 117 px: the body's padding, one line of the key, Done's
-   row; the header's own padding and its rule; the dialog's two borders. The space between the
-   key and Done's row is not among them: it goes before a line of the name does. */
+   finger or the keys. It is cut at a whole line of its own (1lh, whatever size a browser
+   draws it at), and never to less than one. What it leaves is what the dialog cannot do
+   without: the key's line and Done's row, with what stands round them. The space between the
+   key and Done's row is not among them: it goes before a line of the name does.
+
+   A title that is cut says so: the last of its lines in sight fades, for as long as there is
+   more of the name under it. (A scroll bar said so once, and it is what wrapped the name
+   anew.) The fading is an animation run by the title's own scrolling, so a title with nowhere
+   to scroll is not touched by it; a browser that has no such animations runs it at once to
+   its end, where nothing fades. In any browser the whole name is what the pointer is told
+   over the title (see the template).
+
+   The animation is named in this rule, and after other declarations, on purpose. In a rule
+   inside an @supports, and first in it, the built style sheet named it without the mark the
+   framework gives the key frames below — in the production build only, where the white space
+   before it is gone — and there was no fading at all. */
 :host ::ng-deep .m-key-dialog .modal__title {
   min-width: 0;
   overflow-wrap: anywhere;
-  min-height: var(--m-key-line);
-  max-height: calc(var(--m-key-room) - 117px);
-  max-height: #{'round(down, calc(var(--m-key-room) - 117px), var(--m-key-line))'};
+  min-height: 1lh;
+  max-height: #{'round(down, calc(var(--m-key-room) - #{$m-key-rest}), 1lh)'};
   overflow-y: auto;
   scrollbar-width: none;
+  animation: m-key-title-cut linear both;
+  animation-timeline: scroll(self);
+  mask-image: #{'linear-gradient(#000 calc(100% - 1lh), rgb(0 0 0 / calc(1 - 0.75 * var(--m-key-cut, 0))))'};
 }
 
 :host ::ng-deep .m-key-dialog .modal__title::-webkit-scrollbar {
   display: none;
 }
 
-/* The body does not scroll; its middle does, and Done's row stands under that. The least the
-   body is: its padding and the row. The space between the middle and the row belongs to the
-   middle (below), so that it gives way with it. */
+/* One, until the title is all but scrolled to its end. */
+@keyframes m-key-title-cut {
+  0%, 90% { --m-key-cut: 1; }
+  100% { --m-key-cut: 0; }
+}
+
+/* The body does not scroll; its middle does, and Done's row stands under that. It is never
+   lower than the key's line and the row in its padding: the key is not what gives way to a
+   low window. The space between the middle and the row belongs to the middle (below), so
+   that it gives way with it. */
 :host ::ng-deep .m-key-dialog .modal__body {
   gap: 0;
-  min-height: 56px;
+  min-height: $m-key-body;
   overflow: hidden;
 }
 
-/* The key and what is said of it: what scrolls first, and all that a scroll bar narrows. It
-   gives way before anything else does, and to nothing if it must. */
+/* The key and what is said of it: what scrolls first, and all that a scroll bar narrows while
+   the dialog fits its window. It gives way before anything else does, down to the key's line. */
 .m-key-scroll {
   display: flex;
   flex-direction: column;
@@ -156,7 +187,7 @@ app-modal { display: contents; }
 .m-key-dialog .m-actions {
   flex-shrink: 0;
   align-items: center;
-  min-height: 32px;
+  min-height: $m-key-done;
   margin-top: 0;
 }
 
@@ -167,7 +198,7 @@ app-modal { display: contents; }
   display: -webkit-box;
   flex: 1;
   min-width: 0;
-  max-height: 32px;
+  max-height: $m-key-done;
   overflow: hidden;
   line-height: 16px;
   -webkit-box-orient: vertical;

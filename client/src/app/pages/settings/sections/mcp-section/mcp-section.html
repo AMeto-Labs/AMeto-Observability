@@ -60,15 +60,17 @@
      rather than its middle, and Done's row is the last thing in it, of one height. Centred, a
      difference in height between two keys moved Done by half of it — a long profile name on two
      lines of the title did — and the second click of a double click missed Done again. The name
-     is shown whole: it is how one key is told from the next. -->
-<app-modal class="m-key-dialog" [open]="revealed() !== null" [title]="keyTitle()" [dismissable]="false">
+     is shown whole: it is how one key is told from the next. Where a window is too low for the
+     whole of it, the title is cut at a line and scrolls, and the whole name is its tooltip. -->
+<app-modal class="m-key-dialog" [open]="revealed() !== null" [title]="keyTitle()" titleTooltip [dismissable]="false">
   <!-- `shown` is the key as drawn: Done names it, not whatever the store holds first by the
        time a click is handled. The block is kept when the next key takes its place, and so is
        the focus on Done. -->
   @if (revealed(); as shown) {
-    <!-- All that scrolls where the window is too low for the dialog: the key and what is said of
-         it. The profile's name above keeps its lines, and Done's row below is outside what
-         scrolls — neither scrolled out of sight nor pushed sideways by a scroll bar. -->
+    <!-- What scrolls first where the window is too low for the dialog: the key and what is said
+         of it. The profile's name above keeps its lines for as long as this has anything to
+         give, and Done's row below is outside what scrolls — neither scrolled out of sight nor
+         pushed sideways by a scroll bar. -->
     <div class="m-key-scroll">
       <div class="m-key-reveal">
         <lucide-icon name="key" [size]="14" />

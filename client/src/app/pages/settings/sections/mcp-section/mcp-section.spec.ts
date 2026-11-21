@@ -1201,59 +1201,105 @@ describe('Settings → AI / MCP', () => {
     // test page cannot lay out: it has no window to be too low. A browser measures the places
     // — the reviews did, at every height — and here each rule is held to what it says, so that
     // none is changed or dropped unnoticed. Four of them once were, and each broke the dialog.
-    const sheets = Array.from(document.querySelectorAll('style'), s => s.textContent ?? '').join('\n').replace(/\/\*[\s\S]*?\*\//g, '');
+    //
+    // To the letter, and to the space: a run of white space is read as one space, not as none.
+    // Round the minus of a calc() it is what makes the minus one, and a rule that lost it —
+    // `100dvh -117px` — is a rule a browser drops whole: the dialog then sat at the foot of
+    // every window, and these specs passed.
+    const sheets = Array.from(document.querySelectorAll('style'), s => s.textContent ?? '').join('\n')
+      .replace(/\/\*[\s\S]*?\*\//g, '').replace(/\s+/g, ' ');
     const declared = (selector: RegExp): string[] =>
       Array.from(sheets.matchAll(/([^{}]+)\{([^{}]*)\}/g))
-        .filter(rule => selector.test(rule[1].replace(/\s+/g, ' ').trim()))
-        .map(rule => rule[2].replace(/\s+/g, '').replace(/;$/, ''));
+        .filter(rule => selector.test(rule[1].trim()))
+        .map(rule => rule[2].trim().replace(/;$/, ''));
     const host = String.raw`\[_nghost-[\w-]+\]`, own = String.raw`\[_ngcontent-[\w-]+\]`;
 
-    // The room the dialog has, and where its lower edge is held. The margins give way before the
-    // key's one line does: in a window lower than a line of the title, one of the key and Done's
-    // row with the page's margin round them.
+    // The room the dialog has, and where its lower edge is held. The margins give way in a
+    // window lower than the least the dialog is with the page's margin round it: 134.5 px.
     expect(declared(new RegExp(`^${host}$`))).toContain(
-      '--m-key-pad:clamp(0px,calc((100dvh-117px-var(--m-key-line))/2),var(--page-pad));' +
-      '--m-key-edge:max(var(--m-key-pad),calc(50dvh-108px));' +
-      '--m-key-room:calc(100dvh-var(--m-key-pad)-var(--m-key-edge));' +
-      '--m-key-line:calc(var(--fs-lg)*var(--lh-tight))');
+      '--m-key-pad: clamp(0px, calc((100dvh - 134.5px) / 2), var(--page-pad)); ' +
+      '--m-key-edge: max(var(--m-key-pad), calc(50dvh - 108px)); ' +
+      '--m-key-room: calc(100dvh - var(--m-key-pad) - var(--m-key-edge))');
     expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal-backdrop$`))).toEqual([
-      'align-items:flex-end;padding-top:var(--m-key-pad);padding-bottom:var(--m-key-edge)']);
-    // No taller than the room; in a window lower than the least it can be, all of it scrolls.
-    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal$`))).toEqual(['max-height:var(--m-key-room)', 'overflow-y:auto']);
-    expect(sheets.replace(/\s+/g, '')).toMatch(/@media\(max-height:97px\)\{\[_nghost-[\w-]+\]\.m-key-dialog\.modal\{overflow-y:auto;?\}\}/);
+      'align-items: flex-end; padding-top: var(--m-key-pad); padding-bottom: var(--m-key-edge)']);
+    // No taller than the room; in a window lower than the least it is, all of it scrolls — the
+    // title's line and the key's are seen first, Done's row is at its end.
+    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal$`))).toEqual(['max-height: var(--m-key-room)', 'overflow-y: auto']);
+    expect(sheets).toMatch(/@media \(max-height: 134\.5px\) \{ \[_nghost-[\w-]+\] \.m-key-dialog \.modal \{ overflow-y: auto; \} \}/);
     // The title: broken anywhere, whole while there is room, and where there is not, scrolled
-    // by whole lines down to one — with no scroll bar to narrow it and wrap it anew. What it
-    // leaves the rest is 117 px: one line of the key and Done's row, with what stands round them.
-    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__header$`))).toEqual(['flex-shrink:0;align-items:flex-start']);
-    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__title$`))).toEqual([
-      'min-width:0;overflow-wrap:anywhere;min-height:var(--m-key-line);' +
-      'max-height:calc(var(--m-key-room)-117px);' +
-      'max-height:round(down,calc(var(--m-key-room)-117px),var(--m-key-line));' +
-      'overflow-y:auto;scrollbar-width:none']);
-    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__title::-webkit-scrollbar$`))).toEqual(['display:none']);
-    // The body does not scroll; its middle does, and gives way first — to nothing, if it must.
-    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__body$`))).toEqual(['gap:0;min-height:56px;overflow:hidden']);
+    // by whole lines of its own down to one — with no scroll bar to narrow it and wrap it anew.
+    // What it leaves the rest is 117 px: the key's line and Done's row, with what stands round
+    // them.
+    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__header$`))).toEqual(['flex-shrink: 0; align-items: flex-start']);
+    // A title that is cut says so: the last of its lines in sight fades while there is more of
+    // the name under it — an animation run by the title's own scrolling. It is named in this
+    // one rule, after other declarations: named first in a rule of its own inside an @supports,
+    // it lost the framework's mark in the production build, the key frames kept theirs, and
+    // nothing faded. (The build also writes the mask a second time, under the name older
+    // browsers know it by.)
+    const title = declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__title$`));
+    expect(title).toHaveLength(1);
+    const fade = 'linear-gradient(#000 calc(100% - 1lh), rgb(0 0 0 / calc(1 - 0.75 * var(--m-key-cut, 0))))';
+    const marked = /; animation: ([\w-]*)m-key-title-cut linear both; /.exec(title[0])?.[1];
+    expect(marked).toMatch(/^_ngcontent-[\w-]+_$/);
+    expect(title[0].replace(`animation: ${marked}m-key`, 'animation: m-key').replace(`-webkit-mask-image: ${fade}; `, '')).toBe(
+      'min-width: 0; overflow-wrap: anywhere; min-height: 1lh; ' +
+      'max-height: round(down, calc(var(--m-key-room) - 117px), 1lh); ' +
+      'overflow-y: auto; scrollbar-width: none; ' +
+      `animation: m-key-title-cut linear both; animation-timeline: scroll(self); mask-image: ${fade}`);
+    expect(sheets).toContain(`@keyframes ${marked}m-key-title-cut { 0%, 90% { --m-key-cut: 1; } 100% { --m-key-cut: 0; } }`);
+    expect(sheets).not.toMatch(/@supports[^{]*\{[^{}]*\.m-key-dialog/);
+    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__title::-webkit-scrollbar$`))).toEqual(['display: none']);
+    // The body does not scroll; its middle does, and gives way first — down to the key's line,
+    // which the body is never too low for: 94 px.
+    expect(declared(new RegExp(`^${host} \\.m-key-dialog \\.modal__body$`))).toEqual(['gap: 0; min-height: 94px; overflow: hidden']);
     expect(declared(new RegExp(`^\\.m-key-scroll${own}$`))).toEqual([
-      'display:flex;flex-direction:column;flex-shrink:1;gap:var(--gap);min-height:0;overflow-y:auto']);
-    expect(declared(new RegExp(`^\\.m-key-scroll${own}::after$`))).toEqual(['flex:none;height:4px;content:""']);
+      'display: flex; flex-direction: column; flex-shrink: 1; gap: var(--gap); min-height: 0; overflow-y: auto']);
+    expect(declared(new RegExp(`^\\.m-key-scroll${own}::after$`))).toEqual(['flex: none; height: 4px; content: ""']);
     // Done's row gives up none of its height.
     expect(declared(new RegExp(`^\\.m-key-dialog${own} \\.m-actions${own}$`))).toEqual([
-      'flex-shrink:0;align-items:center;min-height:32px;margin-top:0']);
+      'flex-shrink: 0; align-items: center; min-height: 32px; margin-top: 0']);
+
+    // Three of those numbers — 94, 117 and 134.5 px — are sums of what other rules say: the
+    // dialog's own, the row of the key, a line of the title. A change to one of these has to be
+    // a change to the sums, and nothing else here would say so. (The theme's sizes are a part
+    // of them too, and are in no style sheet a test page has.)
+    const parts = (selector: RegExp): string[] => declared(selector).flatMap(rule => rule.split('; '));
+    expect(parts(new RegExp(`^\\.modal${own}$`))).toContain('border: 1px solid var(--border)');
+    expect(parts(new RegExp(`^\\.modal__header${own}$`))).toEqual(expect.arrayContaining([
+      'padding: var(--gap) var(--section-pad)', 'border-bottom: 1px solid var(--border)']));
+    expect(parts(new RegExp(`^\\.modal__title${own}$`))).toEqual(expect.arrayContaining([
+      'font-size: var(--fs-lg)', 'line-height: var(--lh-tight)']));
+    expect(parts(new RegExp(`^\\.modal__body${own}$`))).toContain('padding: var(--section-pad)');
+    expect(parts(/\.m-key-reveal(\[_ngcontent-[\w-]+\])?$/)).toEqual(expect.arrayContaining([
+      'padding: 6px 10px', 'border: 1px solid var(--accent)']));
   });
 
   it('a key comes up read from its top, wherever the one before it was scrolled to', async () => {
     const f = await twoKeys();
     const title = el(f, 'app-modal.m-key-dialog .modal__title'), middle = el(f, '.m-key-scroll');
-    // In a window too low for all of it, the title and the middle scroll. A test page has no
-    // heights to scroll by; it keeps the number it is given.
+    const dialog = el(f, 'app-modal.m-key-dialog .modal');
+    // The whole name is what the pointer is told over the title: in a low window the title is
+    // cut at a line, and is otherwise read to its end only by scrolling it.
+    expect(title.textContent).toMatch(/^Key of “.+”$/);
+    expect(title.title).toBe(title.textContent);
+    // In a window too low for all of it, the title and the middle scroll, and in the lowest
+    // the dialog itself. A test page has no heights to scroll by; it keeps the number it is given.
     title.scrollTop = 35;
     middle.scrollTop = 13;
+    dialog.scrollTop = 21;
     vi.useFakeTimers();
     button(f, 'Done', '.modal').click();
     await settle(f);
     expect(el(f, '.m-key-text').textContent).toBe('the-rotated-key');
     expect([el(f, 'app-modal.m-key-dialog .modal__title'), el(f, '.m-key-scroll')]).toEqual([title, middle]);
     expect([title.scrollTop, middle.scrollTop]).toEqual([0, 0]);
+    // The dialog itself stays where it was scrolled to: Done is at its end, and has to be under
+    // the pointer still when the second click of a double click comes. Scrolled back to its top,
+    // the dialog has Copy where Done was (320×100, in a browser): the click would put the next
+    // key in the clipboard, in place of the one just copied.
+    expect(dialog.scrollTop).toBe(21);
+    expect(title.title).toBe(title.textContent);
   });
 
   it('a click counted as the second of a run takes nothing down while the key has only just come up', async () => {
