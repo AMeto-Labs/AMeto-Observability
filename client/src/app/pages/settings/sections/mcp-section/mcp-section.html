@@ -56,24 +56,29 @@
      the rotation still on its way, say: every dialog stands at the same height, and of two the
      later one in the page is on top.
 
-     Done stands at one height for every key (m-key-dialog): the dialog's lower edge is held
-     rather than its middle, and Done's row is of one height. Centred, a difference in height
-     between two keys moved Done by half of it — a long profile name on two lines of the title
-     did — and the second click of a double click missed Done again. The name is shown whole:
-     it is how one key is told from the next. -->
+     Done stands at one place for every key (m-key-dialog): the dialog's lower edge is held
+     rather than its middle, and Done's row is the last thing in it, of one height. Centred, a
+     difference in height between two keys moved Done by half of it — a long profile name on two
+     lines of the title did — and the second click of a double click missed Done again. The name
+     is shown whole: it is how one key is told from the next. -->
 <app-modal class="m-key-dialog" [open]="revealed() !== null" [title]="keyTitle()" [dismissable]="false">
   <!-- `shown` is the key as drawn: Done names it, not whatever the store holds first by the
        time a click is handled. The block is kept when the next key takes its place, and so is
        the focus on Done. -->
   @if (revealed(); as shown) {
-    <div class="m-key-reveal">
-      <lucide-icon name="key" [size]="14" />
-      <span class="m-key-text">{{ shown.key }}</span>
-      <button type="button" class="btn-icon" title="Copy" (click)="copyKey(shown)">
-        <lucide-icon [name]="copied() === shown.key ? 'check' : 'copy'" [size]="13" />
-      </button>
+    <!-- All that scrolls where the window is too low for the dialog: the key and what is said of
+         it. The profile's name above keeps its lines, and Done's row below is outside what
+         scrolls — neither scrolled out of sight nor pushed sideways by a scroll bar. -->
+    <div class="m-key-scroll">
+      <div class="m-key-reveal">
+        <lucide-icon name="key" [size]="14" />
+        <span class="m-key-text">{{ shown.key }}</span>
+        <button type="button" class="btn-icon" title="Copy" (click)="copyKey(shown)">
+          <lucide-icon [name]="copied() === shown.key ? 'check' : 'copy'" [size]="13" />
+        </button>
+      </div>
+      <span class="m-sub">Copy this key now — it won't be shown again. Only its hash is stored. Give it to the client as the bearer token of the MCP endpoint.</span>
     </div>
-    <span class="m-sub">Copy this key now — it won't be shown again. Only its hash is stored. Give it to the client as the bearer token of the MCP endpoint.</span>
     <div class="m-actions">
       <!-- What is said of the keys still waiting stands beside Done, in Done's own row, so that
            nothing moves under the pointer when it goes. On a line of its own above Done it took
