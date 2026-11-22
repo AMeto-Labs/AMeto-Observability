@@ -22,6 +22,9 @@
   border-radius: var(--radius);
   box-shadow: 0 12px 40px rgba(0, 0, 0, .35);
   overflow: hidden;
+  /* The box holds the focus when nothing in it can (modal.ts); a ring round the whole dialog
+     would say no more than the dialog does by being there. */
+  outline: none;
 }
 
 /* A whole panel (the Traces page's log details) rather than a form: most of the window and

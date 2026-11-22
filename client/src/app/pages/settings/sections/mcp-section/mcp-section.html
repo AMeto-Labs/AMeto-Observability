@@ -102,7 +102,9 @@
 <!-- For the moment after the last key was taken down. The dialog is gone by then, and the second
      click of a double click on its Done would land on whatever stood behind it: a question a
      tab still has open, or a switch that saves on a click. This takes that click, for as long
-     as Done would have been held; a key that arrives meanwhile is shown as any other. -->
-@if (doneHeld() && revealed() === null) {
+     as Done would have been held; a key that arrives meanwhile is shown as any other. Enter and
+     Space are kept from the page for the same moment, by the same word (shieldKey): the focus is
+     back on what had it before the dialog, and a second press would be that control's. -->
+@if (pageShielded()) {
   <div class="m-key-shield" aria-hidden="true"></div>
 }
