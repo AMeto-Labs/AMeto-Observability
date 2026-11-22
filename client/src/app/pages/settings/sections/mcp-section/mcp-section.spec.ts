@@ -1432,6 +1432,96 @@ describe('Settings → AI / MCP', () => {
     expect(all(f, '.m-key-shield')).toEqual([]);
   });
 
+  it('for that moment Enter and Space do not reach the page either, and a key held down never does', async () => {
+    const f = await twoKeys();
+    vi.useFakeTimers();
+    // What has the focus back once the dialog is gone: a control of the page.
+    const tab = el(f, '.m-tab');
+    const heard: string[] = [];
+    const hear = (e: KeyboardEvent): void => { heard.push(e.key + (e.repeat ? ' repeat' : '')); };
+    tab.addEventListener('keydown', hear);
+    /** True when the key was kept from doing what it does — for Enter on a button, a click. */
+    const kept = (key: string, repeat = false): boolean =>
+      !tab.dispatchEvent(new KeyboardEvent('keydown', { key, repeat, bubbles: true, cancelable: true }));
+
+    // While a key is on screen the page's keys are its own.
+    expect([kept('Enter'), kept(' ')]).toEqual([false, false]);
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    expect([kept('Enter'), kept(' ')]).toEqual([false, false]);
+    expect(heard.splice(0)).toEqual(['Enter', ' ', 'Enter', ' ']);
+
+    // The last key is taken down and the dialog goes: the second of two quick presses lands on
+    // whatever has the focus back.
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    expect(all(f, '.modal')).toEqual([]);
+    expect([kept('Enter'), kept(' ')]).toEqual([true, true]);
+    // Any other key is the page's own: Tab moves on, Escape closes what it closes.
+    expect([kept('Tab'), kept('Escape')]).toEqual([false, false]);
+    expect(heard.splice(0)).toEqual(['Tab', 'Escape']);
+
+    // Past the moment a press is a press — and what a key held since before then repeats is not.
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    expect(all(f, '.m-key-shield')).toEqual([]);
+    expect([kept('Enter', true), kept('Enter', true)]).toEqual([true, true]);
+    expect([kept('Enter'), kept('Enter', true), kept(' ')]).toEqual([false, false, false]);
+    expect(heard.splice(0)).toEqual(['Enter', 'Enter repeat', ' ']);
+    tab.removeEventListener('keydown', hear);
+  });
+
+  it('a press is kept from the page for exactly as long as the shield lies over it', async () => {
+    const f = await twoKeys();
+    vi.useFakeTimers();
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    const tab = el(f, '.m-tab');
+    const kept = (): boolean =>
+      !tab.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+
+    // One word draws the shield and stops the key. However long the shield is made to last, a
+    // press is the page's again when a click is, and not a moment sooner: a shield that outlived
+    // the keys' would let the second Enter through under it.
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    const seen: boolean[][] = [];
+    for (let at = 0; at <= 2 * DOUBLE_CLICK_MS; at += 50) {
+      seen.push([all(f, '.m-key-shield').length === 1, kept()]);
+      await vi.advanceTimersByTimeAsync(50);
+      await settle(f);
+    }
+    expect(seen.filter(([shield, key]) => shield !== key)).toEqual([]);
+    expect([seen[0], seen[seen.length - 1]]).toEqual([[true, true], [false, false]]);
+  });
+
+  it('Enter held down on the last Done does not go on to the page once the dialog has gone', async () => {
+    const f = await twoKeys();
+    vi.useFakeTimers();
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS);
+    await settle(f);
+    const tab = el(f, '.m-tab');
+    const kept = (repeat: boolean): boolean =>
+      !tab.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', repeat, bubbles: true, cancelable: true }));
+
+    // The press that takes the last key down, held: a system set to wait a second before it
+    // repeats a key sends the first repeat after the moment is over.
+    button(f, 'Done', '.modal').click();
+    await settle(f);
+    await vi.advanceTimersByTimeAsync(DONE_PAUSE_MS + 300);
+    await settle(f);
+    expect(all(f, '.m-key-shield')).toEqual([]);
+    expect([kept(true), kept(true)]).toEqual([true, true]);
+    // Let go and pressed again, it is a press.
+    expect(kept(false)).toBe(false);
+  });
+
   it('Copy copies the key it stands beside, not the one that has just taken its place', async () => {
     const f = await twoKeys();
     const written: string[] = [];

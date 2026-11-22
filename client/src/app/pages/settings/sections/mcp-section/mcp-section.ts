@@ -142,11 +142,24 @@ export class McpSectionComponent {
   /** True for a moment after Done took a key down (see DONE_PAUSE_MS): the key shown meanwhile cannot be taken down yet. */
   readonly doneHeld = signal(false);
   private donePause: ReturnType<typeof setTimeout> | undefined;
+  /**
+   * True for the moment after the last key was taken down, while the page behind its dialog
+   * takes neither a click nor a press of Enter or Space. The shield in the template is drawn
+   * by this and shieldKey reads it: one word for both, so that the page is never shielded
+   * longer from the pointer than from the keys.
+   */
+  readonly pageShielded = computed(() => this.doneHeld() && this.revealed() === null);
   /** When the key on screen came up (see DOUBLE_CLICK_MS). */
   private shownAt = 0;
+  /** True from a press of Enter or Space that is not the page's (see shieldKey) until a press that is. */
+  private pressSpent = false;
 
   constructor() {
     inject(DestroyRef).onDestroy(() => clearTimeout(this.donePause));
+    // At the window and on the way down: before anything in the page hears the key.
+    const shieldKey = (key: KeyboardEvent): void => this.shieldKey(key);
+    window.addEventListener('keydown', shieldKey, true);
+    inject(DestroyRef).onDestroy(() => window.removeEventListener('keydown', shieldKey, true));
     effect(() => {
       if (this.revealed()) this.shownAt = Date.now();
     });
@@ -220,6 +233,8 @@ export class McpSectionComponent {
     if (click instanceof MouseEvent && click.detail > 1 && Date.now() - this.shownAt < DOUBLE_CLICK_MS) return;
     if (this.doneHeld() || this.revealed() !== key) return;
     this.store.acknowledgeKey(key);
+    // The press that took the last key down has done its work: what it repeats is not the page's.
+    if (this.revealed() === null) this.pressSpent = true;
     this.doneHeld.set(true);
     clearTimeout(this.donePause);
     this.donePause = setTimeout(() => this.doneHeld.set(false), DONE_PAUSE_MS);
@@ -231,6 +246,23 @@ export class McpSectionComponent {
    */
   holdRepeat(key: KeyboardEvent): void {
     if (key.repeat && (key.key === 'Enter' || key.key === ' ')) key.preventDefault();
+  }
+
+  /**
+   * What the shield is to a click (mcp-section.html), for Enter and Space. When the last key's
+   * dialog closes, the focus goes back to what had it before the dialog came up — the button
+   * that asked for the rotation, a switch that saves on a press — and the second of two quick
+   * presses of Enter on Done would be that control's. For as long as the page is shielded
+   * (pageShielded) the key reaches nothing in it. A key held down is one press however long it
+   * is held: its repeats reach nothing either, past that moment as well.
+   */
+  private shieldKey(key: KeyboardEvent): void {
+    if (key.key !== 'Enter' && key.key !== ' ') return;
+    if (this.pageShielded()) this.pressSpent = true;
+    else if (!key.repeat) this.pressSpent = false;
+    if (!this.pressSpent) return;
+    key.preventDefault();
+    key.stopPropagation();
   }
 
   /** Leaving the editor drops what it holds; ask once when that is something. */
