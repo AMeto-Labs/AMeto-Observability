@@ -8389,28 +8389,37 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <item>The loop had FAILED: its task faulted, and the join rethrew that failure.</item>
     /// <item>The join itself could not be set up: the registration of its continuation ran out of memory past the owner
     /// builder's tries (<see cref="OwnerTaskMethodBuilder"/>). The loop, told to stop, was still running then — or the
-    /// join would not have suspended — and may be still: it is waited for here instead, as the join would have done,
-    /// polled (which allocates nothing) within the budget the teardown's waits share. A loop left running is not only a
-    /// matter of locks: a merge of the maintenance loop writes and deletes segment files, and nothing else in the
+    /// join would not have suspended — and may be still: it is waited for here instead — polled, which allocates
+    /// nothing — but, unlike the join, only within the budget the teardown's waits share. A loop left running is not only
+    /// a matter of locks: a merge of the maintenance loop writes and deletes segment files, and nothing else in the
     /// teardown waits for it. Past the budget the teardown goes on without the loop, which may then still run after
     /// <see cref="DisposeAsync"/> has returned. Going on leaves nothing locked: the teardown takes its locks only in
     /// methods of their own (see <see cref="DisposeCoreAsync"/>).</item>
     /// </list>
     /// Said at Error, told apart by how the loop's task ended: failed (with the loop's own failure, which the join's
-    /// registration may have hidden), ended, or still running. The line used to blame the loop on every road. Never throws.
+    /// registration may have hidden), ended, or still running. The line used to blame the loop on every road; a sink
+    /// that throws on it loses the line, not the teardown.
+    ///
+    /// <para>The poll blocks the teardown's thread: the thread the join's registration failed on, the caller's when the
+    /// join was the teardown's first suspension. Under a single-threaded synchronization context that is also where the
+    /// loop's own continuation is posted, and the poll then waits out the budget — there is none in an ASP.NET Core host.</para>
     /// </summary>
     private void LoopNotJoinedAtShutdown(Exception ex, Task loop, string name, long deadline)
     {
         if (!loop.IsCompleted)
         {
-            _onPollingForLoopForTest?.Invoke(name);
+            _onPollingForLoopForTest?.Invoke(name, deadline);
             while (!loop.IsCompleted && Environment.TickCount64 < deadline) Thread.Sleep(10);
         }
         try
         {
             if (loop.IsFaulted)
             {
-                var own = loop.Exception?.InnerException ?? ex;
+                // Read apart: Task.Exception builds a new AggregateException at every read, and one that ran out of
+                // memory here took the whole line with it.
+                Exception own = ex;
+                try { own = loop.Exception?.InnerException ?? ex; }
+                catch (Exception) { /* said with the join's failure */ }
                 if (ReferenceEquals(own, ex))
                     _logger.LogError(ex, "The {Loop} loop had failed — the teardown goes on", name);
                 else
@@ -8431,11 +8440,12 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     }
 
     /// <summary>
-    /// Test hook: called by the teardown, with the loop's name, when the join of a background loop could not be set up
-    /// and the loop is still running — just before it polls for the loop instead (<see cref="LoopNotJoinedAtShutdown"/>).
-    /// Null in production.
+    /// Test hook: called by the teardown, with the loop's name and the budget's deadline (on
+    /// <see cref="Environment.TickCount64"/>), when the join of a background loop could not be set up and the loop is
+    /// still running — just before it polls for the loop instead (<see cref="LoopNotJoinedAtShutdown"/>). Null in
+    /// production.
     /// </summary>
-    internal Action<string>? _onPollingForLoopForTest;
+    internal Action<string, long>? _onPollingForLoopForTest;
 
     /// <param name="order">
     /// Tier indices this segment will contain; null = the whole tier. The file name
