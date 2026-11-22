@@ -1,0 +1,244 @@
+<div class="m-cols">
+  <div class="m-main">
+    <app-section title="Field rules">
+      <span section-actions class="m-hint">Applied when the answer is written. Stored events and this UI stay as they are.</span>
+
+      <div class="m-row between">
+        <span class="m-row m-grow">
+          <div class="m-seg" role="group" aria-label="Masking mode">
+            <button type="button" [attr.aria-pressed]="mode() === 'standard'" (click)="setMode('standard')">Standard</button>
+            <button type="button" [attr.aria-pressed]="mode() === 'strict'" (click)="setMode('strict')">Strict</button>
+          </div>
+          <span class="m-sub m-el">{{ modeNote() }}</span>
+        </span>
+        <button type="button" class="btn primary m-fixed" (click)="addRule()">
+          <lucide-icon name="plus" [size]="13" />
+          Add rule
+        </button>
+      </div>
+
+      <div class="m-table" role="table" aria-label="Field rules">
+        <div class="m-hr cols" role="row">
+          <span role="columnheader">Field</span>
+          <span role="columnheader">Services</span>
+          <span role="columnheader">Action</span>
+          <span class="m-num" role="columnheader">Seen in 24 h</span>
+          <span role="columnheader" aria-label="Edit"></span>
+        </div>
+        @for (r of rows(); track r.rule.id) {
+          <div class="m-tr cols" role="row">
+            <span class="m-cd m-el" role="cell">{{ r.rule.field }}</span>
+            <span class="m-mut m-el" role="cell">{{ r.services }}</span>
+            <span role="cell"><span class="m-pill" [class]="r.tone">{{ r.action }}</span></span>
+            <span class="m-mut m-num" role="cell">{{ r.seen }}</span>
+            <span class="m-cell" role="cell">
+              <button type="button" class="btn-icon" [attr.aria-label]="'Edit the rule for ' + r.rule.field" title="Edit rule" (click)="editRule(r.rule)">
+                <lucide-icon name="pencil" [size]="12" />
+              </button>
+            </span>
+          </div>
+        } @empty {
+          <div class="m-empty">No field rules. In Standard mode only what the detectors find is hidden.</div>
+        }
+      </div>
+    </app-section>
+
+    <app-section title="Detectors">
+      <span class="m-sub">Looked for in every string: property values, the message template and exception text. They catch values that have no field name.</span>
+      <!-- Every switch waits while one is on its way: the change is sent as the whole list of
+           detectors, and two lists in flight would each undo the other's switch. -->
+      <div class="detectors">
+        @for (d of detectors(); track d.id) {
+          <div class="detector">
+            <span class="m-row tight m-grow">
+              <button type="button" class="m-sw" role="switch" [attr.aria-checked]="d.on" [attr.aria-label]="d.name"
+                      [disabled]="switchingDetector() !== null" (click)="toggleDetector(d.id, !d.on)"></button>
+              <span class="m-el">{{ d.name }}</span>
+            </span>
+            <span class="m-hint m-el">{{ d.note }}</span>
+          </div>
+        }
+      </div>
+      @if (detectorError(); as error) {
+        <span class="m-err" role="alert">{{ error }}</span>
+      }
+    </app-section>
+
+    <app-section title="Token">
+      <div class="m-row between">
+        <span class="m-row m-grow">
+          <span class="m-tok m-cd m-fixed">h:91c0e2aa5d17</span>
+          <span class="m-sub">HMAC-SHA256 with a server secret, 12 hex digits. A value hidden the same way always gives the same token, so the AI can match and search by it.</span>
+        </span>
+        <button type="button" class="btn m-fixed" (click)="confirmingRotate.set(true)">
+          <lucide-icon name="refresh-cw" [size]="13" />
+          Rotate secret
+        </button>
+      </div>
+      <span class="m-hint">The secret in use was created on {{ secretSince() }}.</span>
+    </app-section>
+  </div>
+
+  <div class="m-side side">
+    <app-section title="What the AI sees">
+      <select section-actions class="m-select" aria-label="Preview as" [ngModel]="previewAs()" (ngModelChange)="setPreviewAs($event)">
+        <option value="mode:standard">Standard mode</option>
+        <option value="mode:strict">Strict mode</option>
+        @for (p of store.profiles(); track p.id) {
+          <option [value]="p.id">as profile: {{ p.name }}</option>
+        }
+      </select>
+
+      <div class="m-row">
+        <!-- Enter while a preview is on its way asks again: the one on its way is abandoned. -->
+        <input class="field-input mono m-grow" aria-label="Filter that picks the event" placeholder="@service = 'payments-api' and @l = 'Error'"
+               [class.invalid]="previewErrorField() === 'filter'"
+               [attr.aria-invalid]="previewErrorField() === 'filter' || null"
+               [attr.aria-describedby]="previewErrorField() === 'filter' ? 'mcp-preview-error' : null"
+               [ngModel]="probe()" (ngModelChange)="setProbe($event)" (keydown.enter)="runPreview()" />
+        <button type="button" class="btn m-fixed" [disabled]="previewing()" (click)="runPreview()">
+          <lucide-icon [name]="previewing() ? 'loader-circle' : 'search'" [size]="13" />
+          Pick event
+        </button>
+      </div>
+
+      @if (previewError(); as error) {
+        <span class="m-err" role="alert" id="mcp-preview-error">{{ error }}</span>
+      } @else if (preview(); as p) {
+        @if (p.found) {
+          <div class="m-fld">
+            <span class="m-lbl">Stored event</span>
+            <!-- A name is marked like a value where it is one: a property whose name held a value
+                 leaves under its token. -->
+            <div class="m-code kv tall">
+              @for (line of storedLines(); track line.key) {
+                <div class="kv-line">
+                  <span class="m-dim kv-key" [attr.title]="line.renamed ? renamedNote : null">@for (part of line.name; track $index) {<span [class.m-raw]="part.kind === 'raw'">{{ part.text }}</span>}</span>
+                  <span class="kv-value">@for (part of line.parts; track $index) {<span [class.m-raw]="part.kind === 'raw'">{{ part.text }}</span>}</span>
+                </div>
+              }
+            </div>
+          </div>
+          <div class="m-fld">
+            <span class="m-lbl">Sent to the AI</span>
+            <div class="m-code kv tall">
+              @for (line of sentLines(); track line.key) {
+                <div class="kv-line">
+                  <span class="m-dim kv-key" [attr.title]="line.renamed ? renamedNote : null">@for (part of line.name; track $index) {<span [class.m-tok]="part.kind === 'token'">{{ part.text }}</span>}</span>
+                  <span class="kv-value" [class.m-dim]="line.removed">@for (part of line.parts; track $index) {<span [class.m-tok]="part.kind === 'token'">{{ part.text }}</span>}</span>
+                </div>
+              }
+            </div>
+          </div>
+          <span class="m-sub">{{ previewSentence() }} The message is not rendered: the AI gets the template and the properties.</span>
+        } @else {
+          <div class="m-empty">No event of the last 24 hours matches this filter.</div>
+        }
+      } @else {
+        <span class="m-hint">Looking for the most recent event…</span>
+      }
+    </app-section>
+  </div>
+</div>
+
+<app-modal [open]="draft() !== null" [title]="draft()?.id ? 'Edit field rule' : 'Add field rule'" [dismissable]="!savingRule()" (close)="closeDraft()">
+  @if (draft(); as d) {
+    <label class="m-fld">
+      <span class="m-lbl">Field</span>
+      <input class="field-input mono" placeholder="CardNumber" maxlength="200"
+             [class.invalid]="draftErrorField() === 'field'"
+             [attr.aria-invalid]="draftErrorField() === 'field' || null"
+             [attr.aria-describedby]="draftErrorField() === 'field' ? 'mcp-rule-error' : null"
+             [ngModel]="d.field" (ngModelChange)="patchDraft({ field: $event })" />
+      <span class="m-hint">A property path as a filter spells it: Customer.Iin. A name without a dot matches the field at any depth; * stands for any run of characters, as in *Password*.</span>
+    </label>
+
+    <div class="m-fld">
+      <span class="m-lbl">Services</span>
+      <div class="m-row tight wrap">
+        @for (s of d.services; track s) {
+          <span class="m-chip m-cd">
+            {{ s }}
+            <button type="button" class="m-chip-x" [attr.aria-label]="'Remove ' + s" (click)="removeDraftService(s)">
+              <lucide-icon name="x" [size]="11" />
+            </button>
+          </span>
+        } @empty {
+          <span class="m-chip">All services</span>
+        }
+        <span class="adder">
+          <input class="field-input service-input" placeholder="Only in a service" list="mcp-rule-services" aria-label="Add a service"
+                 [ngModel]="draftService()" (ngModelChange)="draftService.set($event)"
+                 (keydown.enter)="addDraftService(); $event.preventDefault()" />
+          <datalist id="mcp-rule-services">
+            @for (s of serviceOptions(); track s) { <option [value]="s"></option> }
+          </datalist>
+          <button type="button" class="btn sm" [disabled]="!draftService().trim()" (click)="addDraftService()">
+            <lucide-icon name="plus" [size]="12" />
+            Add
+          </button>
+        </span>
+      </div>
+    </div>
+
+    <label class="m-fld">
+      <span class="m-lbl">Action</span>
+      <select class="m-select" [ngModel]="d.action" (ngModelChange)="patchDraft({ action: $event })">
+        @for (a of actions; track a.id) {
+          <option [value]="a.id">{{ a.label }}</option>
+        }
+      </select>
+      <span class="m-hint">{{ draftAction().does }} Where two rules match one field, the more protective wins.</span>
+    </label>
+
+    @if (draftError(); as error) {
+      <span class="m-err" role="alert" id="mcp-rule-error">{{ error }}</span>
+    }
+
+    @if (confirmingDelete()) {
+      <!-- The second step of "Delete rule": asked once, here, before a hidden field stops being hidden. -->
+      <span class="m-sub" id="mcp-rule-delete-note">Delete the rule? {{ deleteNote() }}</span>
+      <div class="m-actions">
+        <button #keepRule type="button" class="btn" aria-describedby="mcp-rule-delete-note"
+                [disabled]="savingRule()" (click)="keepRuleAfterAll()">Keep rule</button>
+        <button type="button" class="btn danger" aria-describedby="mcp-rule-delete-note"
+                [disabled]="savingRule()" (click)="deleteRule()">
+          <lucide-icon [name]="savingRule() ? 'loader-circle' : 'trash-2'" [size]="13" />
+          Delete rule
+        </button>
+      </div>
+    } @else {
+      <div class="m-row between">
+        @if (d.id) {
+          <button #askDelete type="button" class="btn danger" [disabled]="savingRule()" (click)="confirmingDelete.set(true)">
+            <lucide-icon name="trash-2" [size]="13" />
+            Delete rule
+          </button>
+        } @else {
+          <span></span>
+        }
+        <span class="m-row tight">
+          <button type="button" class="btn" [disabled]="savingRule()" (click)="closeDraft()">Cancel</button>
+          <button type="button" class="btn primary" [disabled]="savingRule()" (click)="saveRule()">
+            <lucide-icon [name]="savingRule() ? 'loader-circle' : 'save'" [size]="13" />
+            {{ savingRule() ? 'Saving…' : 'Save' }}
+          </button>
+        </span>
+      </div>
+    }
+  }
+</app-modal>
+
+<app-modal [open]="confirmingRotate()" title="Rotate the token secret?" [dismissable]="!rotating()" (close)="confirmingRotate.set(false)">
+  <span class="m-sub">Every token changes with the secret. A token from an earlier answer will match nothing, so an assistant in the middle of an investigation has to search again.</span>
+  @if (rotateError(); as error) {
+    <span class="m-err" role="alert">{{ error }}</span>
+  }
+  <div class="m-actions">
+    <button type="button" class="btn" [disabled]="rotating()" (click)="confirmingRotate.set(false)">Cancel</button>
+    <button type="button" class="btn danger" [disabled]="rotating()" (click)="rotateSecret()">
+      <lucide-icon [name]="rotating() ? 'loader-circle' : 'refresh-cw'" [size]="13" />
+      Rotate secret
+    </button>
+  </div>
+</app-modal>

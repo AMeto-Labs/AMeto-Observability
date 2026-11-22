@@ -950,10 +950,16 @@ public sealed class IngestionEndpoint
     /// </summary>
     internal const int MaxServiceNameBytes = 1024;
 
-    /// <summary><paramref name="utf8"/> cut to <see cref="MaxServiceNameBytes"/>, at the start of the character the cut would split.</summary>
+    /// <summary>
+    /// The name an ingested event is filed under: <paramref name="utf8"/> cut to
+    /// <see cref="MaxServiceNameBytes"/>, at the start of the character the cut would split — and
+    /// never a name the server keeps for its own records (<see cref="ReservedServices"/>). Every
+    /// road an event's service takes into a batch comes through here, which is what makes that
+    /// name the server's alone.
+    /// </summary>
     internal static ReadOnlySpan<byte> ServiceName(ReadOnlySpan<byte> utf8)
     {
-        if (utf8.Length <= MaxServiceNameBytes) return utf8;
+        if (utf8.Length <= MaxServiceNameBytes) return ReservedServices.ForIngestion(utf8);
         int cut = MaxServiceNameBytes;
         // On a continuation byte: back to its lead — three at most, the most a character has. A longer
         // run is not UTF-8, and the decode makes U+FFFD of it whatever the cut.

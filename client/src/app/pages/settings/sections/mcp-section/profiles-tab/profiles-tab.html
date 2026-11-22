@@ -1,0 +1,230 @@
+<div class="m-cols">
+  <div class="m-main">
+    <app-section title="AI profiles">
+      <div class="m-row between">
+        <span class="m-sub">A profile is a key plus what that key may do: tools, services, masking and limits.</span>
+        <button type="button" class="btn primary m-fixed" (click)="startNew()">
+          <lucide-icon name="plus" [size]="13" />
+          New profile
+        </button>
+      </div>
+
+      <div class="m-table" role="table" aria-label="AI profiles">
+        <div class="m-hr cols" role="row">
+          <span role="columnheader">Profile</span>
+          <span role="columnheader">Key</span>
+          <span role="columnheader">Tools</span>
+          <span role="columnheader">Masking</span>
+          <span role="columnheader">Last call</span>
+        </div>
+        <!-- One stop for the Tab key; the arrows walk the rows, and the row walked to is picked. -->
+        @for (r of rows(); track r.profile.id; let i = $index) {
+          <div
+            class="m-tr cols tall pick"
+            role="row"
+            [attr.tabindex]="r.profile.id === tabStop() ? 0 : -1"
+            [class.sel]="r.profile.id === selectedId()"
+            [attr.aria-selected]="r.profile.id === selectedId()"
+            (click)="pick(r.profile.id)"
+            (keydown)="onRowKey($event, i)"
+          >
+            <span class="m-two-lines" role="cell">
+              <span class="m-el m-strong">{{ r.profile.name }}</span>
+              <span class="m-hint m-el">{{ r.note }}</span>
+            </span>
+            <span class="m-cd m-mut" role="cell">{{ r.profile.keyPreview }}</span>
+            <span class="m-mut m-el" role="cell">{{ r.tools }}</span>
+            <span role="cell"><span class="m-pill">{{ r.masking }}</span></span>
+            <span class="m-mut" role="cell">{{ r.last }}</span>
+          </div>
+        } @empty {
+          <div class="m-empty">No profiles yet. Without one the endpoint answers nobody: create a profile and give its key to a client.</div>
+        }
+      </div>
+    </app-section>
+  </div>
+
+  @if (selectedId() !== null) {
+    <div class="m-side side">
+      <section class="section card" [attr.aria-label]="isNew() ? 'New profile' : 'Profile ' + form().name">
+        <div class="m-row between">
+          <span class="section-title m-el">{{ isNew() ? 'New profile' : (selected()?.name ?? '') }}</span>
+          <span class="m-hint m-fixed">{{ created() }}</span>
+        </div>
+
+        <label class="m-fld">
+          <span class="m-lbl">Name</span>
+          <input class="field-input" placeholder="Payments team" maxlength="100"
+                 [class.invalid]="invalid().name"
+                 [attr.aria-invalid]="invalid().name || null" [attr.aria-describedby]="describes('name')"
+                 [ngModel]="form().name" (ngModelChange)="patch({ name: $event })" />
+        </label>
+
+        <label class="m-fld">
+          <span class="m-lbl">Description</span>
+          <input class="field-input" placeholder="Who or what uses this key?"
+                 [ngModel]="form().description" (ngModelChange)="patch({ description: $event })" />
+        </label>
+
+        @if (!isNew()) {
+          <div class="m-fld">
+            <span class="m-lbl">Key</span>
+            <div class="m-row">
+              <span class="m-inp m-cd m-mut m-grow">{{ selected()?.keyPreview }}</span>
+              <button type="button" class="btn" (click)="confirming.set('rotate')">
+                <lucide-icon name="refresh-cw" [size]="13" />
+                Rotate
+              </button>
+            </div>
+            <span class="m-hint">Shown in full only once, when created or rotated.</span>
+          </div>
+        }
+
+        <div class="m-fld">
+          <span class="m-lbl">Tools</span>
+          <div>
+            <div class="m-seg" role="group" aria-label="Tools">
+              <button type="button" [attr.aria-pressed]="form().toolsMode === 'builtInAndPublished'"
+                      (click)="patch({ toolsMode: 'builtInAndPublished' })">Built-in and published</button>
+              <button type="button" [attr.aria-pressed]="form().toolsMode === 'publishedOnly'"
+                      (click)="patch({ toolsMode: 'publishedOnly' })">Published only</button>
+            </div>
+          </div>
+          <div class="tool-grid">
+            @for (t of toolSwitches(); track t.key) {
+              <span class="m-row tight" [class.blocked]="t.blocked" [attr.title]="t.blocked">
+                <button type="button" class="m-sw" role="switch"
+                        [attr.aria-checked]="t.on && !t.blocked" [attr.aria-label]="t.name"
+                        [disabled]="!!t.blocked" (click)="toggleTool(t)"></button>
+                <span class="m-cd m-el">{{ t.name }}</span>
+                @if (t.draft) { <span class="m-hint m-fixed">draft</span> }
+              </span>
+            }
+          </div>
+        </div>
+
+        <div class="m-fld">
+          <span class="m-lbl">Services</span>
+          <div class="m-row tight wrap">
+            @for (s of form().services; track s) {
+              <span class="m-chip m-cd">
+                {{ s }}
+                <button type="button" class="m-chip-x" [attr.aria-label]="'Remove ' + s" (click)="removeService(s)">
+                  <lucide-icon name="x" [size]="11" />
+                </button>
+              </span>
+            } @empty {
+              <span class="m-chip">All services</span>
+            }
+            <span class="adder">
+              <input class="field-input service-input" placeholder="Add a service" list="mcp-profile-services" aria-label="Add a service"
+                     [ngModel]="serviceDraft()" (ngModelChange)="serviceDraft.set($event)"
+                     (keydown.enter)="addService(); $event.preventDefault()" />
+              <datalist id="mcp-profile-services">
+                @for (s of serviceOptions(); track s) { <option [value]="s"></option> }
+              </datalist>
+              <button type="button" class="btn sm" [disabled]="!serviceDraft().trim()" (click)="addService()">
+                <lucide-icon name="plus" [size]="12" />
+                Add
+              </button>
+            </span>
+          </div>
+          <span class="m-hint">Events of other services are neither returned nor counted.</span>
+        </div>
+
+        <div class="m-fld">
+          <span class="m-lbl">Masking</span>
+          <div>
+            <div class="m-seg" role="group" aria-label="Masking">
+              <button type="button" [attr.aria-pressed]="form().maskingMode === 'standard'"
+                      (click)="patch({ maskingMode: 'standard' })">Standard</button>
+              <button type="button" [attr.aria-pressed]="form().maskingMode === 'strict'"
+                      (click)="patch({ maskingMode: 'strict' })">Strict</button>
+            </div>
+          </div>
+          <span class="m-hint">Standard hashes the listed fields and what detectors find. Strict hashes everything except allowed fields.</span>
+        </div>
+
+        <div class="m-row between">
+          <span class="m-two-lines">
+            <span class="m-lbl">Free-form filters</span>
+            <span class="m-hint">Off: the AI can only call published tools with their parameters.</span>
+          </span>
+          <button type="button" class="m-sw" role="switch" aria-label="Free-form filters"
+                  [attr.aria-checked]="form().freeFilters" (click)="patch({ freeFilters: !form().freeFilters })"></button>
+        </div>
+
+        <div class="limits">
+          <label class="m-fld">
+            <span class="m-lbl">Events per call</span>
+            <input class="field-input" type="number" min="1" max="5000"
+                   [class.invalid]="invalid().maxEvents"
+                   [attr.aria-invalid]="invalid().maxEvents || null" [attr.aria-describedby]="describes('maxEvents')"
+                   [ngModel]="form().maxEvents" (ngModelChange)="patch({ maxEvents: asCount($event) })" />
+          </label>
+          <label class="m-fld">
+            <span class="m-lbl">Time window</span>
+            <input class="field-input" placeholder="24h"
+                   [class.invalid]="invalid().window"
+                   [attr.aria-invalid]="invalid().window || null" [attr.aria-describedby]="describes('maxWindowMinutes')"
+                   [ngModel]="form().window" (ngModelChange)="patch({ window: $event })" />
+          </label>
+          <label class="m-fld">
+            <span class="m-lbl">Calls per minute</span>
+            <input class="field-input" type="number" min="1" max="6000"
+                   [class.invalid]="invalid().callsPerMinute"
+                   [attr.aria-invalid]="invalid().callsPerMinute || null" [attr.aria-describedby]="describes('callsPerMinute')"
+                   [ngModel]="form().callsPerMinute" (ngModelChange)="patch({ callsPerMinute: asCount($event) })" />
+          </label>
+        </div>
+
+        @if (error(); as message) {
+          <span class="m-err" role="alert" [id]="errorId">{{ message }}</span>
+        }
+
+        <div class="m-row between">
+          @if (isNew()) {
+            <span></span>
+          } @else {
+            <button type="button" class="btn danger" [disabled]="saving()" (click)="confirming.set('delete')">
+              <lucide-icon name="trash-2" [size]="13" />
+              Delete profile
+            </button>
+          }
+          <span class="m-row tight">
+            <button type="button" class="btn" [disabled]="saving() || (!dirty() && !isNew())" (click)="cancel()">Cancel</button>
+            <button type="button" class="btn primary" [disabled]="saving() || (!dirty() && !isNew())" (click)="save()">
+              <lucide-icon [name]="saving() ? 'loader-circle' : (isNew() ? 'plus' : 'save')" [size]="13" />
+              {{ saving() ? 'Saving…' : (isNew() ? 'Create profile' : 'Save') }}
+            </button>
+          </span>
+        </div>
+      </section>
+    </div>
+  }
+</div>
+
+<!-- Neither question can be put away while its answer is on its way: the card under it must
+     still be the profile it is about when that answer arrives. The key a rotation brings is
+     shown by the section, over this question and any other (see mcp-section.html). -->
+<app-modal [open]="confirming() === 'rotate'" title="Rotate the key?" [dismissable]="!working()" (close)="confirming.set(null)">
+  <span class="m-sub">The current key of “{{ selected()?.name }}” stops working at once. Every client that uses it has to be given the new one.</span>
+  <div class="m-actions">
+    <button type="button" class="btn" [disabled]="working()" (click)="confirming.set(null)">Cancel</button>
+    <button type="button" class="btn primary" [disabled]="working()" (click)="rotate()">
+      <lucide-icon [name]="working() ? 'loader-circle' : 'refresh-cw'" [size]="13" />
+      Rotate key
+    </button>
+  </div>
+</app-modal>
+
+<app-modal [open]="confirming() === 'delete'" title="Delete the profile?" [dismissable]="!working()" (close)="confirming.set(null)">
+  <span class="m-sub">“{{ selected()?.name }}” and its key are removed, and its access ends at once. The record of its calls stays in the log.</span>
+  <div class="m-actions">
+    <button type="button" class="btn" [disabled]="working()" (click)="confirming.set(null)">Cancel</button>
+    <button type="button" class="btn danger" [disabled]="working()" (click)="remove()">
+      <lucide-icon [name]="working() ? 'loader-circle' : 'trash-2'" [size]="13" />
+      Delete profile
+    </button>
+  </div>
+</app-modal>

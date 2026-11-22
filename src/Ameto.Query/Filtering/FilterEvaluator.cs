@@ -495,8 +495,9 @@ public static class FilterEvaluator
 
             if (current is IList list && current is not byte[])
             {
-                if (!int.TryParse(rawSeg, System.Globalization.NumberStyles.Integer,
-                        System.Globalization.CultureInfo.InvariantCulture, out int idx))
+                // One definition of "this segment is a position", shared with everything that
+                // has to know which paths reach a list's elements (see TryReadPosition).
+                if (!PropertyPath.TryReadPosition(rawSeg, out int idx))
                     return null;
                 if (idx < 0 || idx >= list.Count) return null;
                 current = list[idx];

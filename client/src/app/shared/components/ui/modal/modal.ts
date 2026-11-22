@@ -56,6 +56,8 @@ class OpenDialogs {
 export class ModalComponent {
   readonly open = input<boolean>(false);
   readonly title = input<string>('');
+  /** The title is its own tooltip too — for a dialog that may show less than the whole of it. */
+  readonly titleTooltip = input(false, { transform: booleanAttribute });
   readonly dismissable = input(true, { transform: booleanAttribute });
   /** For a whole panel rather than a form (log details): up to 1100px wide, full height. */
   readonly wide = input(false, { transform: booleanAttribute });
