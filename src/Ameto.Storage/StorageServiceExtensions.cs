@@ -109,7 +109,13 @@ public sealed class CountsSummaryBackfillService : BackgroundService
     {
         try { await _storage.CatalogLoaded.WaitAsync(stoppingToken); }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
-        catch (Exception) { /* a faulted scan has ended; the engine says why, and sweeps nothing after it */ }
+        catch (Exception)
+        {
+            // A faulted scan has ended; the engine says why, and sweeps nothing after it. So has a scan
+            // the engine's own teardown stopped (it ends Canceled), when the engine is disposed before
+            // this service is told to stop: its passes sweep nothing either, and write nothing once
+            // that teardown has closed counts.db.
+        }
 
         try { await Task.Delay(_firstPassDelay, stoppingToken); }
         catch (OperationCanceledException) { return; }

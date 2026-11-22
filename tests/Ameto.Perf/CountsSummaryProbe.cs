@@ -88,9 +88,10 @@ public sealed class CountsSummaryProbe
         }
         finally
         {
-            // Two stores of 180 000 events each. Not a bare delete under an empty catch: the reopened
-            // engines scan their catalogs on a task their dispose does not wait for, and a fact that
-            // ends early — a failed assertion — meets that scan with one segment still open.
+            // Two stores of 180 000 events each. Not a bare delete under an empty catch: a delete
+            // that fails here says so. (It used to meet the reopened engines' catalog scans — a task
+            // their dispose returned without, one segment still open — whenever a fact ended early;
+            // the engine's teardown waits for that scan now.)
             TestDataDirectory.Delete(root);
         }
     }
