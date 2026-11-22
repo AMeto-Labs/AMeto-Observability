@@ -23,9 +23,10 @@ namespace Ameto.Storage.Tests;
 /// write from another thread then blocked for good, and so did a reader, and anything else that takes one
 /// of those locks.
 ///
-/// <para>The three sections are methods of their own now, whose exits are real finallys: the teardown goes
-/// on past such a join to its end and leaves nothing locked, and its line says that it could not wait for
-/// the loop, not that the loop had failed.</para>
+/// <para>The three sections are methods of their own now, whose exits are real finallys, so nothing is left
+/// locked. The teardown waits for a loop it could not join by polling, within its budget, and goes on to its
+/// end; its line says that the wait could not be set up, and whether the loop then ended — not that the loop
+/// had failed.</para>
 ///
 /// <para>How a fact reaches one join and no other. The target loop and every loop joined before it are held
 /// in their rounds at seams, so each of those joins suspends, and the first loop still running is the one
@@ -51,17 +52,25 @@ public sealed class ShutdownLoopJoinTests : IDisposable
 
     /// <summary>
     /// The join of each loop, its registration failed with the loop still in its round and nothing in the
-    /// live tier — no final flush comes to resume the method. The teardown goes on to its end: it returns
-    /// with no exception and the store Closed, a write is refused and a reader turned away, each on a thread
-    /// of its own and within the guard, and the retire list's lock is free. Its line says the join could
-    /// not be set up; nothing says the loop had failed.
+    /// live tier — no final flush comes to resume the method. The teardown polls for the loop instead. One
+    /// that ends meanwhile (let go 250 ms after the poll begins: a pause that can only give an engine that does
+    /// not wait the time to return first) has ended when the teardown returns; one that does not is left
+    /// behind once the budget is spent. Either way the teardown goes on to its end: it returns with no
+    /// exception and the store Closed, a write is refused and a reader turned away, each on a thread of its own
+    /// and within the guard, the retire list's lock is free, and the live WAL and the counts store are closed.
+    /// Its line says the join could not be set up, and how the loop ended; nothing says the loop had failed.
     /// </summary>
     [Theory]
-    [InlineData(0, "hot-tier age")]
-    [InlineData(1, "WAL flush")]
-    [InlineData(2, "maintenance")]
-    [InlineData(3, "despill")]
-    public async Task A_join_that_cannot_be_set_up_leaves_nothing_locked_and_the_teardown_goes_on_to_its_end(int loop, string named)
+    [InlineData(0, "hot-tier age", true)]
+    [InlineData(1, "WAL flush",    true)]
+    [InlineData(2, "maintenance",  true)]
+    [InlineData(3, "despill",      true)]
+    [InlineData(0, "hot-tier age", false)]
+    [InlineData(1, "WAL flush",    false)]
+    [InlineData(2, "maintenance",  false)]
+    [InlineData(3, "despill",      false)]
+    public async Task A_join_that_cannot_be_set_up_leaves_nothing_locked_and_the_teardown_goes_on_to_its_end(
+        int loop, string named, bool endsWhilePolled)
     {
         string dir  = NewDir();
         var log     = new CapturingLogger();
@@ -86,6 +95,16 @@ public sealed class ShutdownLoopJoinTests : IDisposable
         engine._beforeLoopWaitForTest       = Hold;                       // the age, WAL and maintenance loops, between two rounds
         engine._despillLoopIterationForTest = () => Hold("despill");     // the despill loop, at the top of a round
         var loops = engine.BackgroundLoopsForTest;
+
+        // The teardown polls for the loop it could not join: let go a while into the poll, or never (the budget runs out).
+        int polled = 0;
+        engine._onPollingForLoopForTest = at =>
+        {
+            if (at != named) return;
+            Interlocked.Increment(ref polled);
+            if (endsWhilePolled) _ = Task.Delay(250).ContinueWith(_ => release[loop].Set(), TaskScheduler.Default);
+        };
+        if (!endsWhilePolled) engine._shutdownWaitBudget = TimeSpan.FromMilliseconds(200);
 
         Task? dispose = null;
         try
@@ -123,8 +142,13 @@ public sealed class ShutdownLoopJoinTests : IDisposable
                 OwnerAsync.LaterSuspensionFailsForTest.Value = null;
             }
 
+            // Whether the loop had ended, read as the teardown returns.
+            var loopEndedAtReturn = dispose.ContinueWith(_ => loops[loop].IsCompleted, CancellationToken.None,
+                                                         TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             await dispose.WaitAsync(HangGuard);   // rethrows what the teardown threw: nothing, it goes on
             Assert.Equal(1, Volatile.Read(ref failed));   // setup: the target's join was a later suspension, and the seam failed it
+            Assert.Equal(1, Volatile.Read(ref polled));
+            Assert.Equal(endsWhilePolled, await loopEndedAtReturn);   // waited for; past the budget, left behind
             Assert.Equal(QueryAvailability.Closed, engine.Availability);
 
             // Nothing is left locked.
@@ -132,11 +156,15 @@ public sealed class ShutdownLoopJoinTests : IDisposable
             Assert.IsType<ObjectDisposedException>(OnAThreadOfItsOwn(
                 () => Record.Exception(() => engine.OpenHotTierReader().Dispose()), "A reader (the frozen-tier lock)"));   // snapshots are closed
             Assert.True(OnAThreadOfItsOwn(() => { lock (engine.RetireLockForTest) return true; }, "The retire list's lock"));
+            // And what the teardown closes last is closed.
+            Assert.True(IsDisposed(engine.LiveWalForTest!), "the live WAL is still open");
+            Assert.True(IsDisposed(engine.CountsStoreForTest!), "the counts store is still open");
 
             // And the line says what happened.
             var lines = log.Snapshot();
             Assert.Contains(lines, l => l.Level == MsLogLevel.Error
-                                        && l.Message.Contains($"could not wait for the {named} loop", StringComparison.Ordinal));
+                                        && l.Message.Contains($"could not set up its wait for the {named} loop", StringComparison.Ordinal)
+                                        && l.Message.Contains(endsWhilePolled ? "has ended since" : "had not ended after", StringComparison.Ordinal));
             Assert.DoesNotContain(lines, static l => l.Message.Contains("had failed", StringComparison.Ordinal));
         }
         finally
@@ -181,6 +209,10 @@ public sealed class ShutdownLoopJoinTests : IDisposable
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static bool IsTeardown(Type stateMachine) => stateMachine.Name.Contains("<DisposeCoreAsync>", StringComparison.Ordinal);
+
+    /// <summary>Whether a write-ahead log or a counts store has been disposed: its own flag, which neither says out loud.</summary>
+    private static bool IsDisposed(object disposable) =>
+        (bool)disposable.GetType().GetField("_disposed", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(disposable)!;
 
     /// <summary>
     /// Runs <paramref name="probe"/> on a thread of its own and returns what it returned; the fact fails if it does

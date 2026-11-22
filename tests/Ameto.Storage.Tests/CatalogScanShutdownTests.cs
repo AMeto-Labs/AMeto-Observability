@@ -667,9 +667,9 @@ public sealed class CatalogScanShutdownTests : IDisposable
     /// the writer fence and two lock statements, whose exits were among them while they were in the
     /// teardown's own body (they are methods of their own now: <see cref="ShutdownLoopJoinTests"/>).
     /// With nothing in the live tier no final flush came to put that right, the teardown reported the
-    /// store closed, and a write after it blocked for good where it should be answered. So the
-    /// failure ends the teardown, as it does at the <c>CancelAsync</c> that begins it, and nothing is
-    /// left locked.
+    /// store closed, and a write after it blocked for good where it should be answered. The failure
+    /// still ends the teardown there, as at the <c>CancelAsync</c> that begins it (#173's choice; see
+    /// the comment at the wait), and nothing is left locked.
     ///
     /// <para>The seam fails the teardown's first later suspension on a configured task awaiter,
     /// which is the wait for the scan. THE ENGINE IS LEFT HALF TORN DOWN — the teardown is claimed,

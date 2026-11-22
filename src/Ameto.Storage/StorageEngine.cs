@@ -298,8 +298,8 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// Test hook: the token the teardown cancels — the constructor's copy, which still answers after
-    /// the teardown has disposed its source. A callback a test registers on it runs inside the
-    /// teardown's <c>CancelAsync</c>.
+    /// the teardown has disposed its source. A callback a test registers on it is run by the
+    /// teardown's <c>CancelAsync</c>, on a pool thread, and that task completes only once it returns.
     /// </summary>
     internal CancellationToken ShutdownTokenForTest => _shutdown;
 
@@ -8384,26 +8384,58 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
     /// <summary>
     /// The teardown's join of a background loop threw something other than the loop's cancellation, and the teardown
-    /// goes on to its final flush either way. Two roads, told apart by the loop's task: the loop had FAILED — its task
-    /// faulted, and the join rethrew that — or the join itself could not be set up: the registration of its continuation
-    /// ran out of memory past the owner builder's tries (<see cref="OwnerTaskMethodBuilder"/>), the loop still in its
-    /// round. On that road the loop, told to stop, ends at its next check, maybe after the teardown has returned; going
-    /// on is safe because the teardown takes its locks only in methods of their own (see <see cref="DisposeCoreAsync"/>).
-    /// The line used to blame the loop on both. Said at Error; never throws.
+    /// goes on to its final flush either way. Two roads:
+    /// <list type="bullet">
+    /// <item>The loop had FAILED: its task faulted, and the join rethrew that failure.</item>
+    /// <item>The join itself could not be set up: the registration of its continuation ran out of memory past the owner
+    /// builder's tries (<see cref="OwnerTaskMethodBuilder"/>). The loop, told to stop, was still running then — or the
+    /// join would not have suspended — and may be still: it is waited for here instead, as the join would have done,
+    /// polled (which allocates nothing) within the budget the teardown's waits share. A loop left running is not only a
+    /// matter of locks: a merge of the maintenance loop writes and deletes segment files, and nothing else in the
+    /// teardown waits for it. Past the budget the teardown goes on without the loop, which may then still run after
+    /// <see cref="DisposeAsync"/> has returned. Going on leaves nothing locked: the teardown takes its locks only in
+    /// methods of their own (see <see cref="DisposeCoreAsync"/>).</item>
+    /// </list>
+    /// Said at Error, told apart by how the loop's task ended: failed (with the loop's own failure, which the join's
+    /// registration may have hidden), ended, or still running. The line used to blame the loop on every road. Never throws.
     /// </summary>
-    private void LoopNotJoinedAtShutdown(Exception ex, Task loop, string name)
+    private void LoopNotJoinedAtShutdown(Exception ex, Task loop, string name, long deadline)
     {
+        if (!loop.IsCompleted)
+        {
+            _onPollingForLoopForTest?.Invoke(name);
+            while (!loop.IsCompleted && Environment.TickCount64 < deadline) Thread.Sleep(10);
+        }
         try
         {
             if (loop.IsFaulted)
-                _logger.LogError(ex, "The {Loop} loop had failed before shutdown — the teardown goes on", name);
+            {
+                var own = loop.Exception?.InnerException ?? ex;
+                if (ReferenceEquals(own, ex))
+                    _logger.LogError(ex, "The {Loop} loop had failed — the teardown goes on", name);
+                else
+                    _logger.LogError(own, "The {Loop} loop had failed — the teardown goes on. Shutdown could not set up its wait " +
+                                          "for the loop either: {JoinFailure}", name, ex.Message);
+            }
+            else if (loop.IsCompleted)
+                _logger.LogError(ex,
+                    "Shutdown could not set up its wait for the {Loop} loop; the loop, told to stop, has ended since, and the " +
+                    "teardown goes on", name);
             else
                 _logger.LogError(ex,
-                    "Shutdown could not wait for the {Loop} loop: the wait could not be set up. The loop has been told to stop " +
-                    "and ends at its next check, maybe after the teardown has returned; the teardown goes on without it", name);
+                    "Shutdown could not set up its wait for the {Loop} loop, and the loop, told to stop, had not ended after " +
+                    "{Budget}s. The teardown goes on without it: the loop ends at its next check, maybe after the teardown has " +
+                    "returned", name, _shutdownWaitBudget.TotalSeconds);
         }
         catch (Exception) { /* the line is lost; the teardown is not */ }
     }
+
+    /// <summary>
+    /// Test hook: called by the teardown, with the loop's name, when the join of a background loop could not be set up
+    /// and the loop is still running — just before it polls for the loop instead (<see cref="LoopNotJoinedAtShutdown"/>).
+    /// Null in production.
+    /// </summary>
+    internal Action<string>? _onPollingForLoopForTest;
 
     /// <param name="order">
     /// Tier indices this segment will contain; null = the whole tier. The file name
@@ -8483,19 +8515,20 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // A loop that died of anything else must not stop the teardown here, before the final flush
         // (round-5 review L-3: the WAL loop's own warning, thrown, ended it, and this await rethrew it).
         // Nor a join that could not be set up — its registration out of memory, the loop still in its
-        // round: the line tells the two apart (LoopNotJoinedAtShutdown), and the teardown goes on.
+        // round: the loop is polled for instead, within the budget, the line tells the roads apart
+        // (LoopNotJoinedAtShutdown), and the teardown goes on.
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _flushLoop, "hot-tier age"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _flushLoop, "hot-tier age", deadline); }
         try { await _walFlushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _walFlushLoop, "WAL flush"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _walFlushLoop, "WAL flush", deadline); }
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _maintenanceLoop, "maintenance"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _maintenanceLoop, "maintenance", deadline); }
         // The despill loop: cancellation ends its wait at once. A despill in its heavy phase is
         // counted like a flush and waited for below; one that had not reached it leaves its file
         // for the next start, as a loop that died anyway (it survives its own failures now) leaves
@@ -8503,7 +8536,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         try { await _despillLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _despillLoop, "despill"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _despillLoop, "despill", deadline); }
         // The boot catalog scan. The cancellation above stops it at its next file — or ends the hold
         // of one a test never released — and it is waited for here: once this teardown has returned,
         // no task of this engine reads the segments directory, so a host may remove it, or open a
