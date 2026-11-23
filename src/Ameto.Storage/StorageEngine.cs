@@ -290,6 +290,22 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// </summary>
     internal Action? _onWaitingForCatalogScan;
 
+    /// <summary>
+    /// Test hook: the four background loops, in the order <see cref="DisposeCoreAsync"/> joins them —
+    /// the hot-tier age loop, the WAL flush loop, the maintenance loop and the despill loop.
+    /// </summary>
+    internal Task[] BackgroundLoopsForTest => [_flushLoop, _walFlushLoop, _maintenanceLoop, _despillLoop];
+
+    /// <summary>
+    /// Test hook: the token the teardown cancels — the constructor's copy, which still answers after
+    /// the teardown has disposed its source. A callback a test registers on it is run by the
+    /// teardown's <c>CancelAsync</c>, on a pool thread, and that task completes only once it returns.
+    /// </summary>
+    internal CancellationToken ShutdownTokenForTest => _shutdown;
+
+    /// <summary>Test hook: the retire list's lock, for a test to see that nothing kept it.</summary>
+    internal object RetireLockForTest => _retireLock;
+
     /// <summary>Test hook: the live hot tier.</summary>
     internal HotTierSegment LiveHotTier => _write.Hot;
 
@@ -8366,12 +8382,70 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// <summary>Test seam: <see cref="_keptFlushSayIntervalMs"/>.</summary>
     internal TimeSpan KeptFlushSayIntervalForTest { set => _keptFlushSayIntervalMs = (long)value.TotalMilliseconds; }
 
-    /// <summary>A background loop that had ended with a failure before shutdown awaited it: said, and the teardown goes on. Never throws.</summary>
-    private void LoopDiedAtShutdown(Exception ex, string loop)
+    /// <summary>
+    /// The teardown's join of a background loop threw something other than the loop's cancellation, and the teardown
+    /// goes on to its final flush either way. Two roads:
+    /// <list type="bullet">
+    /// <item>The loop had FAILED: its task faulted, and the join rethrew that failure.</item>
+    /// <item>The join itself could not be set up: the registration of its continuation ran out of memory past the owner
+    /// builder's tries (<see cref="OwnerTaskMethodBuilder"/>). The loop, told to stop, was still running then — or the
+    /// join would not have suspended — and may be still: it is waited for here instead — polled, which allocates
+    /// nothing — but, unlike the join, only within the budget the teardown's waits share. A loop left running is not only
+    /// a matter of locks: a merge of the maintenance loop writes and deletes segment files, and nothing else in the
+    /// teardown waits for it. Past the budget the teardown goes on without the loop, which may then still run after
+    /// <see cref="DisposeAsync"/> has returned. Going on leaves nothing locked: the teardown takes its locks only in
+    /// methods of their own (see <see cref="DisposeCoreAsync"/>).</item>
+    /// </list>
+    /// Said at Error, told apart by how the loop's task ended: failed (with the loop's own failure, which the join's
+    /// registration may have hidden), ended, or still running. The line used to blame the loop on every road; a sink
+    /// that throws on it loses the line, not the teardown.
+    ///
+    /// <para>The poll blocks the teardown's thread: the thread the join's registration failed on, the caller's when the
+    /// join was the teardown's first suspension. Under a single-threaded synchronization context that is also where the
+    /// loop's own continuation is posted, and the poll then waits out the budget — there is none in an ASP.NET Core host.</para>
+    /// </summary>
+    private void LoopNotJoinedAtShutdown(Exception ex, Task loop, string name, long deadline)
     {
-        try { _logger.LogError(ex, "The {Loop} loop had failed before shutdown — the teardown goes on", loop); }
+        if (!loop.IsCompleted)
+        {
+            _onPollingForLoopForTest?.Invoke(name, deadline);
+            while (!loop.IsCompleted && Environment.TickCount64 < deadline) Thread.Sleep(10);
+        }
+        try
+        {
+            if (loop.IsFaulted)
+            {
+                // Read apart: Task.Exception builds a new AggregateException at every read, and one that ran out of
+                // memory here took the whole line with it.
+                Exception own = ex;
+                try { own = loop.Exception?.InnerException ?? ex; }
+                catch (Exception) { /* said with the join's failure */ }
+                if (ReferenceEquals(own, ex))
+                    _logger.LogError(ex, "The {Loop} loop had failed — the teardown goes on", name);
+                else
+                    _logger.LogError(own, "The {Loop} loop had failed — the teardown goes on. Shutdown could not set up its wait " +
+                                          "for the loop either: {JoinFailure}", name, ex.Message);
+            }
+            else if (loop.IsCompleted)
+                _logger.LogError(ex,
+                    "Shutdown could not set up its wait for the {Loop} loop; the loop, told to stop, has ended since, and the " +
+                    "teardown goes on", name);
+            else
+                _logger.LogError(ex,
+                    "Shutdown could not set up its wait for the {Loop} loop, and the loop, told to stop, had not ended after " +
+                    "{Budget}s. The teardown goes on without it: the loop ends at its next check, maybe after the teardown has " +
+                    "returned", name, _shutdownWaitBudget.TotalSeconds);
+        }
         catch (Exception) { /* the line is lost; the teardown is not */ }
     }
+
+    /// <summary>
+    /// Test hook: called by the teardown, with the loop's name and the budget's deadline (on
+    /// <see cref="Environment.TickCount64"/>), when the join of a background loop could not be set up and the loop is
+    /// still running — just before it polls for the loop instead (<see cref="LoopNotJoinedAtShutdown"/>). Null in
+    /// production.
+    /// </summary>
+    internal Action<string, long>? _onPollingForLoopForTest;
 
     /// <param name="order">
     /// Tier indices this segment will contain; null = the whole tier. The file name
@@ -8430,6 +8504,17 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
     /// → close reader snapshots → wait for readers → free. Each wait shares one budget, and running
     /// out of it leaves the tier that might still be in use allocated, with an Error, rather than
     /// freeing it — and a scan that has not ended running, with an Error, rather than waited for.
+    ///
+    /// <para>No lock, using or other finally in this method's own body (a fact holds it to that). Any
+    /// of its awaits can throw into it with the compiler's state still that suspension's — a
+    /// registration that runs out of memory past the owner builder's tries
+    /// (<see cref="OwnerTaskMethodBuilder"/>) — and from there every finally of the method is skipped
+    /// until an await suspends and resumes. The joins of the loops and the best-effort waits take such
+    /// a failure and go on. The writer fence and the two lock sections used to be in here: on an idle
+    /// engine nothing resumed the method, the teardown reported the store closed, and a write after it
+    /// blocked for good. They are methods of their own (<see cref="FenceWritersAtShutdown"/>,
+    /// <see cref="CloseSnapshotsAtShutdown"/>, <see cref="RetireTiersAtShutdown"/>), whose exits are
+    /// real finallys — the despill loop's remedy (<see cref="RunDespillLoopAsync"/>).</para>
     /// </summary>
     [System.Runtime.CompilerServices.AsyncMethodBuilder(typeof(OwnerTaskMethodBuilder))]
     private async Task DisposeCoreAsync()
@@ -8439,30 +8524,29 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         await _cts.CancelAsync();
         // A loop that died of anything else must not stop the teardown here, before the final flush
         // (round-5 review L-3: the WAL loop's own warning, thrown, ended it, and this await rethrew it).
+        // Nor a join that could not be set up — its registration out of memory, the loop still in its
+        // round: the loop is polled for instead, within the budget, the line tells the roads apart
+        // (LoopNotJoinedAtShutdown), and the teardown goes on.
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopDiedAtShutdown(ex, "hot-tier age"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _flushLoop, "hot-tier age", deadline); }
         try { await _walFlushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopDiedAtShutdown(ex, "WAL flush"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _walFlushLoop, "WAL flush", deadline); }
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex) { LoopDiedAtShutdown(ex, "maintenance"); }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _maintenanceLoop, "maintenance", deadline); }
         // The despill loop: cancellation ends its wait at once. A despill in its heavy phase is
         // counted like a flush and waited for below; one that had not reached it leaves its file
-        // for the next start.
+        // for the next start, as a loop that died anyway (it survives its own failures now) leaves
+        // its blocks.
         try { await _despillLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        catch (Exception ex)
-        {
-            // A loop that died anyway (it survives its own failures now) must not stop the teardown here,
-            // before the final flush: its blocks are on disk for the next start.
-            try { _logger.LogError(ex, "The despill loop had failed; shutdown goes on"); } catch { /* the line is lost */ }
-        }
+        catch (Exception ex) { LoopNotJoinedAtShutdown(ex, _despillLoop, "despill", deadline); }
         // The boot catalog scan. The cancellation above stops it at its next file — or ends the hold
         // of one a test never released — and it is waited for here: once this teardown has returned,
         // no task of this engine reads the segments directory, so a host may remove it, or open a
@@ -8477,14 +8561,13 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
             // However the scan ends — stopped, failed, or not within the budget — this does not throw
             // for it: what it did is read off its task below.
             //
-            // NOT in a try of its own, on purpose. What can throw here is the wait's own setup running
-            // out of memory, and a catch would not make that road safe: a REGISTRATION that fails
-            // leaves this method's later finallys unrun until a suspension resumes (see
-            // OwnerTaskMethodBuilder), so going on would reach the writer fence and the two lock
-            // statements below with their exits skipped — a write after the teardown then blocked for
-            // good where it should be refused. (An allocation that fails before the registration
-            // leaves them intact; a catch cannot tell the two apart.) It ends the teardown instead,
-            // as it does at the CancelAsync that begins it.
+            // NOT in a try of its own (#173): what can throw here is the wait's own setup running out
+            // of memory, and that ends the teardown, as it does at the CancelAsync that begins it. The
+            // reason it was kept out of a try — going on reached the writer fence and the two lock
+            // sections below with their exits skipped, and a write after the teardown blocked for
+            // good — is gone: those are methods of their own now (see the summary), and the joins of
+            // the loops above go on past the same failure. Making this wait go on too is a choice of
+            // its own, not made here.
             await _catalogLoad.WaitAsync(Until(deadline)).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
             if (!_catalogLoad.IsCompleted)
             {
@@ -8570,14 +8653,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         //    hold has the lock no write is in progress and none can start: a write that passed the
         //    check before the close finished first — in the live tier AND its WAL, or in a spill
         //    file, so the next start replays it — and every later one found the path closed.
-        WriteState live;
-        EnterWriterLock();
-        try
-        {
-            live = _write;
-            live.Hot.Freeze();
-        }
-        finally { _writerLock.Exit(); }
+        WriteState live = FenceWritersAtShutdown();
 
         // ── Wait for every heavy phase: the ones scheduled after the snapshot above, the inline
         //    FlushHotTierAsync one, the retries shutdown's cancellation is ending. Only the swap
@@ -8594,24 +8670,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
         // ── Collect what to free and close reader snapshots in the same step, under the lock
         //    snapshots are taken under. From here _activeReaders only falls.
-        List<HotTierSegment> tiers;
-        int leftFrozen = 0;
-        lock (_frozenLock)
-        {
-            _snapshotsClosed = true;
-            tiers = new List<HotTierSegment>(1 + _frozenHot.Count) { live.Hot };
-            if (flushesEnded)
-            {
-                foreach (var (tier, _) in _frozenHot) tiers.Add(tier);
-                _frozenHot.Clear();
-            }
-            else
-            {
-                // Which of them a still-running flush reads cannot be told apart, so none is
-                // freed here. A flush that finishes later retires its own tier the usual way.
-                leftFrozen = _frozenHot.Count;
-            }
-        }
+        var (tiers, leftFrozen) = CloseSnapshotsAtShutdown(live.Hot, flushesEnded);
         if (!flushesEnded)
             _logger.LogError(
                 "Shutdown: {Running} hot-tier flush(es) still running after {Budget}s — {Frozen} frozen tier(s) " +
@@ -8638,15 +8697,7 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
 
         // ── Free, by the retire list's rule: now if no reader is open, otherwise when the last
         //    one closes (OnReaderDisposed → DrainRetired). Tiers retired before shutdown too.
-        lock (_retireLock)
-        {
-            _retired.AddRange(tiers);
-            if (Volatile.Read(ref _activeReaders) == 0)
-            {
-                foreach (var t in _retired) t.Dispose();
-                _retired.Clear();
-            }
-        }
+        RetireTiersAtShutdown(tiers);
 
         live.Wal?.Dispose();
         // A spill still open — the final flush found no slot to end it with — stays on disk for
@@ -8665,6 +8716,69 @@ public sealed partial class StorageEngine : ISegmentProvider, ISegmentManager, I
         // Last: a counting request that outlived the teardown finds a closed store and counts
         // without it; the store's own lock makes that a miss, not a fault.
         _countsStore?.Dispose();
+    }
+
+    // ── The teardown's lock sections, each a method of its own (see DisposeCoreAsync's summary):
+    //    here a lock's exit is a real finally, which no await of the teardown can skip.
+
+    /// <summary>
+    /// The teardown's writer fence (see <see cref="DisposeCoreAsync"/>): takes the writer lock — no write is in
+    /// progress then and none can start — and freezes the live tier under it. Returns the write state it froze.
+    /// </summary>
+    private WriteState FenceWritersAtShutdown()
+    {
+        EnterWriterLock();
+        try
+        {
+            var live = _write;
+            live.Hot.Freeze();
+            return live;
+        }
+        finally { _writerLock.Exit(); }
+    }
+
+    /// <summary>
+    /// Closes reader snapshots and collects the teardown's tiers in the same step, under the lock snapshots are taken
+    /// under (see <see cref="DisposeCoreAsync"/>): the live tier, and the frozen ones when every flush has ended —
+    /// otherwise none of them, and how many it left.
+    /// </summary>
+    private (List<HotTierSegment> Tiers, int LeftFrozen) CloseSnapshotsAtShutdown(HotTierSegment liveTier, bool flushesEnded)
+    {
+        lock (_frozenLock)
+        {
+            _snapshotsClosed = true;
+            var tiers = new List<HotTierSegment>(1 + _frozenHot.Count) { liveTier };
+            int leftFrozen = 0;
+            if (flushesEnded)
+            {
+                foreach (var (tier, _) in _frozenHot) tiers.Add(tier);
+                _frozenHot.Clear();
+            }
+            else
+            {
+                // Which of them a still-running flush reads cannot be told apart, so none is
+                // freed here. A flush that finishes later retires its own tier the usual way.
+                leftFrozen = _frozenHot.Count;
+            }
+            return (tiers, leftFrozen);
+        }
+    }
+
+    /// <summary>
+    /// Frees the teardown's tiers by the retire list's rule, as <see cref="RetireHotTier"/> frees one: now if no reader
+    /// is open, otherwise when the last one closes (<see cref="DrainRetired"/>). Tiers retired before shutdown too.
+    /// </summary>
+    private void RetireTiersAtShutdown(List<HotTierSegment> tiers)
+    {
+        lock (_retireLock)
+        {
+            _retired.AddRange(tiers);
+            if (Volatile.Read(ref _activeReaders) == 0)
+            {
+                foreach (var t in _retired) t.Dispose();
+                _retired.Clear();
+            }
+        }
     }
 
     /// <summary>True if <paramref name="task"/> completes by the <see cref="Environment.TickCount64"/> deadline.</summary>
