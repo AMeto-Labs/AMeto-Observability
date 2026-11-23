@@ -591,6 +591,9 @@ public sealed class SegmentCountsEngineTests : IDisposable
             NullLogger<StorageEngine>.Instance);
         engine.IndexSinkFactory   = static (c, t) => new SegmentIndexBuilder(c, 5, t);
         engine._segmentsCarryCounts = carryCounts;
+        // The boot scan of the empty directory ends before the first write: until it has, a
+        // backfill pass sweeps no row and the progress reads NotYet (#158 review M1), by design.
+        engine.CatalogLoaded.GetAwaiter().GetResult();
 
         var buf = new ArrayBufferWriter<byte>(64);
         for (int i = 0; i < Events; i++)

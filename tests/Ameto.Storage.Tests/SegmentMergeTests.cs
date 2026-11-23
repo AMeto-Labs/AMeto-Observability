@@ -17,11 +17,14 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-merge-" + Guid.NewGuid().ToString("N"));
     private StorageEngine _engine = null!;
 
-    public Task InitializeAsync()
+    public async Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
         _engine = NewEngine();
-        return Task.CompletedTask;
+        // The boot scan, even of an empty directory, ends before any test writes. A scan that
+        // starts late lists the segments a test has just flushed and torn, and sets them aside as
+        // .seg.corrupt itself, before the merge the test is about ever opens them.
+        await WaitForCatalogAsync();
     }
 
     public async Task DisposeAsync()

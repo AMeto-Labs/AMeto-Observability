@@ -5053,6 +5053,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
         finally { await engine.DisposeAsync(); }
 
         await using var next = Engine(opts);
+        await next.CatalogLoaded;   // the earlier run's segments are the boot scan's to list
         await FlushEverythingAsync(next, ShortGuard);
         Assert.Equal(10, ReadAll(next).Count);   // ReadAll asserts no event is there twice
     }
@@ -5140,6 +5141,7 @@ public sealed partial class IngestWriteAndSpillTests : IDisposable
             $"{kept} swapped tiers kept in memory with no retry, past the cap of {StorageEngine.KeptTiersCap}");
 
         await using var next = Engine(opts);
+        await next.CatalogLoaded;   // the kept tiers were flushed by the teardown: the boot scan lists them
         await FlushEverythingAsync(next, ShortGuard);
         Assert.Equal(Tiers * TierEvents, ReadAll(next).Count);   // every one back from its WAL, none twice
     }
